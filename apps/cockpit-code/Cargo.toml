@@ -1,0 +1,29 @@
+[package]
+name = "cockpit-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A terminal coding agent with headless runs and an ACP server"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ai", "agent", "coding-agent", "tui", "acp"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[features]
+default = ["tui"]
+tui = ["dep:code-tui"]
+
+[dependencies]
+code-config = { path = "../../crates/code-config" }
+code-engine = { path = "../../crates/code-engine" }
+code-tui = { path = "../../crates/code-tui", optional = true }
+code-acp = { path = "../../crates/code-acp" }
+serde_json.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+tokio-util.workspace = true

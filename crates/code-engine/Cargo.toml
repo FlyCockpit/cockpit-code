@@ -1,0 +1,60 @@
+[package]
+name = "code-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-process coding-agent engine powering cockpit-code"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+code-config = { path = "../code-config" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng = "0.10"
+toml = "0.8"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+tempfile.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+libc = "0.2"
+regex = "1"
+ignore = "0.4"
+globset = "0.4"
+notify = "8"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+url = "2"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+
+httpdate = "1"
+anyhow = "1"
+similar = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tiktoken-rs = "0.7"
+brush-parser = "0.4"
+htmd = "0.5"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+
+monty = { git = "https://github.com/pydantic/monty.git", rev = "f3fb8e982560c754c5350bc30ed1d3b776bc0e2e" }
+monty-types = { git = "https://github.com/pydantic/monty.git", rev = "f3fb8e982560c754c5350bc30ed1d3b776bc0e2e" }
+
+[features]
+intel-c = ["dep:tree-sitter-c"]
+intel-cpp = ["dep:tree-sitter-cpp"]

@@ -1,0 +1,7 @@
+{
+  "rust": {"command":"rust-analyzer","args":[],"fileGlobs":["*.rs"],"rootMarkers":["Cargo.toml","rust-project.json",".git"],"install":"rustup component add rust-analyzer"},
+  "typescript": {"command":"typescript-language-server","args":["--stdio"],"fileGlobs":["*.ts","*.tsx","*.js","*.jsx","*.mts","*.cts","*.mjs","*.cjs"],"rootMarkers":["tsconfig.json","jsconfig.json","package.json",".git"],"install":"npm install -g typescript typescript-language-server"},
+  "python": {"command":"basedpyright-langserver","alternatives":["pyright-langserver"],"args":["--stdio"],"fileGlobs":["*.py","*.pyi"],"rootMarkers":["pyproject.toml","pyrightconfig.json","setup.py",".git"],"install":"pip install basedpyright (or npm install -g pyright)"},
+  "go": {"command":"gopls","args":[],"fileGlobs":["*.go"],"rootMarkers":["go.work","go.mod",".git"],"install":"go install golang.org/x/tools/gopls@latest"},
+  "cpp": {"command":"clangd","args":["--background-index=false"],"fileGlobs":["*.c","*.h","*.cc","*.hh","*.cpp","*.hpp","*.cxx","*.hxx"],"rootMarkers":["compile_commands.json","compile_flags.txt","CMakeLists.txt",".git"],"install":"Install LLVM/clangd using your system package manager"}
+}
