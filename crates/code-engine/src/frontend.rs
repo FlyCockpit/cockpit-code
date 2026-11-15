@@ -1,4 +1,4 @@
-//! Front-end-only session operations (TUI lane tui-v3): user steering of a
+//! Front-end-only session operations: user steering of a
 //! running subagent and user kill of any background job.
 use crate::{Session, schema::*};
 

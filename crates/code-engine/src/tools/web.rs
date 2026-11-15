@@ -1,4 +1,4 @@
-//! D65 web tools: `web_search` and `web_fetch`.
+//! Web tools: `web_search` and `web_fetch`.
 //!
 //! Providers (config `web: {provider, apiKey: "${ENV}", baseUrl?}`):
 //! - Firecrawl v2: `POST /v2/search` and `POST /v2/scrape`
@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use code_config::{WebConfig, WebProvider};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     sync::{Mutex, OnceLock},
@@ -60,8 +61,8 @@ pub(crate) fn handles(name: &str) -> bool {
     matches!(name, "web_search" | "web_fetch")
 }
 
-/// Validates, authorizes and runs one web call. `blocked` is the D67 exclusive
-/// `blockNetwork` setting; the tool stays in `tools[]` (D61) and errors instead.
+/// Validates, authorizes and runs one web call. `blocked` is the exclusive
+/// `blockNetwork` setting; the tool stays in `tools[]` and errors instead.
 pub(crate) async fn execute(
     gate: &dyn PermissionGate,
     mut op: PreparedOperation,
@@ -110,15 +111,11 @@ pub(crate) async fn execute(
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
             op.command = Some(format!("web_fetch {url}"));
             gate.authorize(&op, cancel).await?;
-            let source = match web.provider {
-                Some(WebProvider::Firecrawl) => "firecrawl",
-                Some(WebProvider::Tinyfish) => "tinyfish",
-                None => "direct",
-            };
-            let page = match cached(source, url) {
+            let key = api_key(web)?;
+            let cache_key = fetch_cache_key(web, key.as_deref(), url);
+            let page = match cached(&cache_key) {
                 Some(page) => page,
                 None => {
-                    let key = api_key(web)?;
                     let page = cancellable(cancel, async {
                         match web.provider {
                             Some(WebProvider::Firecrawl) => {
@@ -132,7 +129,7 @@ pub(crate) async fn execute(
                     })
                     .await?;
                     let page = compress(&page);
-                    remember(source, url, &page);
+                    remember(&cache_key, &page);
                     page
                 }
             };
@@ -176,14 +173,15 @@ fn client() -> Result<reqwest::Client> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("cockpit-code/", env!("CARGO_PKG_VERSION")))
-        // Redirects are not followed: the new URL must pass the permission gate
-        // (session grants are per host), so it is returned to the model instead.
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .context("could not create HTTP client")?;
+    let client = crate::http_client(|| {
+        reqwest::Client::builder()
+            .user_agent(concat!("cockpit-code/", env!("CARGO_PKG_VERSION")))
+            // Redirects are not followed: the new URL must pass the permission gate
+            // (session grants are per host), so it is returned to the model instead.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(15))
+    })
+    .context("could not create HTTP client")?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
@@ -615,8 +613,17 @@ fn cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
     CACHE.get_or_init(Mutex::default)
 }
-fn cached(source: &str, url: &str) -> Option<String> {
-    let key = format!("{source} {url}");
+fn fetch_cache_key(web: &WebConfig, credential: Option<&str>, url: &str) -> String {
+    let (source, endpoint) = match web.provider {
+        Some(WebProvider::Firecrawl) => ("firecrawl", format!("{}/v2/scrape", firecrawl_base(web))),
+        Some(WebProvider::Tinyfish) => ("tinyfish", tinyfish_urls(web).1),
+        None => ("direct", String::new()),
+    };
+    let fingerprint = credential.map(|key| crate::hex::hex(&Sha256::digest(key.as_bytes())));
+    // Structured encoding keeps endpoint and URL boundaries unambiguous.
+    json!([source, endpoint, fingerprint, url]).to_string()
+}
+fn cached(key: &str) -> Option<String> {
     let mut cache = cache().lock().unwrap();
     cache.retain(|(_, at, _)| at.elapsed() < CACHE_TTL);
     cache
@@ -624,12 +631,46 @@ fn cached(source: &str, url: &str) -> Option<String> {
         .find(|(k, _, _)| *k == key)
         .map(|(_, _, page)| page.clone())
 }
-fn remember(source: &str, url: &str, page: &str) {
-    let key = format!("{source} {url}");
+fn remember(key: &str, page: &str) {
     let mut cache = cache().lock().unwrap();
     cache.retain(|(k, _, _)| *k != key);
     if cache.len() >= CACHE_ENTRIES {
         cache.pop_front();
     }
-    cache.push_back((key, Instant::now(), page.into()));
+    cache.push_back((key.into(), Instant::now(), page.into()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_cache_is_scoped_to_endpoint_and_credential() {
+        for provider in [WebProvider::Firecrawl, WebProvider::Tinyfish] {
+            let web = WebConfig {
+                provider: Some(provider),
+                base_url: Some("https://first.invalid".into()),
+                ..WebConfig::default()
+            };
+            let url = format!("https://cache-isolation.invalid/{provider:?}");
+            let original = fetch_cache_key(&web, Some("first-private-key"), &url);
+            assert!(!original.contains("first-private-key"));
+            remember(&original, "private page");
+            assert_eq!(cached(&original).as_deref(), Some("private page"));
+            assert!(cached(&fetch_cache_key(&web, Some("second-private-key"), &url)).is_none());
+            assert!(cached(&fetch_cache_key(&web, None, &url)).is_none());
+            let other_endpoint = WebConfig {
+                base_url: Some("https://second.invalid".into()),
+                ..web.clone()
+            };
+            assert!(
+                cached(&fetch_cache_key(
+                    &other_endpoint,
+                    Some("first-private-key"),
+                    &url
+                ))
+                .is_none()
+            );
+        }
+    }
 }

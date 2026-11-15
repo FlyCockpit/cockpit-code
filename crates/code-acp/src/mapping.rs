@@ -341,7 +341,7 @@ const OTHER: &str = "__other";
 
 /// One form for a whole question set (`elicitation/create`, form mode).
 /// Nothing is required: every question can be skipped. A choice or boolean
-/// gets a companion free-text "Other" field (D62 `allowOther`).
+/// gets a companion free-text "Other" field (`allowOther`).
 pub fn elicitation_schema(specs: &[QuestionSpec]) -> Value {
     let mut properties = Map::new();
     for q in specs {
@@ -488,8 +488,8 @@ pub fn question_option_answer(q: &QuestionSpec, result: &Value) -> Option<Questi
     Some(a)
 }
 
-/// Answer for a free-text question the client cannot collect (D62 allows
-/// `user unavailable` for every kind).
+/// Answer for a free-text question the client cannot collect.
+/// Every question kind accepts `user unavailable`.
 pub fn unavailable(q: &QuestionSpec) -> QuestionAnswer {
     QuestionAnswer {
         id: q.id.clone(),

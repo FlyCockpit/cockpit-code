@@ -26,7 +26,7 @@ pub struct ForkFunction {
 pub struct HiddenFork {
     pub model: Model,
     pub author: PreparedRequest,
-    /// Already canonicalized D52 notice, appended as one user-role message.
+    /// Already canonicalized notice, appended as one user-role message.
     pub tail: String,
     pub copies: usize,
     /// None leaves agent-like forks uncapped; mechanical title/variation forks use Some.
@@ -175,7 +175,7 @@ impl HiddenFork {
             succeeded: false,
             reason: None,
             author_prefix_bytes: self.author.author_prefix().len(),
-            author_prefix_sha256: format!("{:x}", Sha256::digest(self.author.author_prefix())),
+            author_prefix_sha256: crate::hex::hex(&Sha256::digest(self.author.author_prefix())),
             cache_hit_observed: self.model.observed_cache_hit(),
         };
         let result = self

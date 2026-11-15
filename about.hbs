@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cockpit Code — third-party licenses</title>
+  <style>
+    body { font-family: sans-serif; max-width: 70rem; margin: 2rem auto; padding: 0 1rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Cockpit Code — third-party licenses</h1>
+  <p>Licenses of the third-party crates compiled into the <code>cockpit-code</code> release binaries, and the crates that use each license.</p>
+  {{#each licenses}}
+  <section>
+    <h2>{{name}}</h2>
+    <ul>
+      {{#each used_by}}
+      <li>{{crate.name}} {{crate.version}}</li>
+      {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </section>
+  {{/each}}
+</body>
+</html>

@@ -72,7 +72,7 @@ impl HttpClient {
             if sse {
                 for frame in parser.push(&chunk)? {
                     let value: Value = serde_json::from_str(&frame)?;
-                    if value["id"].as_u64() == Some(id) {
+                    if response_id(&value) == Some(id) {
                         return serde_json::from_value::<JsonRpcResponse>(value)?.into_result();
                     }
                 }
@@ -85,7 +85,7 @@ impl HttpClient {
         }
         let value: Value =
             serde_json::from_slice(&body).context("MCP HTTP response missing JSON-RPC message")?;
-        if value["id"].as_u64() != Some(id) {
+        if response_id(&value) != Some(id) {
             bail!("MCP HTTP response id mismatch");
         }
         serde_json::from_value::<JsonRpcResponse>(value)?.into_result()
@@ -129,5 +129,77 @@ impl McpClient for HttpClient {
     async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
         self.request("tools/call", Some(json!({"name":name,"arguments":args})))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve(body: &str, content_type: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            let mut request = Vec::new();
+            loop {
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buf[..count]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (endpoint, task)
+    }
+
+    #[tokio::test]
+    async fn sse_ignores_server_request_with_pending_id() {
+        let body = concat!(
+            "data: {\"id\":1,\"method\":\"sampling/createMessage\"}\n\n",
+            "data: {\"id\":1}\n\n",
+            "data: {\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        );
+        let (endpoint, server) = serve(body, "text/event-stream").await;
+        let mut client =
+            HttpClient::new(endpoint, BTreeMap::new(), McpTimeouts::from_secs(5, 5)).unwrap();
+        assert_eq!(
+            client.request("tools/list", None).await.unwrap(),
+            json!({"ok":true})
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_rejects_server_request_with_pending_id() {
+        let (endpoint, server) = serve(
+            r#"{"id":1,"method":"sampling/createMessage"}"#,
+            "application/json",
+        )
+        .await;
+        let mut client =
+            HttpClient::new(endpoint, BTreeMap::new(), McpTimeouts::from_secs(5, 5)).unwrap();
+        assert!(client.request("tools/list", None).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_accepts_null_result_response() {
+        let (endpoint, server) = serve(r#"{"id":1,"result":null}"#, "application/json").await;
+        let mut client =
+            HttpClient::new(endpoint, BTreeMap::new(), McpTimeouts::from_secs(5, 5)).unwrap();
+        assert_eq!(
+            client.request("tools/list", None).await.unwrap(),
+            Value::Null
+        );
+        server.await.unwrap();
     }
 }

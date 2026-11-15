@@ -1,4 +1,4 @@
-//! The queue box (D73, D74): messages typed while the viewed agent works,
+//! The queue box: messages typed while the viewed agent works,
 //! each with three class buttons (next turn, steer, interrupt = send now;
 //! the selected one coloured), edit and cancel (adapted from
 //! FlyCockpit's Cockpit). The engine adapter owns the queue; this module only shows and edits it.
@@ -76,9 +76,14 @@ impl App {
             .is_some_and(|(q, _)| q.agent == agent)
             && let Some((mut item, at)) = self.queue_edit.take()
         {
-            item.text = text;
+            item.text = text.clone();
             let class = item.class;
-            self.engine.requeue(item, at);
+            if let Err(e) = self.engine.requeue(item, at) {
+                self.composer.set_wire(&text);
+                self.composer.edited();
+                self.queue_changed();
+                return self.hint(e);
+            }
             self.queue_changed();
             self.queue_scroll = at.saturating_sub(QUEUE_ROWS - 1);
             let effect = self.engine.queue_effect(&agent, class);
@@ -94,10 +99,6 @@ impl App {
                     "queued · {} · {effect} · enter again escalates",
                     class.label()
                 ));
-            }
-            Ok(QueueOutcome::Delivered) => {
-                let label = self.tree.label(&agent);
-                self.hint(format!("sent to {label} · reaches it at its next boundary"));
             }
             Err(e) => {
                 self.composer.set_wire(&text);
@@ -183,9 +184,16 @@ impl App {
             }
             self.composer.buf.clear();
             self.composer.edited();
-            self.engine.requeue(item, at);
+            let text = item.text.clone();
+            match self.engine.requeue(item, at) {
+                Ok(()) => self.hint("the queued message went back in the queue"),
+                Err(e) => {
+                    self.composer.set_wire(&text);
+                    self.composer.edited();
+                    self.hint(e);
+                }
+            }
             self.queue_changed();
-            self.hint("the queued message went back in the queue");
         }
     }
 

@@ -35,6 +35,9 @@ impl StdioClient {
         cmd.process_group(0);
         let mut child = cmd.spawn().context("MCP command could not start")?;
         let process_group = child.id();
+        if let Some(pgid) = process_group {
+            crate::process_groups::track(pgid as i32);
+        }
         Ok(Self {
             process_group,
             stdin: child.stdin.take().context("MCP stdin missing")?,
@@ -50,6 +53,7 @@ impl StdioClient {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
+            crate::process_groups::forget(pid as i32);
         }
         let _ = self.child.start_kill();
     }
@@ -116,7 +120,7 @@ impl StdioClient {
             }
             let value: Value =
                 serde_json::from_slice(&line).context("invalid MCP JSON-RPC response")?;
-            if value.get("id").and_then(Value::as_u64) == Some(id) {
+            if response_id(&value) == Some(id) {
                 return Ok(serde_json::from_value(value)?);
             }
             if value.get("method").is_some() && value.get("id").is_some() {
@@ -125,6 +129,7 @@ impl StdioClient {
                 )?;
                 response.push(b'\n');
                 self.stdin.write_all(&response).await?;
+                self.stdin.flush().await?;
             }
         }
     }
@@ -172,5 +177,42 @@ impl McpClient for StdioClient {
         self.request("tools/call", Some(json!({"name":name,"arguments":args})))
             .await?
             .into_result()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn server_request_with_pending_id_gets_unsupported_reply() {
+        let script = r#"
+            read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}'
+            read -r reply
+            case "$reply" in
+                *'-32601'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}' ;;
+                *) exit 1 ;;
+            esac
+            read -r keep_open
+        "#;
+        let mut client = StdioClient::spawn(
+            "sh",
+            &["-c".into(), script.into()],
+            &BTreeMap::new(),
+            Path::new("/"),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.request("tools/list", None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .into_result()
+        .unwrap();
+        assert_eq!(result, json!({"ok":true}));
+        client.shutdown().await;
     }
 }

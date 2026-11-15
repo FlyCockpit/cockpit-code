@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::{BTreeSet, VecDeque};
 impl Index {
-    pub(super) fn search(
+    fn text_hits(
         &self,
         args: &Value,
         scope: Option<&str>,
@@ -384,7 +384,7 @@ impl Index {
                 }
             }
             "query" => {
-                hits = self.search(&json!({"pattern":regex::escape(required(args,"target")?),"limit":cap,"case_insensitive":true}),None,cancel)?;
+                hits = self.text_hits(&json!({"pattern":regex::escape(required(args,"target")?),"limit":cap,"case_insensitive":true}),None,cancel)?;
                 if let Some(rows) = hits["hits"].as_array() {
                     for row in rows {
                         if let Some(path) = row["path"].as_str() {
@@ -437,4 +437,39 @@ pub(super) fn compact_symbol(s: &lang::Symbol) -> Value {
     json!({"name":short(&s.name,240),"kind":s.kind,"line":s.line,"end_line":s.end_line,
         "parent":s.parent.as_deref().map(|p|short(p,240)),"visibility":s.visibility.as_deref().map(|v|short(v,80)),
         "signature":s.signature.as_deref().map(|v|short(v,180))})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_pack_query_uses_internal_text_hits() {
+        let index = Index {
+            files: BTreeMap::from([(
+                "sample.rs".into(),
+                File {
+                    hash: vec![],
+                    source: "fn sample() { /* needle */ }".into(),
+                    language: Language::Rust,
+                    extraction: Extraction::default(),
+                    modified: SystemTime::UNIX_EPOCH,
+                },
+            )]),
+            ..Default::default()
+        };
+        let result = index
+            .context_pack(
+                Path::new("."),
+                &json!({"kind":"query", "target":"needle"}),
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(result["text_hits"]["hits"][0]["path"], "sample.rs");
+        assert_eq!(result["files"][0]["path"], "sample.rs");
+        let code = index.code(&json!({"kind":"tree"}), None).unwrap();
+        assert_eq!(code["items"][0]["path"], "sample.rs");
+        assert!(index.code(&json!({"kind":"unknown"}), None).is_err());
+    }
 }

@@ -1,4 +1,4 @@
-//! D59 substitutions are durably resolved before the first replay, once only.
+//! Substitutions are durably resolved before the first replay, once only.
 use crate::{Control, model::Model, schema::*};
 use code_config::{ModelConfig, PriorThinking, Snapshot, ThinkingMode};
 use std::sync::Arc;

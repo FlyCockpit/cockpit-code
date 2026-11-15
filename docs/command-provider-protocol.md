@@ -68,7 +68,7 @@ and closed afterward. With no stdin template, the executable sees EOF.
 All files live in a private per-request temporary directory removed after the
 process and its pipes finish, including failure, timeout and cancellation. An
 additional `{messageFile}` contains the latest message text. Files are UTF-8.
-Saved requests predating `{cacheKey}`/separate conversation identities keep their stored identities on replay. Keep provider conversation state keyed by `{conversationId}`, even when caching routes by `{cacheKey}`.
+`{conversationId}` is required and nonempty. Keep provider conversation state keyed by `{conversationId}`, even when caching routes by `{cacheKey}`.
 Canonical messages are conversation events from cockpit-code's schema:
 
 ```json
@@ -130,7 +130,15 @@ A `done` event is required and must be terminal. `tool_use` must agree with the
 presence of calls. Invalid JSON lines become visible text and generate one protocol
 warning per attempt; malformed structured events fail. Each line is limited to
 4 MiB. Stdout and stderr drain concurrently. Failure diagnostics retain the last
-64 KiB of stderr, with explicit command-env values redacted.
+64 KiB of stderr. Before a diagnostic is shown or saved, cockpit-code redacts
+values of 8 bytes or more from explicit command-env values, credential `${NAME}`
+expansions, and inherited credential environment variables. A credential name,
+uppercased, ends in `TOKEN`, `SECRET`, `PASSWORD` or `PASSWD`, or has an exact
+`_`-separated token (or is itself) `KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`,
+`PASSWD`, `PASS`, `PWD`, `PAT`, `CREDENTIAL`, `CREDENTIALS` or `AUTH`.
+`SSH_AUTH_SOCK`, `PWD` and `OLDPWD` are excluded, and ordinary names such as
+`HOME`, `GIT_AUTHOR_NAME` and `XAUTHORITY` do not qualify. Longer values are
+replaced first.
 
 `usage` is a complete snapshot; the last usage event wins. Input tokens include
 cache reads and writes. Cost precedence is the configured `reportedCost` body
@@ -153,8 +161,6 @@ to `outputFile`. To report usage, emit one stderr line:
 
 The last such trailer wins. Other stderr is diagnostic only. Without a trailer,
 token usage and cost remain unknown (except explicit subscription billing).
-The plan references a trailer but does not give its framing; this versioned JSON
-line is the implementation's concrete framing.
 
 ## History, scheduling and cancellation
 
@@ -200,8 +206,8 @@ are cached separately for 300 seconds, including across process restarts. Static
 models remain available. A provider-file edit or explicit refresh bypasses both
 caches. `ConfigStore::refresh_discovery_many(providers)` reloads once and refreshes
 each selected provider once. `Snapshot.discovery_errors` maps provider IDs to
-`DiscoveryError {kind,message,cached,retry_at}` (camelCase in JSON); the legacy
-`errors` diagnostics remain available. `cockpit-code discover` includes the same
+`DiscoveryError {kind,message,cached,retry_at}` (camelCase in JSON); the general
+`errors` config diagnostics remain available. `cockpit-code discover` includes the same
 structured error in each provider row's `error` field (null on success).
 
 Discovery prints one object with `protocol`, a `models` object and optional

@@ -1,11 +1,9 @@
-//! Deterministic shell-command classifier (sandboxing part 1, §1).
+//! Deterministic shell-command classifier.
 //!
 //! Parses a proposed shell-command string into a real bash-grammar AST
 //! (`brush-parser`) — **not** a substring scan — and decomposes it into
-//! the set of *simple commands* it would actually run. Each simple
-//! command yields an [`ApprovalKey`] (`argv[0]` + first subcommand
-//! token) the approval store keys grants on, plus a [`Wrapper`] flag for
-//! commands that hide arbitrary behavior.
+//! the set of *simple commands* it would actually run, with executable
+//! identities, wrapper flags and risk metadata for permission decisions.
 //!
 //! ## Why a parser, not a scan
 //!
@@ -22,13 +20,11 @@
 //! Static analysis bounds **syntax, not behavior**. A wrapper like
 //! `bash -c "<script>"`, `eval "$x"`, or `xargs rm` carries a *dynamic*
 //! command string the grammar cannot inspect — the inner program is data
-//! at parse time. So the classifier flags these as [`Wrapper`]s, and the
-//! store refuses to ever persist a grant for one (priority #1 defensive
-//! posture): they re-prompt every run. This is the same reason
+//! at parse time. The classifier flags these as wrappers so permission
+//! decisions can account for the behavior hidden by the command string. This is the same reason
 //! command-substitution `$(...)` and process-substitution force a prompt:
 //! the substituted program isn't statically knowable.
 
-use std::collections::BTreeSet;
 use std::io::Cursor;
 
 use brush_parser::ast::{
@@ -39,7 +35,7 @@ use brush_parser::{Parser, ParserOptions};
 
 /// Commands whose first argument is itself an arbitrary program or
 /// command string the parser cannot inspect. Flagged so the store
-/// refuses to persist grants for them (§2): they re-prompt every run.
+/// refuses to persist grants for them: they re-prompt every run.
 ///
 /// `argv[0]` match only. `sudo`/`env`/`timeout`/`nice` are *prefix*
 /// wrappers — they run whatever command follows with altered
@@ -86,24 +82,20 @@ const PRIVILEGED_NON_PERSISTABLE_COMMANDS: &[&str] = &["chroot", "unshare", "bus
 pub struct SimpleCommandInfo {
     /// `argv[0]` — the program token, verbatim for UI/display (`git`, `"rm"`).
     pub program: String,
-    /// Static executable identity after quote/escape reduction. Approval
-    /// keys and policy decisions use this instead of raw shell syntax.
+    /// Static executable identity after quote/escape reduction, used for
+    /// permission decisions instead of raw shell syntax.
     pub normalized_program: String,
     /// First subcommand token, if any (`pr` for `gh pr create`). `None`
     /// for no-subcommand commands (`ls`, `./script`).
     pub subcommand: Option<String>,
     /// Static suffix argv words after `argv[0]`, preserving source order.
-    /// Option names contribute to the approval key while values remain absent;
-    /// per-invocation risk
-    /// classifiers use them to raise the tier for dangerous flags.
+    /// Risk classifiers use them to raise the tier for dangerous flags.
     pub args: Vec<String>,
-    /// The approval key derived from `normalized_program`, `subcommand`, and option names.
-    pub key: ApprovalKey,
     /// Whether this command is a wrapper/eval that hides behavior the
-    /// parser can't inspect (§1). Wrappers are never persistable (§2).
+    /// parser can't inspect. Wrappers are never persistable.
     pub wrapper: bool,
     /// Whether an option value can name executable behavior. These commands
-    /// are once-only even though their option names participate in shape keys.
+    /// require review even when the executable name is recognized.
     pub execution_bearing_option: bool,
     /// Structured risk/effect metadata used by the approval policy and
     /// prompt. This is conservative static analysis: only literal operands
@@ -156,83 +148,6 @@ impl RiskTier {
             RiskTier::Dynamic => "dynamic",
         }
     }
-
-    /// Parse a risk-tier key as it appears in an `approvalPolicy.riskMaxScope`
-    /// map. The key domain is closed (exactly these five tiers); an
-    /// unrecognized key is `None`, which the approval store treats as a
-    /// malformed policy rather than silently ignoring the intended cap.
-    pub fn from_policy_key(key: &str) -> Option<RiskTier> {
-        match key {
-            "ordinary" => Some(RiskTier::Ordinary),
-            "mutating" => Some(RiskTier::Mutating),
-            "destructive" => Some(RiskTier::Destructive),
-            "privileged" => Some(RiskTier::Privileged),
-            "dynamic" => Some(RiskTier::Dynamic),
-            _ => None,
-        }
-    }
-}
-
-/// The store key for a command grant. It records the normalized executable,
-/// first subcommand, and a sorted set of option names (never values). The
-/// versioned storage format deliberately invalidates the pre-shape coarse
-/// grant format rather than allowing an old grant to cover a new option.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ApprovalKey {
-    pub program: String,
-    pub subcommand: Option<String>,
-    /// Normalized option names, in sorted order. Values are intentionally
-    /// absent so persisted grants cannot retain credentials or other secrets.
-    pub option_names: BTreeSet<String>,
-}
-
-/// Version prefix of every persisted command-approval key (`approvals.json`).
-pub const APPROVAL_KEY_VERSION_PREFIX: &str = "v1:";
-
-impl ApprovalKey {
-    /// Versioned persistence identity. JSON escaping makes the delimiter
-    /// unambiguous even for unusual quoted executable names; the `v1:` prefix
-    /// makes any unversioned or foreign key fail closed instead of matching.
-    pub fn as_storage_str(&self) -> String {
-        let shape = serde_json::json!({
-            "program": self.program,
-            "subcommand": self.subcommand,
-            "options": self.option_names,
-        });
-        format!("{APPROVAL_KEY_VERSION_PREFIX}{shape}")
-    }
-
-    /// Coarse identity used only for configuration policy lookup and human
-    /// labels. It is never persisted as a command grant.
-    pub fn as_policy_str(&self) -> String {
-        match &self.subcommand {
-            Some(sub) => format!("{} {}", self.program, sub),
-            None => self.program.clone(),
-        }
-    }
-
-    /// Human-readable grant shape, without any option values.
-    pub fn as_display_str(&self) -> String {
-        let mut display = self.as_policy_str();
-        if !self.option_names.is_empty() {
-            display.push(' ');
-            display.push_str(
-                &self
-                    .option_names
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-        display
-    }
-}
-
-impl std::fmt::Display for ApprovalKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.as_display_str())
-    }
 }
 
 /// Outcome of classifying a command string.
@@ -262,7 +177,7 @@ pub enum Classification {
     /// function definitions) keeps command-shaped syntax out of prose.
     /// Nothing here can ever be auto-run: approval consumers treat it
     /// exactly like [`Classification::Unparseable`] — deny/prompt, never
-    /// grant (issue #289 review cycle 3, finding 1; remaining finding 1).
+    /// grant.
     EffectsOnly,
     /// Empty, whitespace-only, or comment-only input — nothing to run,
     /// treated as not-granted by the store (never silently auto-allowed).
@@ -275,10 +190,7 @@ pub enum Classification {
 
 impl Classification {
     /// The simple commands, or an empty slice for
-    /// `EffectsOnly`/`Empty`/`Unparseable`. `bash`'s skip-the-box check
-    /// (sandboxing part 2) walks these to ask the store whether every
-    /// constituent command is already granted; an empty list is never
-    /// vacuously granted (see `command_escalation_preauthorized`).
+    /// `EffectsOnly`/`Empty`/`Unparseable`.
     pub fn simple_commands(&self) -> &[SimpleCommandInfo] {
         match self {
             Classification::Parsed {
@@ -287,45 +199,18 @@ impl Classification {
             _ => &[],
         }
     }
-
-    /// Whether any constituent command is a wrapper. A `true` here means
-    /// the whole string can only ever be approved [`Once`], never stored,
-    /// so `bash`'s skip-the-box fast path (sandboxing part 2) bails on it.
-    ///
-    /// Session grants never cover wrappers.
-    pub fn has_wrapper(&self) -> bool {
-        self.simple_commands().iter().any(|c| c.wrapper)
-    }
 }
 
 /// Classify a proposed shell-command string. Pure and synchronous —
 /// the standalone-testable core of the subsystem.
 pub fn classify(command: &str) -> Classification {
-    classify_with_grammar(command, true)
-}
-
-/// Classify a string against the **bash** grammar rather than the `sh`
-/// subset. `classify` matches what `bash.rs` executes (`sh -c`); this
-/// variant matches what an *interactive bash terminal* would accept — a
-/// strict superset. Callers that must fail closed on text a real terminal
-/// could run (computer-use terminal-input policy, issue #289) classify
-/// with **both** grammars: bash-only constructs (process substitution,
-/// `[[ ]]`, `coproc`) are `Unparseable` under `classify` alone and would
-/// otherwise pass a gate that only rejects parseable programs.
-pub fn classify_bash(command: &str) -> Classification {
-    classify_with_grammar(command, false)
-}
-
-fn classify_with_grammar(command: &str, sh_mode: bool) -> Classification {
     if command.trim().is_empty() {
         return Classification::Empty;
     }
 
-    // `bash.rs` runs `sh -c <command>`; the `sh_mode` flag selects the
-    // matching grammar (`true`) or the interactive-bash superset
-    // (`false`, see [`classify_bash`]).
+    // Match the `sh -c <command>` grammar used by the bash tool.
     let opts = ParserOptions {
-        sh_mode,
+        sh_mode: true,
         ..ParserOptions::default()
     };
     let mut parser = Parser::new(Cursor::new(command.as_bytes().to_vec()), &opts);
@@ -348,8 +233,7 @@ fn classify_with_grammar(command: &str, sh_mode: bool) -> Classification {
 
     if acc.simple_commands.is_empty() {
         // No runnable simple command — but "nothing to run" is not "no
-        // effect" (issue #289 review cycle 3, finding 1; remaining
-        // finding 1): a redirect-only line (`>important-file`) opens or
+        // effect": a redirect-only line (`>important-file`) opens or
         // truncates a file when the receiver executes it, an
         // assignment-only line (`PATH=/evil/bin`, `PROMPT_COMMAND=…`)
         // mutates interactive-shell state (and can run later, at prompt
@@ -381,8 +265,7 @@ struct Decomposer {
     /// the program. Redirects are filesystem/child-process effects even
     /// on a line with no program word; assignments mutate shell state
     /// (`PATH`, `PROMPT_COMMAND`, …) even without substitution. Either
-    /// must keep such lines out of the benign `Empty` bucket (issue
-    /// #289 review cycle 3, finding 1; remaining finding 1).
+    /// must keep such lines out of the benign `Empty` bucket.
     effects_only: bool,
 }
 
@@ -490,7 +373,7 @@ impl Decomposer {
         }
     }
 
-    /// Extract argv[0], first subcommand, and option-name shape from a simple command and
+    /// Extract argv[0], first subcommand, arguments and risk from a simple command and
     /// record it. Command/process substitution anywhere in the command
     /// marks the source compound (a substituted program isn't statically
     /// knowable) but the outer program is still keyed and evaluated.
@@ -578,13 +461,7 @@ impl Decomposer {
             .flat_map(command_substitutions)
             .collect();
 
-        let option_names = option_names(&args, &normalized_program);
         let execution_bearing_option = has_execution_bearing_option(&args, &normalized_program);
-        let key = ApprovalKey {
-            program: normalized_program.clone(),
-            subcommand: subcommand.clone(),
-            option_names,
-        };
         // Source span of this simple command within the original string,
         // from the AST's `SourceLocation`. `index` counts chars (the
         // tokenizer advances it once per `char`), so the range slices a
@@ -598,7 +475,6 @@ impl Decomposer {
             normalized_program,
             subcommand,
             args,
-            key,
             wrapper,
             execution_bearing_option,
             risk,
@@ -638,11 +514,10 @@ impl Decomposer {
                     }
                 }
                 CommandPrefixOrSuffixItem::AssignmentWord(_, w) => {
-                    // Assignments are effects even without substitution
-                    // (issue #289 remaining finding 1): they mutate
-                    // interactive-shell state. `PROMPT_COMMAND=…` runs at
-                    // the next prompt; `PATH=/evil/bin` redirects later
-                    // commands to attacker-controlled executables.
+                    // Assignments are effects even without substitution:
+                    // they mutate interactive-shell state. `PROMPT_COMMAND=…`
+                    // runs at the next prompt; `PATH=/evil/bin` redirects
+                    // later commands to attacker-controlled executables.
                     self.effects_only = true;
                     if word_has_substitution(&w.value) {
                         self.compound = true;
@@ -667,8 +542,7 @@ impl Decomposer {
         // file; reads a descriptor) even on a line with no program word:
         // `>important-file` executes a filesystem mutation with no
         // program token at all. Recorded so "decomposed to no simple
-        // command" can never be read as "no effect" (issue #289 review
-        // cycle 3, finding 1).
+        // command" can never be read as "no effect".
         self.effects_only = true;
         if let IoRedirect::File(_, _, IoFileRedirectTarget::ProcessSubstitution(_, _)) = redir {
             self.compound = true;
@@ -746,56 +620,8 @@ fn is_subcommand_token(word: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Derive a stable option-name set from argv suffixes. Values never enter the
-/// set: --flag=value and --flag value intentionally normalize to --flag.
-/// `--` ends parsing, and repeated names collapse in the BTreeSet.
-fn option_names(args: &[String], program: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let mut parse_options = true;
-    for arg in args {
-        if !parse_options {
-            continue;
-        }
-        if arg == "--" {
-            parse_options = false;
-            continue;
-        }
-        if !arg.starts_with('-') || arg == "-" {
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            let name = long.split_once('=').map_or(long, |(name, _)| name);
-            names.insert(normalize_option_name(program, &format!("--{name}")));
-            continue;
-        }
-        // Numeric short forms (for example git log -5) carry a value, not
-        // an option identity, so exclude them from the shape.
-        if arg[1..].chars().all(|ch| ch.is_ascii_digit()) {
-            continue;
-        }
-        // Short option clusters are represented as their component names so
-        // -vv and -v -v converge. This is conservative for short options
-        // with attached values: it may prompt more often, never less.
-        for short in arg[1..].chars() {
-            names.insert(normalize_option_name(program, &format!("-{short}")));
-        }
-    }
-    names
-}
-
-/// Cheap aliases shared by common CLIs. Expanding this list affects only
-/// prompt volume, never authority: omitted aliases merely produce a fresh key.
-fn normalize_option_name(_program: &str, option: &str) -> String {
-    match option {
-        "-m" => "--message".to_string(),
-        "-v" => "--verbose".to_string(),
-        _ => option.to_string(),
-    }
-}
-
 /// Values of these options can install a command string or executable path,
-/// so their invocations are always once-only. Keep this narrow and explicit;
-/// the shape key still protects every other novel option.
+/// so permission decisions must review their invocations.
 fn has_execution_bearing_option(args: &[String], program: &str) -> bool {
     let mut parse_options = true;
     let mut index = 0;
@@ -852,180 +678,6 @@ fn is_privileged_non_persistable(program: &str) -> bool {
 fn program_basename(program: &str) -> &str {
     program.rsplit(['/', '\\']).next().unwrap_or(program)
 }
-
-/// Mainstream command program basenames (basename match, so `/usr/bin/curl`
-/// and `curl` agree) whose plain invocations a receiving terminal would
-/// execute even though [`classify`] leaves them at the `Ordinary` tier:
-/// the run tool still prompts for every one of these (grant-or-ask), so
-/// computer-use terminal-input policy (issue #289) refuses typed text
-/// that carries one. Wrappers, privilege-escalators, and the
-/// risk-elevating programs are caught by their own classifier flags and
-/// tiers; this table covers the rest of the common shell surface.
-///
-/// Deliberately broad: a false positive only costs typing convenience
-/// (prose that begins with one of these words is refused). Program names
-/// **unknown to policy** stay typable because no text-only signal
-/// distinguishes an unknown command word from prose — the typed-line
-/// commit fence in `computer/mod.rs` is what refuses their execution.
-/// One unknown name does carry a text-only execution signal: a path
-/// separator, making the word an executable-path invocation
-/// (`./payload`, `bin/deploy.sh`, `/usr/local/bin/mytool`) rather than
-/// prose. Those are refused here at typing time, before any commit.
-/// Tokens carrying a URL scheme separator (`://`) stay typable — not
-/// because they are unexec'd by a shell (POSIX collapses repeated
-/// slashes, so `https://example.com` can resolve to a relative
-/// `https:/example.com` executable), but because typing executes
-/// nothing and no text-only signal distinguishes an address-bar URL
-/// from prose. Their **commit** is refused by the typed-line fence,
-/// which holds URL-shaped program tokens to the same runnable-command
-/// rule as every other program word (issue #289 review cycle 3,
-/// finding 2).
-pub fn typed_program_is_blocked_command(normalized_program: &str) -> bool {
-    if normalized_program.contains("://") {
-        return false;
-    }
-    if normalized_program.contains('/') || normalized_program.contains('\\') {
-        return true;
-    }
-    let base = program_basename(normalized_program);
-    TYPED_COMMAND_PROGRAMS.contains(&base)
-}
-
-const TYPED_COMMAND_PROGRAMS: &[&str] = &[
-    "alias",
-    "apt",
-    "apt-get",
-    "awk",
-    "base32",
-    "base64",
-    "brew",
-    "bun",
-    "cargo",
-    "cat",
-    "cd",
-    "clang",
-    "clear",
-    "cmake",
-    "cpio",
-    "curl",
-    "cut",
-    "date",
-    "dd",
-    "diff",
-    "dig",
-    "diskutil",
-    "dmesg",
-    "docker",
-    "dotnet",
-    "dpkg",
-    "echo",
-    "export",
-    "fdisk",
-    "ffmpeg",
-    "file",
-    "free",
-    "gcc",
-    "gdb",
-    "gem",
-    "gh",
-    "git",
-    "go",
-    "grep",
-    "gunzip",
-    "gzip",
-    "head",
-    "host",
-    "htop",
-    "ifconfig",
-    "ip",
-    "java",
-    "kubectl",
-    "kill",
-    "killall",
-    "less",
-    "ln",
-    "locate",
-    "ls",
-    "lsof",
-    "mail",
-    "make",
-    "man",
-    "mkdir",
-    "more",
-    "mount",
-    "msg",
-    "mv",
-    "mysql",
-    "nano",
-    "nc",
-    "netstat",
-    "nmap",
-    "node",
-    "npm",
-    "npx",
-    "open",
-    "openssl",
-    "osascript",
-    "passwd",
-    "patch",
-    "ping",
-    "pip",
-    "pip3",
-    "pkg",
-    "powershell",
-    "ps",
-    "psql",
-    "pwd",
-    "python",
-    "python3",
-    "rake",
-    "rm",
-    "rmdir",
-    "rsync",
-    "ruby",
-    "rustup",
-    "scp",
-    "sed",
-    "sha1sum",
-    "sha256sum",
-    "shred",
-    "shutdown",
-    "sleep",
-    "snap",
-    "sort",
-    "sqlite3",
-    "ssh",
-    "su",
-    "system_profiler",
-    "systemctl",
-    "tail",
-    "tar",
-    "tee",
-    "telnet",
-    "top",
-    "touch",
-    "tr",
-    "umount",
-    "uname",
-    "unzip",
-    "useradd",
-    "vi",
-    "vim",
-    "vmstat",
-    "w",
-    "watch",
-    "wc",
-    "wget",
-    "whereis",
-    "which",
-    "whoami",
-    "winget",
-    "xxd",
-    "yes",
-    "yum",
-    "zip",
-    "zypper",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableWord {

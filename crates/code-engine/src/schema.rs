@@ -7,7 +7,6 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
-    #[serde(default = "complete_call")]
     pub complete: bool,
 }
 impl ToolCall {
@@ -105,7 +104,7 @@ pub enum HistoryEvent {
         change: crate::subscriptions::SubscriptionChange,
     },
     SubscriptionOverflow,
-    /// D122: the user ran `!cmd` locally while viewing this agent. Only the
+    /// The user ran `!cmd` locally while viewing this agent. Only the
     /// facts are recorded (never the output); the notice is delivered once,
     /// before the agent's next model request, as a system reminder.
     LocalCommand {
@@ -149,16 +148,14 @@ pub enum HistoryEvent {
         tool_calls: Vec<ToolCall>,
         #[serde(default)]
         replay: Option<NativeReplay>,
-        #[serde(default)]
         status: CompletionStatus,
-        #[serde(default)]
         native_reason: String,
     },
     CallUpdate {
         call: ToolCall,
         reason: String,
     },
-    /// A once-only replacement before this assistant block's first replay (D59).
+    /// A once-only replacement before this assistant block's first replay.
     ThinkingUpdate {
         assistant: usize,
         #[serde(default)]
@@ -217,10 +214,6 @@ pub enum HistoryEvent {
     Question {
         question: QuestionRecord,
     },
-    Answer {
-        id: String,
-        text: String,
-    },
     QuestionsAnswered {
         id: String,
         answers: Vec<QuestionAnswer>,
@@ -250,10 +243,6 @@ pub enum HistoryEvent {
     },
     GoalState {
         state: Box<crate::goal_controller::GoalRun>,
-    },
-    Job {
-        id: String,
-        status: String,
     },
     JobUpdate {
         job: JobRecord,
@@ -349,18 +338,15 @@ pub struct HiddenForkOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentExecution {
-    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub spawning_context: Option<u32>,
     #[serde(default)]
     pub max_descendants: Option<u64>,
-    #[serde(default)]
     pub model_policy: Vec<crate::ModelPolicy>,
-    #[serde(default)]
+    #[serde(deserialize_with = "launch_identity")]
     pub launch_id: String,
-    #[serde(default)]
-    pub original_task: Option<String>,
+    pub original_task: String,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     pub agent_id: String,
@@ -368,6 +354,13 @@ pub struct AgentExecution {
     pub remaining_depth: Option<usize>,
     pub task: String,
     pub background: bool,
+}
+fn launch_identity<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    if id.is_empty() {
+        return Err(serde::de::Error::custom("launchId must be nonempty"));
+    }
+    Ok(id)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -407,15 +400,10 @@ pub struct Tokens {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecord {
     pub call_id: String,
-    #[serde(default)]
     pub session_id: String,
-    #[serde(default)]
     pub agent_id: String,
-    #[serde(default)]
     pub provider: String,
-    #[serde(default)]
     pub endpoint: String,
-    #[serde(default)]
     pub attempt: usize,
     #[serde(default)]
     pub input_estimate: Option<u64>,
@@ -545,7 +533,7 @@ pub struct QuestionRecord {
     pub discussing: bool,
     #[serde(default)]
     pub call_id: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "question_set")]
     pub questions: Vec<QuestionSpec>,
     #[serde(default)]
     pub answers: Option<Vec<QuestionAnswer>>,
@@ -558,6 +546,15 @@ pub struct QuestionRecord {
     pub text: String,
     pub answer: Option<String>,
     pub note: Option<String>,
+}
+fn question_set<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<QuestionSpec>, D::Error> {
+    let questions = Vec::<QuestionSpec>::deserialize(deserializer)?;
+    if questions.is_empty() {
+        return Err(serde::de::Error::custom("at least one question required"));
+    }
+    Ok(questions)
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -615,7 +612,6 @@ pub enum ApprovalDecision {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
     pub id: String,
-    #[serde(default)]
     pub call_id: String,
     #[serde(default)]
     pub parent_call_id: Option<String>,
@@ -908,9 +904,6 @@ pub enum EngineEvent {
         #[serde(flatten)]
         details: ToolResultDetails,
     },
-    Todo {
-        items: Value,
-    },
     Usage {
         usage: UsageRecord,
     },
@@ -994,5 +987,131 @@ impl SessionTotals {
             self.cache_write_tokens,
             self.cost_display()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_required_fields<T: Serialize + serde::de::DeserializeOwned>(
+        value: serde_json::Value,
+        fields: &[&str],
+    ) {
+        let record: T = serde_json::from_value(value).unwrap();
+        let saved = serde_json::to_value(record).unwrap();
+        let restored: T = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), saved);
+        for field in fields {
+            let mut missing = saved.clone();
+            assert!(missing.as_object_mut().unwrap().remove(*field).is_some());
+            let error = serde_json::from_value::<T>(missing).err().unwrap();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn stored_tool_calls_preserve_incomplete_calls_and_require_completeness() {
+        for complete in [false, true] {
+            assert_required_fields::<ToolCall>(
+                serde_json::json!({"id":"call", "name":"bash", "arguments":{}, "complete":complete}),
+                &["complete"],
+            );
+        }
+    }
+
+    #[test]
+    fn stored_assistant_events_require_completion_metadata() {
+        assert_required_fields::<HistoryEvent>(
+            serde_json::json!({"kind":"assistant", "text":"partial", "reasoning":[],
+                "tool_calls":[], "status":"output_limit", "native_reason":"max_tokens"}),
+            &["status", "native_reason"],
+        );
+    }
+
+    #[test]
+    fn stored_usage_requires_attribution_even_when_empty_or_zero() {
+        assert_required_fields::<UsageRecord>(
+            serde_json::json!({"callId":"call", "sessionId":"", "agentId":"", "provider":"p",
+                "endpoint":"p:command", "attempt":0, "model":"p/m", "kind":"agent",
+                "tokens":{}, "costUsd":null, "partial":false}),
+            &["sessionId", "agentId", "provider", "endpoint", "attempt"],
+        );
+    }
+
+    #[test]
+    fn stored_approval_requests_require_call_identity() {
+        assert_required_fields::<ApprovalRequest>(
+            serde_json::json!({"id":"approval", "callId":"call", "agentId":"root",
+                "breadcrumb":"root", "tool":"bash", "requested":{}, "resolved":{},
+                "reason":"approval"}),
+            &["callId"],
+        );
+    }
+
+    fn question_record() -> serde_json::Value {
+        serde_json::json!({"id":"set", "asker":"root", "recipient":null, "breadcrumb":"root",
+            "text":"Proceed?", "answer":null, "note":null,
+            "questions":[{"id":"q1", "text":"Proceed?", "kind":"boolean"}]})
+    }
+
+    #[test]
+    fn question_storage_requires_a_nonempty_structured_set() {
+        let value = question_record();
+        let question: QuestionRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(question.questions[0].kind, QuestionKind::Boolean);
+        let round_trip: QuestionRecord =
+            serde_json::from_value(serde_json::to_value(question).unwrap()).unwrap();
+        assert_eq!(round_trip.questions[0].id, "q1");
+        let mut empty = value.clone();
+        empty["questions"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<QuestionRecord>(empty).is_err());
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("questions");
+        assert!(serde_json::from_value::<QuestionRecord>(missing).is_err());
+    }
+
+    #[test]
+    fn question_answer_events_use_structured_answers_only() {
+        let event = HistoryEvent::QuestionsAnswered {
+            id: "set".into(),
+            answers: vec![QuestionAnswer {
+                id: "q1".into(),
+                boolean: Some(true),
+                ..Default::default()
+            }],
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["kind"], "questions_answered");
+        assert!(serde_json::from_value::<HistoryEvent>(value).is_ok());
+        assert!(
+            serde_json::from_value::<HistoryEvent>(
+                serde_json::json!({"kind":"answer", "id":"set", "text":"yes"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn launch_storage_requires_a_current_nonempty_identity() {
+        let value = serde_json::json!({"launchId":"launch", "agentId":"child", "cwd":".",
+            "title":"", "modelPolicy":[],
+            "remainingDepth":null, "originalTask":"original", "task":"task", "background":false});
+        assert_required_fields::<AgentExecution>(value.clone(), &["title", "modelPolicy"]);
+        let execution: AgentExecution = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(execution.launch_id, "launch");
+        assert_eq!(execution.original_task, "original");
+        let round_trip: AgentExecution =
+            serde_json::from_value(serde_json::to_value(&execution).unwrap()).unwrap();
+        assert_eq!(round_trip.original_task, "original");
+        let mut no_original = value.clone();
+        no_original.as_object_mut().unwrap().remove("originalTask");
+        assert!(serde_json::from_value::<AgentExecution>(no_original).is_err());
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("launchId");
+        assert!(serde_json::from_value::<AgentExecution>(missing).is_err());
+        let mut empty = value;
+        empty["launchId"] = serde_json::json!("");
+        assert!(serde_json::from_value::<AgentExecution>(empty).is_err());
     }
 }

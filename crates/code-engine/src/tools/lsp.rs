@@ -165,6 +165,18 @@ impl Manager {
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+
+/// Outer operation deadlines can drop a request before its own select returns.
+struct PendingRequest<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 #[derive(Clone)]
 struct Diagnostics {
     received: tokio::time::Instant,
@@ -199,7 +211,7 @@ impl Client {
         let mut child = command
             .spawn()
             .with_context(|| format!("start LSP {}", server.command))?;
-        let group = super::ProcessGroup(child.id().context("LSP pid unavailable")? as i32);
+        let group = super::ProcessGroup::new(child.id().context("LSP pid unavailable")? as i32);
         let stdin = Arc::new(AsyncMutex::new(
             child.stdin.take().context("LSP stdin unavailable")?,
         ));
@@ -311,6 +323,10 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        let pending_request = PendingRequest {
+            pending: &self.pending,
+            id,
+        };
         let result = tokio::select! {
             _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
             result = tokio::time::timeout(Duration::from_secs(30), async {
@@ -320,7 +336,7 @@ impl Client {
                 Ok(response["result"].clone())
             }) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("LSP request timed out"))),
         };
-        self.pending.lock().unwrap().remove(&id);
+        drop(pending_request);
         if result.is_err() {
             let _ = self.notify("$/cancelRequest", json!({"id":id})).await;
         }
@@ -799,4 +815,57 @@ fn render_introduced(
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_request_guard_cleans_up_when_outer_timeout_drops_future() {
+        let pending: Pending = Arc::default();
+        let (other_tx, mut other_rx) = oneshot::channel();
+        pending.lock().unwrap().insert(2, other_tx);
+        let (tx, mut rx) = oneshot::channel();
+        let result = tokio::time::timeout(Duration::from_millis(1), async {
+            pending.lock().unwrap().insert(1, tx);
+            let _guard = PendingRequest {
+                pending: &pending,
+                id: 1,
+            };
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(pending.lock().unwrap().len(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn pending_request_guard_allows_response_to_remove_entry_first() {
+        let pending: Pending = Arc::default();
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().unwrap().insert(1, tx);
+        let guard = PendingRequest {
+            pending: &pending,
+            id: 1,
+        };
+        pending
+            .lock()
+            .unwrap()
+            .remove(&1)
+            .unwrap()
+            .send(json!("ok"))
+            .unwrap();
+        drop(guard);
+        assert!(pending.lock().unwrap().is_empty());
+        assert_eq!(rx.try_recv().unwrap(), json!("ok"));
+    }
 }

@@ -617,7 +617,7 @@ async fn run_shell(
     mut child: tokio::process::Child,
     pid: i32,
 ) {
-    let guard = crate::pty::ProcessGroup(pid);
+    let guard = crate::pty::ProcessGroup::new(pid);
     let output_terminal = terminal.clone();
     let output_control = control.clone();
     let output_id = id.clone();

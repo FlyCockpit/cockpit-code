@@ -896,10 +896,7 @@ async fn dispatch(
             let query = args[key].as_str().ok_or_else(||anyhow::anyhow!("Use tools.search(query='...') for capability discovery or tools.describe(name='...') for a schema. {text_route}"))?.to_lowercase();
             if name == "tools.describe" {
                 return defs.iter().find(|d| d.name.to_lowercase() == query || names.canonical(&d.name).to_lowercase() == query)
-                    .map(|d|json!(d)).ok_or_else(|| {
-                        if query == "search" { anyhow::anyhow!("Repository search is retired in new sessions. {text_route} Use tools.search(query='...') only to discover allowed tools.") }
-                        else { anyhow::anyhow!("Tool unavailable: {query}. Discover allowed names with tools.search(query='...'); inspect with tools.describe(name='...').") }
-                    });
+                    .map(|d|json!(d)).ok_or_else(|| anyhow::anyhow!("Tool unavailable: {query}. Discover allowed names with tools.search(query='...'); inspect with tools.describe(name='...')."));
             }
             let cap = args.get("limit").map(|v|v.as_u64().filter(|n|(1..=100).contains(n)).ok_or_else(||anyhow::anyhow!("tools.search limit must be 1..100"))).transpose()?.unwrap_or(10) as usize;
             let terms = query.split(|c:char| !c.is_alphanumeric() && c != '_').filter(|t|!t.is_empty()).collect::<Vec<_>>();
@@ -979,9 +976,6 @@ async fn dispatch(
             .split_once('.')
             .map_or((name, None), |(b, a)| (b, Some(a)));
         if !defs.iter().any(|d| names.canonical(&d.name) == base) {
-            if base == "search" && let Some(text) = defs.iter().find(|d|names.canonical(&d.name)=="grep") {
-                bail!("Repository search is retired in new sessions. Use {}(pattern='...', path='...', glob='...') for text; tools.search(query='...') discovers capabilities.",text.name);
-            }
             bail!("tool {name} is unavailable to this agent; use tools.search(query='...') for allowed capabilities, then tools.describe(name='...')");
         }
         if let Some(action) = action {
@@ -1004,10 +998,8 @@ async fn dispatch(
                 | "grep"
                 | "glob"
                 | "bash"
-                | "todo"
                 | "script"
                 | "lsp"
-                | "search"
                 | "code"
                 | "graph"
                 | "context_pack"
@@ -1033,4 +1025,69 @@ async fn dispatch(
     }
     .await;
     result.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn discovery_lists_current_intel_and_rejects_unknown_search() {
+        let (temp, store) = crate::test_support::store(json!({}));
+        let session =
+            crate::Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        {
+            let state = session.state.lock().await;
+            let defs = crate::intel::definitions();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let barrier = Arc::new(CommitBarrier::default());
+            let mut details = ToolResultDetails::default();
+            let found = dispatch(
+                &state,
+                &defs,
+                "tools.describe",
+                "d",
+                json!({"name":"code"}),
+                &cancel,
+                barrier.clone(),
+                &tx,
+                &mut details,
+            )
+            .await
+            .unwrap();
+            assert_eq!(found["name"], "code");
+            for name in ["search", "unknown"] {
+                let error = dispatch(
+                    &state,
+                    &defs,
+                    name,
+                    "d",
+                    json!({}),
+                    &cancel,
+                    barrier.clone(),
+                    &tx,
+                    &mut details,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("unavailable to this agent"));
+                let error = dispatch(
+                    &state,
+                    &defs,
+                    "tools.describe",
+                    "d",
+                    json!({"name":name}),
+                    &cancel,
+                    barrier.clone(),
+                    &tx,
+                    &mut details,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("Tool unavailable:"));
+            }
+        }
+        session.shutdown().await.unwrap();
+    }
 }

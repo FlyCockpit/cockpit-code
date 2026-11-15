@@ -24,8 +24,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
-// search dispatch remains solely for already frozen legacy sessions. New definitions omit it.
-pub(crate) const NAMES: &[&str] = &["search", "code", "graph", "context_pack", "change_impact"];
+pub(crate) const NAMES: &[&str] = &["code", "graph", "context_pack", "change_impact"];
 #[derive(Default)]
 pub(crate) struct Manager {
     indexes: Mutex<HashMap<PathBuf, Index>>,
@@ -77,7 +76,6 @@ impl Manager {
         check(cancel)?;
         let args = &call.arguments;
         let result = match call.name.as_str() {
-            "search" => index.search(args, scope, cancel)?,
             "code" => index.code(args, scope)?,
             "graph" => index.graph(args, scope, cancel)?,
             "context_pack" => index.context_pack(root, args, scope, cancel)?,
@@ -512,5 +510,20 @@ impl ToolBox {
             manager.execute(&root, scope.as_deref(), &call, &cancel)
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_catalog_matches_dispatch_names() {
+        let defs = definitions();
+        assert_eq!(
+            defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            NAMES
+        );
+        assert!(!NAMES.contains(&"search"));
     }
 }

@@ -59,6 +59,15 @@ pub struct Options {
     pub flat: bool,
 }
 
+/// Coalesce a bounded burst so drawing and input get another select turn.
+fn drain_burst(mut next: impl FnMut() -> bool) {
+    for _ in 0..256 {
+        if !next() {
+            break;
+        }
+    }
+}
+
 fn restore() {
     let _ = execute!(
         io::stdout(),
@@ -343,23 +352,25 @@ async fn event_loop(app: &mut app::App, typed: &[u8]) -> Result<(), String> {
             ev = app::recv(engine_rx) => {
                 app.on_engine(ev);
                 // Coalesce bursts of stream deltas into one frame.
-                while let Some(rx) = app.events() {
+                drain_burst(|| {
+                    let Some(rx) = app.events() else { return false };
                     match rx.try_recv() {
-                        Ok(ev) => app.on_engine(Some(ev)),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(_) => { app.on_engine(None); break; }
+                        Ok(ev) => { app.on_engine(Some(ev)); true }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+                        Err(_) => { app.on_engine(None); false }
                     }
-                }
+                });
             },
             msg = app::recv_term(term_rx) => {
                 app.on_term_msg(msg);
-                while let Some(rx) = app.term_events() {
+                drain_burst(|| {
+                    let Some(rx) = app.term_events() else { return false };
                     match rx.try_recv() {
-                        Ok(msg) => app.on_term_msg(Some(msg)),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(_) => { app.on_term_msg(None); break; }
+                        Ok(msg) => { app.on_term_msg(Some(msg)); true }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+                        Err(_) => { app.on_term_msg(None); false }
                     }
-                }
+                });
             },
             _ = tick.tick() => {
                 app.tick += 1;
@@ -377,4 +388,37 @@ async fn event_loop(app: &mut app::App, typed: &[u8]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn burst_returns_with_backlog_and_preserves_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for i in 0..600 {
+            tx.send(i).unwrap();
+        }
+        let mut received = vec![];
+        drain_burst(|| match rx.try_recv() {
+            Ok(value) => {
+                received.push(value);
+                true
+            }
+            Err(_) => false,
+        });
+        assert_eq!(received, (0..256).collect::<Vec<_>>());
+        assert_eq!(rx.try_recv().unwrap(), 256);
+    }
+
+    #[test]
+    fn burst_stops_when_receiver_is_empty() {
+        let mut calls = 0;
+        drain_burst(|| {
+            calls += 1;
+            false
+        });
+        assert_eq!(calls, 1);
+    }
 }

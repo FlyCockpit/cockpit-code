@@ -237,12 +237,12 @@ async fn run(
     Ok((output, MediaInput::Attachment { attachment }))
 }
 async fn download(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?
-        .get(url)
-        .send()
-        .await?;
+    let response = crate::http_client(|| {
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+    })?
+    .get(url)
+    .send()
+    .await?;
     if !response.status().is_success() {
         bail!(
             "image URL returned HTTP {}; use its direct URL",

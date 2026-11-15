@@ -413,8 +413,8 @@ fn extract_symbols(
     while let Some(m) = matches.next() {
         // Simple top-level definition: name + def captures present.
         if let (Some(ni), Some(di)) = (idx_name, idx_def) {
-            let name_cap = m.captures.iter().find(|c| c.index == ni);
-            let def_cap = m.captures.iter().find(|c| c.index == di);
+            let name_cap = m.captures().iter().find(|c| c.index == ni);
+            let def_cap = m.captures().iter().find(|c| c.index == di);
             if let (Some(nc), Some(dc)) = (name_cap, def_cap)
                 && let Ok(name) = nc.node.utf8_text(source)
             {
@@ -439,17 +439,17 @@ fn extract_symbols(
         // Method nested in a container — parent comes from the container
         // capture (impl_type / class_name / recv).
         if let (Some(mi), Some(mdi)) = (idx_method, idx_method_def) {
-            let method_cap = m.captures.iter().find(|c| c.index == mi);
-            let method_def_cap = m.captures.iter().find(|c| c.index == mdi);
+            let method_cap = m.captures().iter().find(|c| c.index == mi);
+            let method_def_cap = m.captures().iter().find(|c| c.index == mdi);
             if let (Some(mc), Some(mdc)) = (method_cap, method_def_cap)
                 && let Ok(name) = mc.node.utf8_text(source)
             {
                 let parent = idx_impl_type
-                    .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                    .and_then(|i| m.captures().iter().find(|c| c.index == i))
                     .or_else(|| {
-                        idx_class_name.and_then(|i| m.captures.iter().find(|c| c.index == i))
+                        idx_class_name.and_then(|i| m.captures().iter().find(|c| c.index == i))
                     })
-                    .or_else(|| idx_recv.and_then(|i| m.captures.iter().find(|c| c.index == i)))
+                    .or_else(|| idx_recv.and_then(|i| m.captures().iter().find(|c| c.index == i)))
                     .and_then(|c| c.node.utf8_text(source).ok())
                     .map(|s| s.trim_start_matches(['*', '&']).to_string());
                 let def = mdc.node;
@@ -896,4 +896,81 @@ pub fn regex_outline(source: &str) -> Vec<(String, i64)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Language, extract};
+
+    #[test]
+    fn upgraded_grammars_parse_and_query_function_symbols() {
+        let mut cases = vec![
+            (Language::Rust, "fn example() { target(); }"),
+            (
+                Language::TypeScript,
+                "function example(): void { target(); }",
+            ),
+            (Language::Tsx, "function example() { return <div/>; }"),
+            (Language::JavaScript, "function example() { target(); }"),
+            (Language::Python, "def example():\n    target()\n"),
+            (Language::Go, "package main\nfunc example() { target() }"),
+        ];
+        if cfg!(feature = "intel-c") {
+            cases.push((Language::C, "void example() { target(); }"));
+        }
+        if cfg!(feature = "intel-cpp") {
+            cases.push((Language::Cpp, "void example() { target(); }"));
+        }
+        for (lang, source) in cases {
+            let extraction = extract(lang, source.as_bytes()).unwrap();
+            assert!(
+                extraction.symbols.iter().any(|s| s.name == "example"),
+                "{lang:?}: {extraction:?}"
+            );
+            assert!(
+                extraction.identifiers.iter().any(|i| i.token == "example"),
+                "{lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_captures_keep_method_parents() {
+        for (lang, source) in [
+            (
+                Language::Rust,
+                "struct Example; impl Example { fn method(&self) {} }",
+            ),
+            (Language::TypeScript, "class Example { method() {} }"),
+            (
+                Language::Python,
+                "class Example:\n    def method(self):\n        pass\n",
+            ),
+            (
+                Language::Go,
+                "package main\ntype Example struct {}\nfunc (e *Example) method() {}",
+            ),
+        ] {
+            let extraction = extract(lang, source.as_bytes()).unwrap();
+            assert!(
+                extraction
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == "method" && s.parent.as_deref() == Some("Example")),
+                "{lang:?}: {extraction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_call_keeps_rightmost_identifier() {
+        let extraction = extract(Language::Rust, b"fn example() { module::target(); }").unwrap();
+        assert!(
+            extraction
+                .callsites
+                .iter()
+                .any(|c| c.callee_name == "target"),
+            "{extraction:?}"
+        );
+    }
 }

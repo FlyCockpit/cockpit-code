@@ -1,4 +1,4 @@
-//! Criteria (D88–D92, D110): the read-only checklist overlay (`/criteria`)
+//! Criteria: the read-only checklist overlay (`/criteria`)
 //! and the contract editor used by `/goal` approval, `/goal edit` and a
 //! roadblock pivot. Both share the dialog chrome: a rounded accent border
 //! on the surface color, a faint key-hint footer, and a scrollbar in the
@@ -37,7 +37,7 @@ pub fn mark(c: &CriterionView) -> (&'static str, Style) {
 }
 
 /// "user · verified", "self · check failed": owner and the verification
-/// label owners always see (D90). Open criteria show only the owner.
+/// label owners always see. Open criteria show only the owner.
 pub fn meta(c: &CriterionView, steps: bool) -> String {
     let mut parts = vec![];
     if !steps {
@@ -166,7 +166,7 @@ fn location_rows(
     (rows, links)
 }
 
-/// D126/D132 findings of an area. Compact: one row per finding (severity,
+/// Findings of an area. Compact: one row per finding (severity,
 /// first location, problem) plus coverage counts. Open: every field.
 fn finding_rows(c: &CriterionView, width: usize, open: bool) -> (Vec<Line<'static>>, Vec<Link>) {
     let t = theme();
@@ -907,7 +907,7 @@ pub struct ContractEditor {
     len: usize,
     spans: Vec<(usize, usize)>,
     /// The wheel or scrollbar moved the view: leave it until the next key
-    /// or click (D130).
+    /// or click.
     pinned: bool,
 }
 

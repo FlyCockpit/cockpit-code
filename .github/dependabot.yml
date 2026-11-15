@@ -1,0 +1,20 @@
+version: 2
+
+# Supply-chain guardrail: `cooldown.default-days` makes Dependabot ignore
+# releases younger than 7 days when it opens version-update PRs, matching the
+# release-age policy the project uses for manual upgrades. Security updates
+# are not delayed by cooldown, so a real advisory fix still lands immediately.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

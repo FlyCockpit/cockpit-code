@@ -1,6 +1,6 @@
-//! tui-v13 panels and controls: `/agents` (D131) with ask status,
-//! finalize and stop, the agent strip's actions, `/decisions` (D128) and
-//! `/subagents` (D133).
+//! Panels and controls: `/agents` with ask status,
+//! finalize and stop, the agent strip's actions, `/decisions` and
+//! `/subagents`.
 use super::{App, DialogPurpose, Overlay};
 use crate::agentsview::{AgentRow, AgentsAction, AgentsView};
 use crate::decisionsview::{DecisionsAction, DecisionsView};
@@ -280,7 +280,7 @@ impl App {
         changed
     }
 
-    /// An agent strip action chip (D131): ask status, stop branch, finalize,
+    /// An agent strip action chip: ask status, stop branch, finalize,
     /// or the agent in `/agents`.
     pub(super) fn strip_act(&mut self, id: &str, act: crate::ui::StripAct) {
         use crate::ui::StripAct;
@@ -304,7 +304,7 @@ impl App {
             let (role, rest) = (it.next().unwrap_or_default(), it.next().unwrap_or_default());
             v.push((id.clone(), a.label.clone()));
             v.push((
-                format!("{role}-{}", &rest[..rest.len().min(8)]),
+                format!("{role}-{}", rest.chars().take(8).collect::<String>()),
                 a.label.clone(),
             ));
         }
@@ -375,7 +375,7 @@ impl App {
         }
     }
 
-    // ---- /subagents (D133) ----------------------------------------------
+    // ---- /subagents ----------------------------------------------
 
     /// The session header names the mode: keep it true after a change.
     fn mode_changed(&mut self, flat: bool) {

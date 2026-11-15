@@ -229,7 +229,6 @@ pub struct ToolBox {
     reads: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
     read_contents: Arc<Mutex<crate::file_notices::ReadMemory>>,
     own_writes: Arc<Mutex<RecentWrites>>,
-    todos: Arc<Mutex<Value>>,
     pub(crate) lsp: Arc<lsp::Manager>,
     pub(crate) intel: Arc<crate::intel::Manager>,
     bash_history: Arc<Mutex<HashMap<String, bash_hints::History>>>,
@@ -258,7 +257,6 @@ impl ToolBox {
             reads: Arc::default(),
             read_contents: Arc::default(),
             own_writes: Arc::default(),
-            todos: Arc::new(Mutex::new(json!([]))),
             lsp: Arc::default(),
             intel: Arc::default(),
             bash_history: Arc::default(),
@@ -282,7 +280,6 @@ impl ToolBox {
             reads: Arc::new(Mutex::new(self.reads.lock().unwrap().clone())),
             read_contents: Arc::new(Mutex::new(self.read_contents.lock().unwrap().clone())),
             own_writes: self.own_writes.clone(),
-            todos: Arc::new(Mutex::new(json!([]))),
             lsp: self.lsp.clone(),
             intel: self.intel.clone(),
             bash_history: self.bash_history.clone(),
@@ -296,7 +293,7 @@ impl ToolBox {
         tools
     }
     /// Observe revisions without authorizing a stale write or advancing read state.
-    pub(crate) fn context_observations(&self) -> (Value, Vec<(PathBuf, String, String)>) {
+    pub(crate) fn context_observations(&self) -> Vec<(PathBuf, String, String)> {
         let reads = self.reads.lock().unwrap().clone();
         let mut changed = reads
             .into_iter()
@@ -315,7 +312,7 @@ impl ToolBox {
             })
             .collect::<Vec<_>>();
         changed.sort_by(|a, b| a.0.cmp(&b.0));
-        (self.todos.lock().unwrap().clone(), changed)
+        changed
     }
     pub(crate) fn watch_source(&self, path: &Path, bytes: &[u8]) {
         self.read_contents.lock().unwrap().remember(path, bytes);
@@ -442,12 +439,6 @@ impl ToolBox {
                 json!({"pattern":string,"path":path,"offset":number,"start_byte":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}}),
                 json!(["pattern"]),
             ),
-            def(
-                "todo",
-                "Replace the session todo list with items having content and pending/in_progress/completed status.",
-                json!({"items":{"type":"array","items":{"type":"object","properties":{"content":string,"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"],"additionalProperties":false}}}),
-                json!(["items"]),
-            ),
         ];
         definitions.extend(media::definitions());
         definitions.push(lsp::definition());
@@ -531,7 +522,7 @@ impl ToolBox {
         call: ToolCall,
         cancel: CancellationToken,
         barrier: Arc<CommitBarrier>,
-        tx: &EventSender,
+        _tx: &EventSender,
     ) -> ToolOutput {
         let mut canonical = call.clone();
         let mut details = ToolResultDetails::default();
@@ -655,14 +646,6 @@ impl ToolBox {
                         );
                         result
                     }
-                }
-                "todo" => {
-                    let items = prepared.call.arguments["items"].clone();
-                    *self.todos.lock().unwrap() = items.clone();
-                    let _ = tx.send(EngineEvent::Todo {
-                        items: items.clone(),
-                    });
-                    Ok(items.to_string())
                 }
                 "write" | "edit" => {
                     let path = prepared.target.clone().context("missing write path")?;
@@ -873,14 +856,18 @@ impl ToolBox {
             .as_ref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
-        let diff = similar::TextDiff::from_lines(&before, &body)
+        let diff = similar::TextDiff::configure()
+            .algorithm(similar::Algorithm::RawMyers)
+            .diff_lines(&before, &body)
             .unified_diff()
             .context_radius(3)
             .header(&path.to_string_lossy(), &path.to_string_lossy())
             .to_string();
-        let changes = similar::TextDiff::from_lines(&before, &body);
-        let old_lines = changes.old_slices();
-        let new_lines = changes.new_slices();
+        let changes = similar::TextDiff::configure()
+            .algorithm(similar::Algorithm::RawMyers)
+            .diff_lines(&before, &body);
+        let old_lines: Vec<_> = changes.iter_old_slices().collect();
+        let new_lines: Vec<_> = changes.iter_new_slices().collect();
         let hunks = changes
             .grouped_ops(3)
             .into_iter()
@@ -995,7 +982,7 @@ impl ToolBox {
             }
             "grep" | "glob" => self.search(call, cancel),
             _ => bail!(
-                "unknown tool {}; available: read, write, edit, bash, grep, glob, todo",
+                "unknown tool {}; available: read, write, edit, bash, grep, glob",
                 call.name
             ),
         }
@@ -1210,7 +1197,7 @@ impl ToolBox {
             None
         };
         let mut child = cmd.spawn().context("start sh")?;
-        let guard = ProcessGroup(child.id().context("missing child pid")? as i32);
+        let guard = ProcessGroup::new(child.id().context("missing child pid")? as i32);
         // Drain every raw byte to disk before bounded preview capture/compression.
         let spool = if job.is_none() {
             Some(Arc::new(Mutex::new(tempfile::tempfile()?)))
@@ -1462,6 +1449,10 @@ fn cap_at(body: &str, limit: usize) -> String {
 }
 struct ProcessGroup(i32);
 impl ProcessGroup {
+    fn new(pgid: i32) -> Self {
+        crate::process_groups::track(pgid);
+        Self(pgid)
+    }
     fn signal(&self, signal: i32) {
         unsafe {
             libc::kill(-self.0, signal);
@@ -1471,6 +1462,7 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.signal(libc::SIGKILL);
+        crate::process_groups::forget(self.0);
     }
 }
 async fn capture(

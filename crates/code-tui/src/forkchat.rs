@@ -1,4 +1,4 @@
-//! "Chat about this in a fork" (D64): an interactive hidden fork of a
+//! "Chat about this in a fork": an interactive hidden fork of a
 //! question's asker. The view shows the questions, the fork's chat and an
 //! input; the fork answers with its `answer_question` script function,
 //! which closes it. The asker keeps running or waiting meanwhile.
@@ -86,38 +86,18 @@ impl ForkChat {
         }
     }
 
-    /// A fork tool call finished: its row gets the result and run time.
-    /// Without structured data (older engines) the "name: output" text
-    /// becomes an untimed row.
-    pub fn tool(&mut self, text: String, call: Option<ToolCall>, result: Option<ToolResultData>) {
-        match (call, result) {
-            (Some(c), Some(r)) => {
-                let known = self
-                    .transcript
-                    .entries
-                    .iter()
-                    .any(|e| matches!(&e.kind, Kind::Tool(t) if t.id == c.id));
-                if known {
-                    self.transcript
-                        .tool_end(&c.id, r.output, r.is_error, r.details);
-                } else {
-                    self.transcript.recorded_tool(c, Some(r));
-                }
-            }
-            (call, _) => {
-                let (name, output) = text
-                    .split_once(": ")
-                    .map_or(("tool", text.as_str()), |(n, o)| (n, o));
-                let id = call.map(|c| c.id).unwrap_or_default();
-                self.transcript
-                    .replayed_tool(id.clone(), name.to_string(), serde_json::json!({}));
-                self.transcript.tool_end(
-                    &id,
-                    output.to_string(),
-                    output.starts_with("Error:"),
-                    Default::default(),
-                );
-            }
+    /// A fork tool call finished: its structured row gets the result and run time.
+    pub fn tool(&mut self, call: ToolCall, result: ToolResultData) {
+        let known = self
+            .transcript
+            .entries
+            .iter()
+            .any(|e| matches!(&e.kind, Kind::Tool(t) if t.id == call.id));
+        if known {
+            self.transcript
+                .tool_end(&call.id, result.output, result.is_error, result.details);
+        } else {
+            self.transcript.recorded_tool(call, Some(result));
         }
         self.back = 0;
     }
@@ -130,7 +110,7 @@ impl ForkChat {
         for m in messages {
             match (m.role.as_str(), m.tool_call) {
                 ("tool", Some(call)) => self.transcript.recorded_tool(call, m.tool_result),
-                ("tool", None) => self.tool(m.text, None, None),
+                ("tool", None) => {}
                 (role, _) => {
                     self.message(role, m.text);
                     self.transcript.stamp_last(&m.ts);
@@ -336,5 +316,74 @@ impl ForkChat {
             (cx, cy)
         };
         frame.set_cursor_position((area.x + 2 + cursor.0, inner_y + input_y as u16 + cursor.1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call() -> ToolCall {
+        ToolCall {
+            id: "call".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path":"a.rs"}),
+            complete: true,
+        }
+    }
+    fn result() -> ToolResultData {
+        ToolResultData {
+            output: "contents: with colon".into(),
+            is_error: false,
+            details: Default::default(),
+        }
+    }
+    #[test]
+    fn structured_tool_results_update_live_and_restored_rows() {
+        for live in [false, true] {
+            let mut chat = ForkChat::with_summary("root".into(), vec![]);
+            if live {
+                chat.tool_start(Some(call()));
+            }
+            chat.tool(call(), result());
+            let tools = chat
+                .transcript
+                .entries
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Kind::Tool(t) => Some(t),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name, "read");
+            assert_eq!(tools[0].args["path"], "a.rs");
+            assert_eq!(tools[0].output.as_deref(), Some("contents: with colon"));
+        }
+    }
+    #[test]
+    fn saved_tool_rows_require_structured_calls() {
+        let mut chat = ForkChat::with_summary("root".into(), vec![]);
+        chat.load(vec![ForkChatMessage {
+            role: "tool".into(),
+            text: "opaque".into(),
+            ts: String::new(),
+            tool_call: Some(call()),
+            tool_result: Some(result()),
+        }]);
+        assert!(
+            chat.transcript
+                .entries
+                .iter()
+                .any(|e| matches!(&e.kind, Kind::Tool(t) if t.args["path"] == "a.rs"))
+        );
+        chat.load(vec![ForkChatMessage {
+            role: "tool".into(),
+            text: "read: old".into(),
+            ts: String::new(),
+            tool_call: None,
+            tool_result: None,
+        }]);
+        assert!(chat.transcript.entries.is_empty());
     }
 }

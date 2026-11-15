@@ -1,4 +1,4 @@
-//! Structured questions (D62): one dialog per `question` call with a tab
+//! Structured questions: one dialog per `question` call with a tab
 //! per question and a single Submit. Choice questions show radio options
 //! (checkboxes with `multiSelect`) plus a free-text "Other…" field; boolean
 //! questions show Yes / No plus an optional note; text questions show a
@@ -31,11 +31,11 @@ pub enum Outcome {
     Later,
     /// Open this asker's transcript; the dialog stays queued.
     Jump(String),
-    /// "Chat about this" (D64) for this call.
+    /// "Chat about this" for this call.
     Discuss(String),
-    /// "Chat about this in a fork" (D64) for this call.
+    /// "Chat about this in a fork" for this call.
     ForkChat(String),
-    /// Answers per call; calls left untouched stay pending (D64).
+    /// Answers per call; calls left untouched stay pending.
     Submit(Vec<(String, Vec<QAnswer>)>),
 }
 
@@ -88,8 +88,8 @@ pub struct QDialog {
 }
 
 impl QDialog {
-    /// One dialog over several calls (the pending-questions dialog, D64)
-    /// or a single call (D62).
+    /// One dialog over several calls (the pending-questions dialog)
+    /// or a single call.
     pub fn new(title: String, calls: Vec<(Call, Vec<QItem>)>) -> Self {
         let mut items = vec![];
         let mut item_call = vec![];
@@ -172,6 +172,18 @@ impl QDialog {
 
     fn in_field(&self) -> bool {
         self.rows().get(self.focus) == Some(&Row::Field)
+    }
+
+    /// Paste into the focused answer field, just like typed text.
+    pub fn paste(&mut self, text: &str) {
+        if !self.items.is_empty() && self.in_field() {
+            let s = &mut self.state[self.tab];
+            s.field.insert(&text.replace('\n', " "));
+            s.skipped = false;
+            if self.items[self.tab].kind == QKind::Choice && !self.items[self.tab].multi {
+                s.picked.iter_mut().for_each(|p| *p = false);
+            }
+        }
     }
 
     /// Whether question `i` has an answer (or is skipped).
@@ -803,5 +815,65 @@ impl QDialog {
                 frame.set_cursor_position((inner.x + x, y));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::QOption;
+
+    fn dialog(kind: QKind) -> QDialog {
+        QDialog::new(
+            "questions".into(),
+            vec![(
+                Call {
+                    id: "call".into(),
+                    asker: "root".into(),
+                    label: "root".into(),
+                    preamble: String::new(),
+                    can_jump: false,
+                },
+                vec![QItem {
+                    id: Some("q".into()),
+                    text: "Question?".into(),
+                    kind,
+                    options: vec![QOption {
+                        label: "A".into(),
+                        description: None,
+                    }],
+                    multi: false,
+                }],
+            )],
+        )
+    }
+
+    #[test]
+    fn paste_targets_only_focused_field_and_clears_skip() {
+        for kind in [QKind::Text, QKind::Choice, QKind::Boolean] {
+            let mut d = dialog(kind);
+            d.focus = d.rows().iter().position(|r| *r == Row::Field).unwrap();
+            d.state[0].skipped = true;
+            d.paste("界\nanswer");
+            assert_eq!(d.state[0].field.text, "界 answer");
+            assert!(!d.state[0].skipped);
+            d.focus = d.rows().len();
+            d.paste("ignored");
+            assert_eq!(d.state[0].field.text, "界 answer");
+        }
+    }
+
+    #[test]
+    fn pasted_other_replaces_single_choice() {
+        let mut d = dialog(QKind::Choice);
+        d.pick(Row::Option(0), false);
+        d.paste("ignored while option focused");
+        assert!(d.state[0].field.text.is_empty());
+        d.focus = 1;
+        d.paste("other");
+        assert!(!d.state[0].picked[0]);
+        assert!(
+            matches!(&d.answers()[0].1[0], QAnswer::Choice { labels, other: Some(text) } if labels.is_empty() && text == "other")
+        );
     }
 }

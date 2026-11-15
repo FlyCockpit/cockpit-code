@@ -116,7 +116,7 @@ impl App {
         }
     }
 
-    /// D130: the wheel scrolls the view under the pointer, never a
+    /// The wheel scrolls the view under the pointer, never a
     /// selection. Inside the overlay: the pane under the pointer (a
     /// recorded region, else the overlay's main view). Outside it: what is
     /// under the pointer there (the transcript, strip, composer …); a
@@ -152,7 +152,7 @@ impl App {
         }
     }
 
-    /// The wheel over a recorded scroll region (D130). True when one is
+    /// The wheel over a recorded scroll region. True when one is
     /// under the pointer (even at its end, so nothing behind it scrolls).
     fn wheel_region(&mut self, x: u16, y: u16, delta: isize) -> bool {
         let Some((id, g)) = self.hits.region_at(x, y) else {
@@ -353,7 +353,7 @@ impl App {
         if self.transcript.prune_abandoned() {
             changed = true;
         }
-        // Startup MCP health check (D69): report each broken server once.
+        // Startup MCP health check: report each broken server once.
         if let Some(until) = self.mcp_check_until
             && self.tick.is_multiple_of(5)
         {

@@ -31,10 +31,12 @@ Every key is optional. Unknown keys are ignored. A syntax error in `config.json`
 | `permissions.autoModel` | none | Safety sidecar for `auto`/`unattended`; must take and produce text. |
 | `permissions.autoVariations` | `3` | Candidates generated when the sidecar answers "improve". |
 | `permissions.prompts.toolCall` / `.writeEdit` | built-in | Markdown files replacing the safety prompts; relative to `CONFIG`. |
+| `subagents.mode` | `"tree"` | `subagents` is an object; mode is `"tree"` or `"flat"`. |
 | `subagents.maxDepth` | `null` (unlimited) | |
 | `subagents.maxConcurrentChildren` | `4` | Per parent. |
 | `subagents.maxTotalAgents` | `null` | Live agents across the tree. |
 | `script.cpuSecs`, `script.maxCalls` | `10`, `1000` | Limits for the `script` tool. |
+| `generate.maxOutputBytes` | `4294967296` (4 GiB) | Hard ceiling per `generate` output (raw provider response, decoded media, command `outputFile`). Output stays in memory up to 64 MiB (response) / 256 MiB (decoded media), then spills to a private temp file under the session directory; exceeding the ceiling fails the call. |
 | `benchmarks` | `{}` | Key → `{label, unit?, higherIsBetter}` (`higherIsBetter` defaults to true). Register every benchmark key used in provider files so `models rank` sorts the right way. |
 | `web.provider` | none | `firecrawl` \| `tinyfish`. Without it `web_search` errors and `web_fetch` does a plain HTTP GET. |
 | `web.apiKey` | none | Must be exactly one `${VAR}` reference such as `"${FIRECRAWL_API_KEY}"`; a literal key is a config error. Expanded when a web tool runs. |
@@ -92,7 +94,7 @@ managed defaults and upgrades untouched entries, preserving edits and deletions.
 
 LSP auto-detects installed binaries for project languages at session start (gitignore-aware scan, up to 100,000 entries). Shipped names are `rust` (rust-analyzer), `typescript` (typescript-language-server --stdio), `python` (basedpyright-langserver --stdio, then pyright-langserver), `go` (gopls), `cpp` (clangd). No servers are downloaded. `init`/`doctor` show detections and missing-binary install hints for observed languages.
 
-`lsp.<name>` partially overrides defaults: `command`, `args`, `fileGlobs`, `rootMarkers`; omitted fields inherit, explicit empty arrays replace. `enabled:false` disables a default; arbitrary names add servers. For example `{"lsp":{"cpp":{"enabled":false},"python":{"command":"pyright-langserver"}}}`. Both binary availability and matching project files are required. The resolved map, including an empty map, is persisted in the session; config/PATH/new language changes need a new session. No matching server means no native or script LSP tool. Existing frozen legacy tool surfaces remain intact.
+`lsp.<name>` partially overrides defaults: `command`, `args`, `fileGlobs`, `rootMarkers`; omitted fields inherit, explicit empty arrays replace. `enabled:false` disables a default; arbitrary names add servers. For example `{"lsp":{"cpp":{"enabled":false},"python":{"command":"pyright-langserver"}}}`. Both binary availability and matching project files are required. The resolved map, including an empty map, is persisted in the session; config/PATH/new language changes need a new session. No matching server means no native or script LSP tool.
 
 LSP also accepts `lsp.afterWrite`:
 `"errors" | "errors+warnings" | "off"` (default errors+warnings) and
@@ -102,7 +104,7 @@ capped to 20 lines. Timeouts/no matching server never fail a write. A model may
 set `"lsp":{"afterWrite":"off"}` (or errors/errors+warnings) to override global
 behavior; afterWriteMs can also be overridden per model.
 
-The standalone repository `search` tool is retired for new sessions; use grep for text and code for syntax. Its internal index remains. Untouched managed search defaults are removed on upgrade; edited legacy entries are inert for new sessions.
+Use grep for repository text and code for syntax. Tool overrides must name a current tool; unknown names are configuration errors.
 
 `code` is native in core. `graph`, `context_pack` and `change_impact` are Monty-only in both full and core. Their bounded heuristic results cannot prove absence or correctness.
 

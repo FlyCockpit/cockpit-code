@@ -209,7 +209,7 @@ impl DiffView {
         self.top = top.min(self.rows.saturating_sub(self.view));
     }
 
-    /// The file list's top row (its wheel and scrollbar; D130: the
+    /// The file list's top row (its wheel and scrollbar; the
     /// selected file stays).
     pub fn set_list_offset(&mut self, top: usize) {
         self.list_top = top.min(self.files.len().saturating_sub(self.list_view));

@@ -32,6 +32,17 @@ impl JsonRpcRequest {
     }
 }
 
+/// Only responses may resolve an outstanding client request. Server requests can
+/// reuse the same numeric ID because each direction owns its own ID namespace.
+pub fn response_id(value: &Value) -> Option<u64> {
+    if value.get("method").is_some()
+        || (value.get("result").is_none() && value.get("error").is_none())
+    {
+        return None;
+    }
+    value.get("id").and_then(Value::as_u64)
+}
+
 /// A JSON-RPC 2.0 response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcResponse {
@@ -63,7 +74,6 @@ impl JsonRpcResponse {
     }
 }
 
-pub const MCP_TOOL_NAME_MAX_CHARS: usize = 128;
 pub const MCP_TOOL_DESCRIPTION_MAX_CHARS: usize = 2_048;
 
 /// One tool descriptor as returned by `tools/list`.
@@ -171,4 +181,29 @@ pub fn parse_tools_list(result: &Value) -> Result<Vec<ToolDescriptor>> {
         out.push(sanitize_tool_descriptor(desc));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_ids_exclude_server_requests_notifications_and_missing_payloads() {
+        for value in [
+            json!({"id":7,"method":"sampling/createMessage"}),
+            json!({"id":7,"method":"ping","result":null}),
+            json!({"method":"notifications/changed"}),
+            json!({"id":7}),
+            json!({"id":"7","result":null}),
+        ] {
+            assert_eq!(response_id(&value), None, "{value}");
+        }
+        for value in [
+            json!({"id":7,"result":null}),
+            json!({"id":7,"result":{"tools":[]}}),
+            json!({"id":7,"error":{"code":-32601,"message":"unsupported"}}),
+        ] {
+            assert_eq!(response_id(&value), Some(7), "{value}");
+        }
+    }
 }

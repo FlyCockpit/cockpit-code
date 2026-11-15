@@ -122,7 +122,19 @@ fn parse(path: &Path, content: &str) -> Result<Vec<GuidanceItem>, EngineError> {
                 path.display()
             ))
         })?;
-        let metadata: GuidanceMetadata = serde_yaml_ng::from_str(&rest[..end]).map_err(|_| {
+        let metadata: GuidanceMetadata = serde_saphyr::from_str_with_options(
+            &rest[..end],
+            serde_saphyr::options! {
+                ignore_binary_tag_for_string: true,
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                duplicate_keys: serde_saphyr::DuplicateKeyPolicy::PassThrough,
+                strict_booleans: true,
+                leading_zero_numbers_as_strings: true,
+                underscored_numbers_as_strings: true,
+                non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+            },
+        )
+        .map_err(|_| {
             EngineError::bad(format!("{}: invalid guidance frontmatter", path.display()))
         })?;
         (metadata, &rest[end + 4..])
@@ -291,4 +303,62 @@ pub fn starter_files() -> [(&'static str, &'static str); 4] {
         ),
         ("data.md", include_str!("builtin/guidance/data.md")),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn guidance_binary_tags_keep_literal_string_text() {
+        let items = parse(std::path::Path::new("guidance.md"), "---\nwhen: !!binary SGVsbG8=\nlanguages: [!!binary V29ybGQ=]\n---\n- **rule Example**\nText\n").unwrap();
+        assert_eq!(items[0].metadata.when, ["SGVsbG8="]);
+        assert_eq!(items[0].metadata.languages, ["V29ybGQ="]);
+    }
+    use std::path::Path;
+
+    #[test]
+    fn guidance_frontmatter_preserves_strings_lists_and_ignored_nested_values() {
+        let input = "---\nwhen: 'quoted: trigger'\nlanguages: &langs [rust, python]\nglobs: ['src/**', '*.rs']\nextra: {nested: [1, true, null]}\n---\n- **rule Example**\n  Use this guidance.\n";
+        let items = parse(Path::new("guidance.md"), input).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].metadata.when, ["quoted: trigger"]);
+        assert_eq!(items[0].metadata.languages, ["rust", "python"]);
+        assert_eq!(items[0].metadata.globs, ["src/**", "*.rs"]);
+        let items = parse(Path::new("guidance.md"), "---\nwhen: |\n  first\n  second\nlanguages: &langs [rust]\nglobs: []\nextra: *langs\n---\n- **rule Example**\nText\n").unwrap();
+        assert_eq!(items[0].metadata.when, ["first\nsecond\n"]);
+        assert!(items[0].metadata.globs.is_empty());
+    }
+
+    #[test]
+    fn guidance_preserves_numeric_looking_strings_and_ignores_merge_fields() {
+        let items = parse(Path::new("guidance.md"), "---\nlanguages: [01, 1_000, 'true']\ndefaults: &defaults {when: merged}\n<<: *defaults\nextra: .inf\n---\n- **rule Example**\nText\n").unwrap();
+        assert_eq!(items[0].metadata.languages, ["01", "1_000", "true"]);
+        assert!(items[0].metadata.when.is_empty());
+    }
+
+    #[test]
+    fn guidance_accepts_empty_metadata_and_rejects_invalid_yaml() {
+        let items = parse(
+            Path::new("guidance.md"),
+            "---\n\n---\n- **rule Example**\nText\n",
+        )
+        .unwrap();
+        assert!(items[0].metadata.when.is_empty());
+        for front in [
+            "when: [",
+            "when: *missing",
+            "when: first\nwhen: second",
+            "when: {nested: map}",
+        ] {
+            assert!(
+                parse(
+                    Path::new("guidance.md"),
+                    &format!("---\n{front}\n---\n- **rule Example**\nText\n")
+                )
+                .is_err(),
+                "{front}"
+            );
+        }
+    }
 }

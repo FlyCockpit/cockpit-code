@@ -1,4 +1,4 @@
-//! Palette, lifted from Cockpit's excoc instrument-panel tokens (dark) with a
+//! Palette, lifted from Cockpit's instrument-panel tokens (dark) with a
 //! matching light variant. Truecolor RGB is used when `COLORTERM` advertises
 //! it; otherwise each token falls back to its paired 256-color index.
 use ratatui::style::{Color, Modifier, Style};

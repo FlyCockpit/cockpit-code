@@ -1,4 +1,4 @@
-//! D64 discussions and interactive checkpoint forks. Chat records are side files,
+//! Discussions and interactive checkpoint forks. Chat records are side files,
 //! never ordinary agent history, even after reopening or resuming a session.
 use crate::{
     Control, Session,
@@ -326,14 +326,14 @@ impl Session {
         Ok(id)
     }
     /// `/btw`: open (or reopen) the side chat of `agent`, a private
-    /// interactive hidden fork (D56) with read-only tools. It has no
+    /// interactive hidden fork with read-only tools. It has no
     /// question to answer and never enters any agent's context; its record
     /// persists with the session. Opening uses no tokens.
     pub fn open_side_chat(&self, agent: &str) -> Result<String, EngineError> {
         let agent = self.resolve_agent_id(agent)?;
         let agent = agent.as_str();
         self.control.check_owner()?;
-        // D122: the newest side chat is reused while the agent is still in
+        // The newest side chat is reused while the agent is still in
         // the context it forked from; after a compaction a fresh fork shares
         // the new context's cache, and earlier chats stay reachable through
         // btw_list / btw_search.
@@ -680,33 +680,15 @@ async fn converse(
                 tool_call: Some(call.clone()),
                 tool_result: None,
             });
-            let result = if !call.complete {
-                Err(EngineError::bad("incomplete fork call"))
-            } else if call.name == "script" {
-                reader
-                    .fork_script(&call.arguments, 0, &functions, cancel)
-                    .await
-                    .map(|(output, _)| output)
-            } else if matches!(call.name.as_str(), "read" | "grep" | "glob") {
-                reader.call(&call, cancel).await
-            } else if crate::tools::web::handles(&call.name) {
-                reader.web(&call, cancel).await
-            } else if call.name == "history" {
-                call.arguments["session"] = json!("current");
-                crate::session_tools::history(
-                    &control.journal.lock().unwrap(),
-                    &record.chat.asker,
-                    &call.arguments,
-                    None,
-                )
-                .map_err(|e| EngineError::bad(e.to_string()))
-            } else {
-                // The output below appends ALLOWED once.
-                Err(EngineError::bad(format!(
-                    "{} is not available in this fork.",
-                    call.name
-                )))
-            };
+            let result = dispatch_call(
+                &record.request,
+                &reader,
+                &functions,
+                &mut call,
+                (control, &record.chat.asker),
+                cancel,
+            )
+            .await;
             let is_error = result.is_err();
             let output =
                 result.unwrap_or_else(|e| format!("Error: {} {}", e.message, allowed(side)));
@@ -774,5 +756,132 @@ async fn converse(
         if record.chat.closed || calls.is_empty() {
             return Ok(());
         }
+    }
+}
+
+/// Dispatch using the frozen request's canonical names while preserving wire calls
+/// in the chat and provider replay.
+async fn dispatch_call(
+    request: &PreparedRequest,
+    reader: &ReadOnly,
+    functions: &[ForkFunction],
+    call: &mut ToolCall,
+    history: (&Control, &str),
+    cancel: &CancellationToken,
+) -> Result<String, EngineError> {
+    let mut canonical = call.clone();
+    canonical.name = request.canonical_tool_name(&call.name).to_owned();
+    if !call.complete {
+        Err(EngineError::bad("incomplete fork call"))
+    } else if canonical.name == "script" {
+        reader
+            .fork_script(&canonical.arguments, 0, functions, cancel)
+            .await
+            .map(|(output, _)| output)
+    } else if matches!(canonical.name.as_str(), "read" | "grep" | "glob") {
+        reader.call(&canonical, cancel).await
+    } else if crate::tools::web::handles(&canonical.name) {
+        reader.web(&canonical, cancel).await
+    } else if canonical.name == "history" {
+        call.arguments["session"] = json!("current");
+        crate::session_tools::history(
+            &history.0.journal.lock().unwrap(),
+            history.1,
+            &call.arguments,
+            None,
+        )
+        .map_err(|e| EngineError::bad(e.to_string()))
+    } else {
+        Err(EngineError::bad(format!(
+            "{} is not available in this fork.",
+            call.name
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn renamed_fork_tools_dispatch_without_changing_the_wire_name() {
+        let (temp, store) = crate::test_support::store(json!({}));
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        std::fs::write(temp.path().join("example.txt"), "needle\n").unwrap();
+        session
+            .control
+            .commit(
+                "root",
+                HistoryEvent::SystemReminder {
+                    text: "history".into(),
+                },
+            )
+            .unwrap();
+        let request: PreparedRequest = serde_json::from_value(json!({
+            "prefix":"{}", "body":"{}", "wire":"command", "cache":null,
+            "history_items":0, "offered_tools":[], "session_id":"session",
+            "cache_key":"family", "conversation_id":"session:root", "agent_id":"root", "kind":"agent",
+            "input_estimate":0, "retry_limit":0,
+            "tool_aliases":{"read":"view_file", "grep":"find_text", "glob":"find_files", "script":"run_code", "history":"past_events", "web_search":"search_online", "web_fetch":"fetch_online"}
+        })).unwrap();
+        let reader =
+            ReadOnly::new(temp.path().to_owned()).with_aliases(request.tool_aliases.clone());
+        for (name, arguments) in [
+            ("view_file", json!({"path":"example.txt"})),
+            (
+                "find_text",
+                json!({"path":"example.txt", "pattern":"needle"}),
+            ),
+            ("find_files", json!({"pattern":"*.txt"})),
+            ("run_code", json!({"code":"print('script output')"})),
+            (
+                "past_events",
+                json!({"action":"contexts", "session":"ignored-foreign-session"}),
+            ),
+        ] {
+            let mut call = ToolCall {
+                id: "call-1".into(),
+                name: name.into(),
+                arguments,
+                complete: true,
+            };
+            let output = dispatch_call(
+                &request,
+                &reader,
+                &[],
+                &mut call,
+                (&session.control, "root"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!output.is_empty(), "{name}");
+            assert_eq!(call.name, name);
+            if name == "past_events" {
+                assert_eq!(call.arguments["session"], "current");
+            }
+        }
+        for name in ["search_online", "fetch_online"] {
+            let mut call = ToolCall {
+                id: "call-1".into(),
+                name: name.into(),
+                arguments: json!({}),
+                complete: true,
+            };
+            let error = dispatch_call(
+                &request,
+                &reader,
+                &[],
+                &mut call,
+                (&session.control, "root"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            // The reader has no web access; reaching its error proves canonical dispatch.
+            assert_eq!(error.message, crate::read_only::ALLOWED);
+            assert_eq!(call.name, name);
+        }
+        session.shutdown().await.unwrap();
     }
 }

@@ -54,7 +54,9 @@ fn transcript(history: &[HistoryEvent], emergency: bool) -> String {
                 HistoryEvent::Question { question } => {
                     json!({"role":"question","question":question})
                 }
-                HistoryEvent::Answer { id, text } => json!({"role":"answer","id":id,"text":text}),
+                HistoryEvent::QuestionsAnswered { id, answers } => {
+                    json!({"role":"answer","id":id,"answers":answers})
+                }
                 HistoryEvent::Goal { contract } => json!({"role":"contract","contract":contract}),
                 _ => return None,
             };
@@ -331,5 +333,28 @@ pub(crate) async fn draft(
             ));
         }
         source = merged;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_retains_current_structured_question_answers() {
+        let event = HistoryEvent::QuestionsAnswered {
+            id: "set".into(),
+            answers: vec![QuestionAnswer {
+                id: "q1".into(),
+                text: Some("answer".into()),
+                ..Default::default()
+            }],
+        };
+        for emergency in [false, true] {
+            let row: serde_json::Value =
+                serde_json::from_str(&transcript(std::slice::from_ref(&event), emergency)).unwrap();
+            assert_eq!(row["id"], "set");
+            assert_eq!(row["answers"][0]["text"], "answer");
+        }
     }
 }

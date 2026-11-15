@@ -1,7 +1,7 @@
 //! `!cmd`: a local shell command run in the session's directory. Its row
 //! shows in the transcript like a bash row, marked local. The output is
 //! never sent to the model or written to the session; when it finishes the
-//! viewed agent is told that it ran (D122: command, exit code, duration,
+//! viewed agent is told that it ran (command, exit code, duration,
 //! output size).
 use super::App;
 use crate::engine::LocalRun;

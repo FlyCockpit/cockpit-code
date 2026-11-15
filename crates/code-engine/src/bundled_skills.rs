@@ -1,4 +1,4 @@
-//! Skills shipped inside the binary (§3 config skill, D12), installed into
+//! Skills shipped inside the binary (including the config skill), installed into
 //! `~/.agents/skills/<name>/` on first run and refreshed on upgrade while the
 //! installed copy is still exactly what we wrote. A user-owned skill of the same
 //! name (by directory or frontmatter `name`), a user-edited copy and a deliberate
@@ -59,7 +59,7 @@ pub fn install(home: &Path, data: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     Ok(written)
 }
-/// Additional agent skill directory, with independent D78 ownership markers.
+/// Additional agent skill directory, with independent ownership markers.
 pub fn install_at(skills_dir: &Path, data: &Path) -> std::io::Result<Vec<PathBuf>> {
     let skills_dir = if skills_dir.is_absolute() {
         skills_dir.to_owned()
@@ -170,7 +170,7 @@ fn digest(mut files: Vec<(String, Vec<u8>)>) -> String {
         hasher.update((body.len() as u64).to_le_bytes());
         hasher.update(&body);
     }
-    format!("{:x}", hasher.finalize())
+    crate::hex::hex(&hasher.finalize())
 }
 
 fn bundled_hash(skill: &Bundled) -> String {

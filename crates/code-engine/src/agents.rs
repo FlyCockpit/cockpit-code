@@ -199,11 +199,7 @@ pub(crate) fn show(control: &Control, caller: &str, id: &str) -> Result<Value, E
         let id = j.resolve_agent_id(id)?;
         let mut value = row(&j, caller, &id);
         value["brief"] = json!(j.executions.get(&id).map(|e| e.task.as_str()));
-        value["originalBrief"] = json!(
-            j.executions
-                .get(&id)
-                .and_then(|e| e.original_task.as_deref())
-        );
+        value["originalBrief"] = json!(j.executions.get(&id).map(|e| e.original_task.as_str()));
         value["report"] = json!(report(&j, &id));
         if j.settings.subagents == crate::SubagentMode::Tree {
             value["partialReport"] = json!(j.partial_reports.get(&id));
@@ -362,9 +358,6 @@ pub(crate) async fn execute(
 impl Session {
     pub fn agent_rows(&self, filters: Value) -> Result<Value, EngineError> {
         list(&self.control, "root", &filters)
-    }
-    pub fn agent_show(&self, id: &str) -> Result<Value, EngineError> {
-        show(&self.control, "root", id)
     }
     pub async fn ask_agent(
         &self,

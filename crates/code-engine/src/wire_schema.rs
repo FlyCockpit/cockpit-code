@@ -425,7 +425,7 @@ fn add_null_arm(schema: &mut Value) {
 
     // `$ref` cannot have siblings on OpenAI's strict subset, and enum-only or
     // otherwise untyped schemas have no safe type to infer. Wrap the complete
-    // schema so rig can sanitize each arm without dropping the reference.
+    // schema so each arm can be sanitized without dropping the reference.
     let original = std::mem::take(schema);
     *schema = json!({ "anyOf": [original, { "type": "null" }] });
 }
@@ -664,7 +664,7 @@ fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> 
     }
 }
 
-/// Rig supplied this final step in Cockpit; our explicit wire owns it here.
+/// As in Cockpit, mark every object property as required for the provider's strict schema format.
 fn require_all_properties(schema: &mut Value) {
     let Value::Object(object) = schema else {
         return;

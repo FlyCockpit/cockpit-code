@@ -80,23 +80,6 @@ pub struct ThinkSplitter {
 }
 
 impl ThinkSplitter {
-    /// Reconstruct a splitter from its persisted fields. The TUI's
-    /// `PendingMsg` stores these separately (they predate this type); this
-    /// lets `route_text_delta` adapt them to the shared state machine
-    /// without changing that struct.
-    pub fn from_parts(inside_think: bool, body_started: bool, tag_partial: String) -> Self {
-        Self {
-            inside_think,
-            body_started,
-            tag_partial,
-        }
-    }
-
-    /// Decompose into the persisted fields, written back onto `PendingMsg`.
-    pub fn into_parts(self) -> (bool, bool, String) {
-        (self.inside_think, self.body_started, self.tag_partial)
-    }
-
     /// Route one chunk into `text` (outside tags) and `reasoning` (inside
     /// tags). Returns `true` if any non-think body text was appended —
     /// callers use this as the "real answer text has started" signal.

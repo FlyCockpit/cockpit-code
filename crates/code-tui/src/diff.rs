@@ -1,7 +1,7 @@
 //! Unified diff for `write` / `edit` calls, adapted from FlyCockpit's Cockpit's
 //! inline renderer (side-by-side mode and config coupling removed). Rows
 //! carry dim line numbers when the engine reported where each hunk starts
-//! (engine-m `FileEdit` hunks), and code is highlighted by file extension
+//! (`FileEdit` hunks), and code is highlighted by file extension
 //! on top of the +/− backgrounds.
 use crate::engine::FileEdit;
 use crate::highlight::Highlighter;
@@ -25,14 +25,9 @@ pub struct Diff {
 /// One shown row: change, line number (new side; old side for a deletion), text.
 pub type Numbered = (ChangeTag, Option<usize>, String);
 
-/// Render `old → new` as unified rows (`+`/`-`/context) with `…` between hunks.
+/// Render `old → new` as unified rows, highlighted by `path`'s extension,
+/// numbered from `start` = (old first line, new first line) when known.
 /// Rows are not wrapped here; the transcript wraps them with a hanging gutter.
-pub fn render(old: &str, new: &str) -> Diff {
-    render_file("", old, new, None)
-}
-
-/// [`render`] for a file: highlighted by `path`'s extension, numbered from
-/// `start` = (old first line, new first line) when known.
 pub fn render_file(path: &str, old: &str, new: &str, start: Option<(usize, usize)>) -> Diff {
     let (rows, added, removed) = numbered(old, new, start);
     paint(path, vec![rows], added, removed)
@@ -72,7 +67,9 @@ pub fn numbered(
         }
     };
     let (old, new) = (nl(old), nl(new));
-    let diff = TextDiff::from_lines(&old, &new);
+    let diff = TextDiff::configure()
+        .algorithm(similar::Algorithm::RawMyers)
+        .diff_lines(&old, &new);
     let mut rows: Vec<(ChangeTag, String)> = diff
         .iter_all_changes()
         .map(|change| {
@@ -226,7 +223,11 @@ pub fn unified_from_edits(path: &str, edits: &[FileEdit], new_file: bool) -> Str
                 }
             };
             let (o, n) = (nl(&h.old_text), nl(&h.new_text));
-            for c in TextDiff::from_lines(&o, &n).iter_all_changes() {
+            for c in TextDiff::configure()
+                .algorithm(similar::Algorithm::RawMyers)
+                .diff_lines(&o, &n)
+                .iter_all_changes()
+            {
                 let sign = match c.tag() {
                     ChangeTag::Delete => '-',
                     ChangeTag::Insert => '+',
@@ -358,4 +359,44 @@ pub fn parse_unified(text: &str) -> Vec<FileDiff> {
         h.push(Some((tag, Some(num), text.replace('\t', "    "))));
     }
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChangeTag, numbered};
+
+    #[test]
+    fn moved_blocks_keep_original_myers_tie_breaking_and_line_numbers() {
+        let (rows, added, removed) = numbered("a\nb\nc\nd\n", "c\nd\na\nb\n", Some((1, 1)));
+        assert_eq!((added, removed), (2, 2));
+        assert_eq!(
+            rows,
+            vec![
+                Some((ChangeTag::Insert, Some(1), "c".into())),
+                Some((ChangeTag::Insert, Some(2), "d".into())),
+                Some((ChangeTag::Equal, Some(3), "a".into())),
+                Some((ChangeTag::Equal, Some(4), "b".into())),
+                Some((ChangeTag::Delete, Some(3), "c".into())),
+                Some((ChangeTag::Delete, Some(4), "d".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn numbered_diff_keeps_myers_changes_and_fragment_line_numbers() {
+        let (rows, added, removed) =
+            numbered("one\ntwo\nthree", "one\nchanged\nthree", Some((10, 20)));
+        assert_eq!((added, removed), (1, 1));
+        assert_eq!(
+            rows,
+            vec![
+                Some((ChangeTag::Equal, Some(20), "one".into())),
+                Some((ChangeTag::Delete, Some(11), "two".into())),
+                Some((ChangeTag::Insert, Some(21), "changed".into())),
+                Some((ChangeTag::Equal, Some(22), "three".into())),
+            ]
+        );
+        assert_eq!(numbered("same", "same\n", None), (vec![], 0, 0));
+        assert_eq!(numbered("", "", None), (vec![], 0, 0));
+    }
 }

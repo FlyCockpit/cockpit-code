@@ -1,10 +1,10 @@
 //! Transcript model and rendering: user messages, assistant markdown
-//! segments, reasoning, compact tool rows (with diffs and checklists),
+//! segments, reasoning, compact tool rows (with diffs),
 //! pending (still being written) tool calls, notices. Rendered rows carry
 //! [`Meta`] for selection, copy buttons and toggles, and are cached per
 //! entry and width. Long thinking and long tool results render inside an
 //! inner scroll box with its own offset.
-use crate::engine::{FileEdit, TodoItem, ToolCall, ToolResultData, ToolResultDetails, todo_items};
+use crate::engine::{FileEdit, ToolCall, ToolResultData, ToolResultDetails};
 use crate::rows::{Btn, Meta, Row, button_row, plain, wrap_rows};
 use crate::theme::theme;
 use crate::wrap::truncate;
@@ -17,7 +17,6 @@ use unicode_width::UnicodeWidthStr;
 
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const COLLAPSED_DIFF_ROWS: usize = 12;
-const COLLAPSED_TODO_ROWS: usize = 20;
 /// Rows kept from a tool result before the box (the box scrolls within them).
 const MAX_OUTPUT_LINES: usize = 5000;
 /// Visible rows of an expanded thinking block (Cockpit's `THINKING_VISIBLE`).
@@ -38,7 +37,7 @@ pub enum Level {
     Message,
     /// A background job finished.
     Job,
-    /// The user answered a question (D62): a compact row, not a message.
+    /// The user answered a question: a compact row, not a message.
     Answer,
 }
 
@@ -52,7 +51,7 @@ pub struct ChildLink {
     pub follow_up: bool,
 }
 
-/// A sidecar safety review of a call (D46).
+/// A sidecar safety review of a call.
 #[derive(Clone)]
 pub struct Review {
     pub model: String,
@@ -73,12 +72,12 @@ pub struct Tool {
     /// For `task` rows: the child agent, once known.
     pub child: Option<ChildLink>,
     pub review: Option<Review>,
-    /// `script` rows: inner host calls, oldest first (engine-m records).
+    /// `script` rows: inner host calls, oldest first.
     pub inner: Vec<Inner>,
     /// Successful write/edit results: the hunks with their line numbers.
     pub edits: Vec<FileEdit>,
-    /// A steer or interrupt moved this foreground call to the background
-    /// (D72/D74): the engine's reason.
+    /// A steer or interrupt moved this foreground call to the background:
+    /// the engine's reason.
     pub moved: Option<String>,
     /// Time spent waiting for the user's approval (not shown as run time).
     pub waited: Duration,
@@ -160,7 +159,7 @@ pub struct Card {
 
 pub enum Kind {
     User(String),
-    /// A compact collapsible notice (engine-o rows, prune, local runs).
+    /// A compact collapsible notice (scope and guidance updates, prune, local runs).
     Card(Box<Card>),
     Assistant(String),
     Reasoning(String),
@@ -175,14 +174,14 @@ pub enum Kind {
     Compacted(String),
     /// An earlier, compacted context window, collapsed by default.
     Earlier(Vec<Entry>),
-    /// Older context files still on disk (D103): the agent and their
+    /// Older context files still on disk: the agent and their
     /// numbers, oldest first; loaded one at a time when scrolled to.
     Older {
         agent: String,
         contexts: Vec<u32>,
         loading: bool,
     },
-    /// A question answered through its fork (D64): question id, summary.
+    /// A question answered through its fork: question id, summary.
     /// Its button reopens the fork's saved chat.
     ForkAnswer {
         question: String,
@@ -236,12 +235,12 @@ pub struct Entry {
     /// When a user or agent message was written (live: now; replay: the
     /// journal's `ts`), shown right-aligned on its first row.
     pub ts: Option<chrono::DateTime<chrono::Local>>,
-    /// D117: whether `ts` is shown (user messages always; agent text on a
+    /// Whether `ts` is shown (user messages always; agent text on a
     /// turn's first segment, then only after a minute since the last shown).
     pub show_ts: bool,
     rev: u64,
     cache: Option<(Key, Rendered)>,
-    /// The row count of a dropped cache (D103): far off-screen entries keep
+    /// The row count of a dropped cache: far off-screen entries keep
     /// only their height until they come back into view.
     height: Option<(Key, usize)>,
 }
@@ -287,7 +286,7 @@ impl Entry {
         }
         self.render(width, tick).lines.len()
     }
-    /// Drop the wrapped and highlighted rows, keeping the height (D103).
+    /// Drop the wrapped and highlighted rows, keeping the height.
     pub fn trim(&mut self) {
         if let Some((k, r)) = self.cache.take() {
             self.height = Some((k, r.lines.len()));
@@ -380,7 +379,7 @@ impl Entry {
 }
 
 fn has_body(t: &Tool) -> bool {
-    matches!(t.name.as_str(), "write" | "edit" | "todo")
+    matches!(t.name.as_str(), "write" | "edit")
 }
 
 #[derive(Default)]
@@ -407,7 +406,7 @@ impl Transcript {
         self.entries.push(Entry::new(kind, expanded));
         self.decide_stamp(self.entries.len() - 1);
     }
-    /// D117 for entry `i`: agent text shows its time on the first segment
+    /// For entry `i`: agent text shows its time on the first segment
     /// of a turn, then only when a minute has passed since the last time
     /// shown. A turn starts at a user message, an agent or tree message, a
     /// question answer or a compaction. It depends only on the entries, so
@@ -519,7 +518,7 @@ impl Transcript {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
-    /// A loaded older context (D103) goes in just below the "on disk" row,
+    /// A loaded older context goes in just below the "on disk" row,
     /// above the contexts loaded before it.
     pub fn insert_earlier(&mut self, n: u32, entries: Vec<Entry>) {
         let Some(Kind::Older {
@@ -532,17 +531,17 @@ impl Transcript {
         *loading = false;
         let empty = contexts.is_empty();
         self.entries[0].touch();
-        let mut added = 0isize;
         if !entries.is_empty() {
             self.entries
                 .insert(1, Entry::new(Kind::Earlier(entries), false));
-            added += 1;
+            if self.attempt_start >= 1 {
+                self.attempt_start += 1;
+            }
         }
         if empty {
             self.entries.remove(0);
-            added -= 1;
+            self.attempt_start = self.attempt_start.saturating_sub(1);
         }
-        self.attempt_start = (self.attempt_start as isize + added).max(0) as usize;
         self.generation += 1;
     }
     /// The next older context to load, marking the row as loading.
@@ -591,12 +590,7 @@ impl Transcript {
         false
     }
     pub fn end_compacting(&mut self) {
-        let before = self.entries.len();
-        self.entries
-            .retain(|e| !matches!(e.kind, Kind::Compacting(_)));
-        if self.entries.len() != before {
-            self.generation += 1;
-        }
+        self.retain_entries(|e| !matches!(e.kind, Kind::Compacting(_)));
     }
     pub fn begin_attempt(&mut self) {
         self.attempt_start = self.entries.len();
@@ -738,7 +732,7 @@ impl Transcript {
         };
     }
     /// Abandon every pending row (stream reset, retry, turn end).
-    /// An interrupt stopped the stream (D74): the text so far stays as a
+    /// An interrupt stopped the stream: the text so far stays as a
     /// finished segment marked interrupted; tentative calls are dropped.
     pub fn interrupted(&mut self) {
         self.abandon_pending();
@@ -754,6 +748,12 @@ impl Transcript {
         self.notice(Level::Warn, "interrupted · the partial reply above is kept");
         self.attempt_start = self.entries.len();
     }
+    /// Keep a committed partial reply across resets of the next attempt.
+    pub fn partial(&mut self, notice: impl Into<String>) {
+        self.notice(Level::Warn, notice);
+        self.abandon_pending();
+        self.begin_attempt();
+    }
     pub fn abandon_pending(&mut self) {
         for e in &mut self.entries {
             if let Kind::Pending(p) = &mut e.kind
@@ -766,10 +766,24 @@ impl Transcript {
     }
     /// Drop abandoned pending rows after a moment; true when any went.
     pub fn prune_abandoned(&mut self) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(
+        self.retain_entries(
             |e| !matches!(&e.kind, Kind::Pending(p) if p.abandoned.is_some_and(|t| t.elapsed() >= ABANDONED_FOR)),
-        );
+        )
+    }
+    /// Preserve the attempt boundary when rows on either side are removed.
+    fn retain_entries(&mut self, mut keep: impl FnMut(&Entry) -> bool) -> bool {
+        let before = self.entries.len();
+        let mut index = 0;
+        let mut removed_before = 0;
+        self.entries.retain(|e| {
+            let retain = keep(e);
+            if !retain && index < self.attempt_start {
+                removed_before += 1;
+            }
+            index += 1;
+            retain
+        });
+        self.attempt_start -= removed_before;
         let changed = self.entries.len() != before;
         if changed {
             self.generation += 1;
@@ -926,7 +940,7 @@ impl Transcript {
         }
     }
     /// A steer (or an interrupt) moved foreground call `id` to the
-    /// background as job `job` (D72): from here on it is a background job
+    /// background as job `job`: from here on it is a background job
     /// row, as if it had been started with `background: true`.
     pub fn moved_to_background(&mut self, id: &str, job: &str, reason: &str) {
         for e in self.entries.iter_mut().rev() {
@@ -1033,18 +1047,6 @@ impl Transcript {
             c.waiting = false;
         }
         e.touch();
-    }
-    pub fn todo(&mut self, items: Vec<TodoItem>) {
-        // The todo tool row renders its own checklist; refresh it from the event.
-        for e in self.entries.iter_mut().rev() {
-            if let Kind::Tool(t) = &mut e.kind
-                && t.name == "todo"
-            {
-                t.args = serde_json::json!({ "items": items.iter().map(|i| serde_json::json!({"content": i.content, "status": i.status})).collect::<Vec<_>>() });
-                e.touch();
-                break;
-            }
-        }
     }
     /// Mark tools that never finished (turn ended or was cancelled).
     pub fn abandon_running(&mut self) {
@@ -1239,8 +1241,8 @@ fn render(entry: &Entry, width: usize, tick: usize) -> (Vec<Row>, Option<BoxInfo
     let rows = match &entry.kind {
         Kind::User(text) => {
             let bar = Span::styled("▌ ", Style::default().fg(t.accent));
-            // Paste blocks show as one chip row each (D53); a click opens
-            // them. Attachment chips (D79) stay inline as labels and are
+            // Paste blocks show as one chip row each; a click opens
+            // them. Attachment chips stay inline as labels and are
             // repeated as clickable chips in a tray under the text.
             let mut body: Vec<Row> = vec![];
             let mut n = 0usize;
@@ -1829,7 +1831,7 @@ pub fn set_cwd(cwd: &std::path::Path) {
     let _ = CWD.set(format!("{}/", cwd.display()));
 }
 
-/// A write/edit result that is a D120 scope request: (status, owner). The
+/// A write/edit result that is a scope request: (status, owner). The
 /// no-wait form is `{requestId, owner, status, applied:false}`; a waited
 /// one is the whole request (`requester`, `owner`, `status`).
 fn scope_result(output: &str) -> Option<(String, String)> {
@@ -1920,7 +1922,7 @@ fn call_arg(name: &str, a: &Value) -> String {
                 first.trim().to_string()
             }
         }
-        // D131: the child's durable title, else the brief's first line.
+        // The child's durable title, else the brief's first line.
         "task" => {
             let title = s("title");
             if title.trim().is_empty() {
@@ -1929,12 +1931,12 @@ fn call_arg(name: &str, a: &Value) -> String {
                 title
             }
         }
-        // `criteria {action, id?, text?, evidence?, kind?}` (D110).
+        // `criteria {action, id?, text?, evidence?, kind?}`.
         "criteria" => {
             let action = a["action"].as_str().unwrap_or("show");
             let id = a["id"]
                 .as_str()
-                .map(|i| format!("{} ", &i[..i.len().min(8)]))
+                .map(|i| format!("{} ", i.chars().take(8).collect::<String>()))
                 .unwrap_or_default();
             let kind = a["kind"]
                 .as_str()
@@ -1957,11 +1959,6 @@ fn call_arg(name: &str, a: &Value) -> String {
             )
             .trim_end()
             .to_string()
-        }
-        "todo" => {
-            let items = todo_items(&a["items"]);
-            let done = items.iter().filter(|i| i.status == "completed").count();
-            format!("{done}/{} done", items.len())
         }
         // `question {questions: [{text, ...}]}`: the first question.
         "question" => {
@@ -2069,7 +2066,9 @@ pub fn unified_diff(tool: &Tool) -> Option<String> {
         }
     };
     let (old, new) = (nl(old), nl(new));
-    let diff = similar::TextDiff::from_lines(&old, &new);
+    let diff = similar::TextDiff::configure()
+        .algorithm(similar::Algorithm::RawMyers)
+        .diff_lines(&old, &new);
     Some(
         diff.unified_diff()
             .context_radius(3)
@@ -2079,7 +2078,7 @@ pub fn unified_diff(tool: &Tool) -> Option<String> {
 }
 
 /// Variation notes at the head of a tool result (self-evaluated writes,
-/// auto-mode `improve`; D60, D104, D105): each as (summary, judge
+/// auto-mode `improve`): each as (summary, judge
 /// rationale), plus the rest of the output. Candidate numbers are
 /// zero-based and 0 is the original call:
 /// "self-evaluated 3 candidates; applied variation 2: …" → "self-evaluated 3 · applied #2",
@@ -2261,7 +2260,7 @@ fn render_tool(
     let t = theme();
     let expanded = entry.expanded;
     let reviewing = tool.review.as_ref().is_some_and(|r| r.result.is_none());
-    // D120: an out-of-scope write/edit returns a request, not a write.
+    // An out-of-scope write/edit returns a request, not a write.
     let scope = matches!(tool.name.as_str(), "write" | "edit")
         .then_some(tool.output.as_deref())
         .flatten()
@@ -2314,7 +2313,7 @@ fn render_tool(
             }
         }
     }
-    // D115: a tamper flag the engine added to the result shows as its own
+    // A tamper flag the engine added to the result shows as its own
     // row; the output shows without it.
     let (tamper, stripped) = tool.output.as_deref().map(tamper_flag).unwrap_or_default();
     let (notes, body) = stripped
@@ -2350,7 +2349,7 @@ fn render_tool(
             Style::default().fg(color),
         ));
     }
-    // D101: a follow-up's context choice ("fresh" when the cache is cold).
+    // A follow-up's context choice ("fresh" when the cache is cold).
     let task_context = (tool.name == "task")
         .then_some(tool.output.as_deref())
         .flatten()
@@ -2471,7 +2470,7 @@ fn render_tool(
     let mut out: Vec<Row> = vec![(Line::from(row), meta)];
     let gutter = Span::styled("    │ ", Style::default().fg(t.rule));
     let g = std::slice::from_ref(&gutter);
-    // D120: the child's write scope and subscriptions, always visible.
+    // The child's write scope and subscriptions, always visible.
     if tool.name == "task" {
         let list = |k: &str| -> Option<String> {
             let v = tool.args[k].as_array()?;
@@ -2557,7 +2556,7 @@ fn render_tool(
         }
         out.extend(rows);
     }
-    // D129: the whole output went to a file: its size and an open button.
+    // The whole output went to a file: its size and an open button.
     if let Some((bytes, lines, path)) = tool.output.as_deref().and_then(full_output) {
         let name = path
             .file_name()
@@ -2705,40 +2704,6 @@ fn render_tool(
             }
         }
     }
-    if tool.name == "todo" {
-        let items = todo_items(&tool.args["items"]);
-        let limit = if expanded {
-            usize::MAX
-        } else {
-            COLLAPSED_TODO_ROWS
-        };
-        let lines = items
-            .iter()
-            .take(limit)
-            .map(|i| {
-                let (mark, style) = match i.status.as_str() {
-                    "completed" => (
-                        "☑ ",
-                        Style::default()
-                            .fg(t.dim)
-                            .add_modifier(Modifier::CROSSED_OUT),
-                    ),
-                    "in_progress" => ("◐ ", Style::default().fg(t.yellow)),
-                    _ => ("☐ ", t.text()),
-                };
-                Line::from(vec![
-                    Span::styled(mark, style.remove_modifier(Modifier::CROSSED_OUT)),
-                    Span::styled(i.content.clone(), style),
-                ])
-            })
-            .collect();
-        out.extend(wrap_rows(
-            plain(lines, 0),
-            width,
-            g,
-            &[Span::styled("    │   ", Style::default().fg(t.rule))],
-        ));
-    }
     if let Some(d) = diff {
         let total = d.lines.len();
         let limit = if expanded { total } else { COLLAPSED_DIFF_ROWS };
@@ -2770,7 +2735,7 @@ fn render_tool(
         } else {
             output
         };
-        let show_output = expanded || (tool.is_error && !matches!(tool.name.as_str(), "todo"));
+        let show_output = expanded || tool.is_error;
         if show_output {
             let style = if tool.is_error {
                 Style::default().fg(t.red)
@@ -2949,7 +2914,7 @@ fn decode_partial(body: &str) -> String {
     out
 }
 
-/// D129: `full output (N bytes, M lines): <path> — use read/grep on it`
+/// `full output (N bytes, M lines): <path> — use read/grep on it`
 /// in a tool result: (bytes, lines, path).
 pub fn full_output(output: &str) -> Option<(u64, u64, std::path::PathBuf)> {
     let at = output.find("full output (")?;
@@ -2980,5 +2945,136 @@ pub fn fmt_bytes(n: u64) -> String {
         n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
         n if n >= 1024 => format!("{:.1} kB", n as f64 / 1024.0),
         n => format!("{n} B"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn criteria_ids_render_on_character_boundaries() {
+        for id in ["界界界", "界界界界界界界界界", "123456789"] {
+            let args = serde_json::json!({"action": "done", "id": id});
+            let expected = format!("done {}", id.chars().take(8).collect::<String>());
+            assert_eq!(call_arg("criteria", &args), expected);
+            let mut tr = Transcript::default();
+            tr.tool_start("call".into(), "criteria".into(), args);
+            let rendered = tr.entries.last_mut().unwrap().render(80, 0);
+            assert!(!rendered.lines.is_empty());
+        }
+    }
+
+    #[test]
+    fn pruning_abandoned_calls_preserves_partial_reply_boundary() {
+        let mut tr = Transcript::default();
+        tr.begin_attempt();
+        tr.append_text("committed partial");
+        tr.tool_delta(0, None, Some("write".into()), "{");
+        tr.partial("output limit");
+        tr.append_text("uncommitted retry");
+        tr.tool_delta(1, None, Some("read".into()), "{");
+        tr.abandon_pending();
+        for e in &mut tr.entries {
+            if let Kind::Pending(p) = &mut e.kind {
+                p.abandoned = Some(Instant::now() - ABANDONED_FOR);
+            }
+        }
+        let generation = tr.generation;
+        assert!(tr.prune_abandoned());
+        assert_eq!(tr.generation, generation + 1);
+        assert_eq!(tr.attempt_start, 2);
+        tr.append_reasoning("failed reasoning");
+        tr.stream_reset();
+        assert_eq!(tr.entries.len(), 2);
+        assert!(
+            matches!(&tr.entries[0].kind, Kind::Assistant(text) if text == "committed partial")
+        );
+        assert!(
+            matches!(&tr.entries[1].kind, Kind::Notice(Level::Warn, text) if text == "output limit")
+        );
+        assert!(!tr.prune_abandoned());
+    }
+
+    #[test]
+    fn removing_compaction_rows_preserves_attempt_boundary() {
+        let mut tr = Transcript::default();
+        tr.append_text("committed reply");
+        tr.compacting();
+        tr.begin_attempt();
+        tr.append_text("failed retry");
+        tr.compacting();
+        tr.end_compacting();
+        assert_eq!(tr.attempt_start, 1);
+        tr.stream_reset();
+        assert_eq!(tr.entries.len(), 1);
+        assert!(matches!(&tr.entries[0].kind, Kind::Assistant(text) if text == "committed reply"));
+    }
+
+    #[test]
+    fn loading_earlier_context_preserves_attempt_boundary() {
+        for empty in [false, true] {
+            for started in [false, true] {
+                let mut tr = Transcript::default();
+                tr.push(Kind::Older {
+                    agent: "root".into(),
+                    contexts: if empty { vec![1] } else { vec![1, 2] },
+                    loading: true,
+                });
+                if started {
+                    tr.begin_attempt();
+                }
+                tr.append_text("failed retry");
+                tr.insert_earlier(
+                    1,
+                    vec![Entry::new(Kind::Assistant("old reply".into()), false)],
+                );
+                assert_eq!(
+                    tr.attempt_start,
+                    if started {
+                        if empty { 1 } else { 2 }
+                    } else {
+                        0
+                    }
+                );
+                tr.stream_reset();
+                assert!(
+                    !tr.entries
+                        .iter()
+                        .any(|e| matches!(e.kind, Kind::Assistant(_)))
+                );
+                assert!(
+                    tr.entries
+                        .iter()
+                        .any(|e| matches!(e.kind, Kind::Earlier(_)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_reply_survives_later_stream_reset() {
+        let mut tr = Transcript::default();
+        tr.begin_attempt();
+        tr.append_text("committed partial");
+        tr.tool_delta(0, None, Some("write".into()), "{");
+        tr.partial("output limit");
+        assert!(
+            tr.entries
+                .iter()
+                .any(|e| matches!(&e.kind, Kind::Pending(p) if p.abandoned.is_some()))
+        );
+        tr.append_text("uncommitted retry");
+        tr.stream_reset();
+        assert!(
+            tr.entries
+                .iter()
+                .any(|e| matches!(&e.kind, Kind::Assistant(text) if text == "committed partial"))
+        );
+        assert!(
+            !tr.entries
+                .iter()
+                .any(|e| matches!(&e.kind, Kind::Assistant(text) if text == "uncommitted retry"))
+        );
     }
 }

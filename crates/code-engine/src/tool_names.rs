@@ -6,6 +6,7 @@ use crate::{
 };
 use code_config::{Snapshot, tools::ToolOverride};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 pub(crate) type Overrides = BTreeMap<String, ToolOverride>;
 #[derive(Clone, Default)]
 pub(crate) struct Names {
@@ -26,44 +27,51 @@ impl Names {
     }
     /// Engine-owned prose only. Never pass file/tool/user content here.
     pub fn rewrite(&self, text: &str) -> String {
-        let re = regex::Regex::new(r"\b[A-Za-z_][A-Za-z_0-9]*\b").unwrap();
-        re.replace_all(text, |c: &regex::Captures<'_>| {
-            let span = c.get(0).unwrap();
-            let prefix = &text[..span.start()];
-            let suffix = text[span.end()..].trim_start();
-            let mut quote = None;
-            let mut previous = None;
-            let mut escaped = false;
-            for ch in prefix.chars() {
-                if escaped {
-                    escaped = false;
-                    previous = Some(ch);
-                    continue;
-                }
-                if ch == '\\' {
-                    escaped = true;
-                    previous = Some(ch);
-                    continue;
-                }
-                if let Some(q) = quote {
-                    if ch == q {
-                        quote = None;
+        static IDENT: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"\b[A-Za-z_][A-Za-z_0-9]*\b").unwrap());
+        // With no renames every identifier maps to itself.
+        if self.names.is_empty() {
+            return text.to_owned();
+        }
+        IDENT
+            .replace_all(text, |c: &regex::Captures<'_>| {
+                let span = c.get(0).unwrap();
+                let prefix = &text[..span.start()];
+                let suffix = text[span.end()..].trim_start();
+                let mut quote = None;
+                let mut previous = None;
+                let mut escaped = false;
+                for ch in prefix.chars() {
+                    if escaped {
+                        escaped = false;
+                        previous = Some(ch);
+                        continue;
                     }
-                } else if matches!(ch, '\'' | '"')
-                    && !(ch == '\'' && previous.is_some_and(char::is_alphanumeric))
-                {
-                    quote = Some(ch);
+                    if ch == '\\' {
+                        escaped = true;
+                        previous = Some(ch);
+                        continue;
+                    }
+                    if let Some(q) = quote {
+                        if ch == q {
+                            quote = None;
+                        }
+                    } else if matches!(ch, '\'' | '"')
+                        && !(ch == '\'' && previous.is_some_and(char::is_alphanumeric))
+                    {
+                        quote = Some(ch);
+                    }
+                    previous = Some(ch);
                 }
-                previous = Some(ch);
-            }
-            // Method/action names, argument keys and literal values are fixed schema.
-            if quote.is_some() || prefix.ends_with(['/', '.']) || suffix.starts_with(['=', ':']) {
-                c[0].to_owned()
-            } else {
-                self.configured(&c[0]).to_owned()
-            }
-        })
-        .into_owned()
+                // Method/action names, argument keys and literal values are fixed schema.
+                if quote.is_some() || prefix.ends_with(['/', '.']) || suffix.starts_with(['=', ':'])
+                {
+                    c[0].to_owned()
+                } else {
+                    self.configured(&c[0]).to_owned()
+                }
+            })
+            .into_owned()
     }
 }
 pub(crate) fn merged(snapshot: &Snapshot, id: &str) -> Overrides {
@@ -83,9 +91,6 @@ pub(crate) fn merged(snapshot: &Snapshot, id: &str) -> Overrides {
             }
         }
     }
-    // Retired config entries are inert for new profiles, including their names.
-    // Old contexts retain their separately frozen overrides and legacy aliases.
-    out.remove("search");
     out
 }
 pub(crate) fn snapshots(snapshot: &Snapshot) -> BTreeMap<String, Overrides> {
@@ -139,7 +144,7 @@ pub(crate) fn apply(
         .collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
     for (key, o) in overrides {
-        if !canonical.contains(key) && key != "search" {
+        if !canonical.contains(key) {
             return Err(EngineError::bad(format!("unknown tool override {key}")));
         }
         let name = o.name.as_deref().unwrap_or(key);
@@ -315,4 +320,35 @@ pub(crate) fn sanitize_history(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_search_override_is_an_unknown_tool() {
+        let mut snapshot = Snapshot::default();
+        snapshot.tools.insert("search".into(), Default::default());
+        let overrides = merged(&snapshot, "");
+        assert!(overrides.contains_key("search"));
+        let error = apply(crate::tool_defaults::definitions(), &overrides).unwrap_err();
+        assert_eq!(error.message, "unknown tool override search");
+    }
+
+    #[test]
+    fn current_intel_overrides_rename_and_disable_tools() {
+        let overrides: Overrides = serde_json::from_value(serde_json::json!({
+            "code":{"name":"syntax"}, "graph":{"enabled":false}
+        }))
+        .unwrap();
+        let defs = apply(crate::intel::definitions(), &overrides).unwrap();
+        assert!(defs.iter().any(|d| d.name == "syntax"));
+        assert!(
+            !defs
+                .iter()
+                .any(|d| d.name == "code" || d.name == "graph" || d.name == "search")
+        );
+        assert_eq!(names(&overrides).canonical("syntax"), "code");
+    }
 }

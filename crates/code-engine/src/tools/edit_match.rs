@@ -1,4 +1,9 @@
 //! Eight-stage edit matching cascade adapted from FlyCockpit's Cockpit.
+//!
+//! The stage order (exact, line-trimmed, block-anchor, whitespace- and
+//! indentation-tolerant, escape-normalized, trimmed-boundary and context-aware
+//! matching) follows the edit replacer cascade of opencode
+//! (<https://github.com/sst/opencode>, MIT License, Copyright (c) 2025 opencode).
 use anyhow::{Result, bail};
 use std::ops::Range;
 fn invalid_input(message: &str) -> anyhow::Error {

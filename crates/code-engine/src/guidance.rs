@@ -212,6 +212,11 @@ fn pin_content(data: &Path, path: &Path, bytes: Option<&[u8]>) -> Result<(), Eng
     }
     crate::sessions::write_json(&pins_path, &pins)
 }
+fn pinned_content(data: &Path, hash: &str) -> Result<Vec<u8>, EngineError> {
+    read_content(&data.join("reviewer-guidance-content").join(hash))?
+        .filter(|bytes| crate::context::digest(bytes) == hash)
+        .ok_or_else(|| EngineError::bad("trusted reviewer guidance content missing or mismatched"))
+}
 fn read_pins(path: &Path) -> BTreeMap<PathBuf, String> {
     std::fs::read(path)
         .ok()
@@ -254,7 +259,7 @@ impl Control {
         self.guidance.lock().unwrap().pending = pending;
         Ok(())
     }
-    /// Register before execution so legacy hash-only pins can capture matching bytes.
+    /// Register verified immutable content, or untrusted initial bytes for change detection.
     pub(crate) fn watch_reviewer_guidance(&self, cwd: &Path) -> Result<(), EngineError> {
         let path = cwd.join(".cockpit-code/reviewer-guidance.md");
         let mut state = self.guidance.lock().unwrap();
@@ -263,17 +268,12 @@ impl Control {
         }
         let pins = read_pins(&self.data_dir.join("reviewer-guidance-trust.json"));
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let content = if let Some(hash) = pins.get(&path).or_else(|| pins.get(&canonical)) {
-            let blob = self.data_dir.join("reviewer-guidance-content").join(hash);
-            let bytes = match read_content(&blob)? {
-                Some(bytes) => Some(bytes),
-                None => read_content(&path)?,
-            };
-            let bytes = bytes.filter(|b| crate::context::digest(b) == *hash);
-            if let Some(bytes) = &bytes {
-                pin_content(&self.data_dir, &path, Some(bytes))?;
-            }
-            bytes
+        let content = if let Some(content) = pins
+            .get(&path)
+            .or_else(|| pins.get(&canonical))
+            .and_then(|hash| pinned_content(&self.data_dir, hash).ok())
+        {
+            Some(content)
         } else {
             // Trust controls prompt use, not whether an existing file may be read.
             // Capture the initial bytes so a read-only call is not called tampering.
@@ -376,9 +376,7 @@ impl Control {
             let pins = read_pins(&self.data_dir.join("reviewer-guidance-trust.json"));
             if pins.get(&path) != pin.sha256.as_ref() {
                 let shared = pins.get(&path).cloned();
-                let content = if shared == hash {
-                    bytes.clone()
-                } else if let Some(hash) = &shared {
+                let content = if let Some(hash) = &shared {
                     read_content(&self.data_dir.join("reviewer-guidance-content").join(hash))
                         .ok()
                         .flatten()
@@ -395,7 +393,10 @@ impl Control {
             }
             if approved.contains(&path) {
                 if let Err(e) = pin_content(&self.data_dir, &path, bytes.as_deref()) {
-                    flags.push(format!("approved reviewer-guidance pin failed: {}", e.message));
+                    flags.push(format!(
+                        "approved reviewer-guidance pin failed: {}",
+                        e.message
+                    ));
                 } else {
                     state.watched.insert(
                         path,
@@ -522,6 +523,7 @@ impl Control {
             let hash = crate::context::digest(content.as_bytes());
             if read_pins(&self.data_dir.join("reviewer-guidance-trust.json")).get(&path)
                 == Some(&hash)
+                && pinned_content(&self.data_dir, &hash).is_ok()
             {
                 return Ok(Some(content));
             }
@@ -587,4 +589,73 @@ pub(crate) fn protected_write(op: &PreparedOperation) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_guidance_blobs_allow_startup_without_trusting_the_working_file() {
+        for corrupt in [false, true] {
+            let (temp, store) = crate::test_support::store(serde_json::json!({}));
+            let cwd = temp.path().join("project");
+            let path = cwd.join(".cockpit-code/reviewer-guidance.md");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"trusted").unwrap();
+            pin_content(&store.directories.data, &path, Some(b"trusted")).unwrap();
+            let blob = store
+                .directories
+                .data
+                .join("reviewer-guidance-content")
+                .join(crate::context::digest(b"trusted"));
+            if corrupt {
+                std::fs::write(blob, b"corrupt").unwrap();
+            } else {
+                std::fs::remove_file(blob).unwrap();
+            }
+            let session = Session::create(store, cwd.clone(), Default::default()).unwrap();
+            // Keep the current bytes as a tamper-detection baseline only.
+            assert_eq!(
+                session.control.guidance.lock().unwrap().watched[&path]
+                    .content
+                    .as_deref(),
+                Some(b"trusted".as_slice())
+            );
+            // Library reads return immediately with trust pending. Even a matching
+            // working-file hash cannot replace the missing immutable content.
+            assert!(
+                session
+                    .control
+                    .project_library_guidance(&path, &CancellationToken::new())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(session.pending_reviewer_guidance().len(), 1);
+            session.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn guidance_pins_require_verified_immutable_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let path = temp.path().join("reviewer-guidance.md");
+        std::fs::write(&path, b"trusted").unwrap();
+        pin_content(&data, &path, Some(b"trusted")).unwrap();
+        let hash = crate::context::digest(b"trusted");
+        assert_eq!(
+            read_pins(&data.join("reviewer-guidance-trust.json"))[&path],
+            hash
+        );
+        assert_eq!(pinned_content(&data, &hash).unwrap().as_slice(), b"trusted");
+        let blob = data.join("reviewer-guidance-content").join(&hash);
+        std::fs::write(&blob, b"changed").unwrap();
+        assert!(pinned_content(&data, &hash).is_err());
+        std::fs::remove_file(blob).unwrap();
+        assert!(pinned_content(&data, &hash).is_err());
+        pin_content(&data, &path, None).unwrap();
+        assert!(!read_pins(&data.join("reviewer-guidance-trust.json")).contains_key(&path));
+    }
 }

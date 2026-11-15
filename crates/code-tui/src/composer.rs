@@ -1,5 +1,5 @@
-//! Multi-line composer with history recall, paste blocks (D53) and an
-//! optional vim mode (D54), plus the single-line input used by dialogs and
+//! Multi-line composer with history recall, paste blocks and an
+//! optional vim mode, plus the single-line input used by dialogs and
 //! the model filter. Positions are byte offsets on char boundaries; layout
 //! hard-wraps by display width.
 //!
@@ -134,7 +134,7 @@ impl TextBuf {
         self.blocks.insert(at, block);
         self.cursor = b;
     }
-    /// Insert an attachment chip (D79) for `path` at the cursor.
+    /// Insert an attachment chip for `path` at the cursor.
     pub fn insert_attachment(&mut self, kind: &str, path: &str) {
         self.last_a += 1;
         let n = self.last_a;
@@ -189,6 +189,11 @@ impl TextBuf {
     }
     /// `start..end` as wire text (the range must not split a chip).
     pub fn wire_range(&self, start: usize, end: usize) -> String {
+        let start = self.text.floor_char_boundary(start.min(self.text.len()));
+        let end = self
+            .text
+            .ceil_char_boundary(end.min(self.text.len()))
+            .max(start);
         let mut out = String::new();
         let mut at = start;
         for b in self
@@ -625,7 +630,7 @@ pub struct Composer {
     draft: String,
     /// Esc-cleared wire text, restored before walking sent messages.
     cleared: Option<String>,
-    /// Vim state when vim mode is on (D54).
+    /// Vim state when vim mode is on.
     pub vim: Option<Vim>,
 }
 
@@ -747,5 +752,28 @@ impl Composer {
         let sel = self.vim.as_ref().and_then(|v| v.visual_range(&self.buf));
         self.buf
             .layout_ex(width, prefix, Span::raw("  "), t.text(), sel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_range_clamps_stale_utf8_offsets() {
+        let mut buf = TextBuf::default();
+        buf.set("a界éz");
+        assert_eq!(buf.wire_range(2, 5), "界é");
+        assert_eq!(buf.wire_range(usize::MAX, usize::MAX), "");
+        assert_eq!(buf.wire_range(6, 1), "");
+        assert_eq!(buf.wire_range(1, 4), "界");
+        buf.insert_attachment("image", "/tmp/image.png");
+        let wire = buf.to_wire();
+        let mut recalled = TextBuf::default();
+        recalled.set_wire(&wire);
+        assert_eq!(
+            crate::paste::attachments(&recalled.to_wire()),
+            vec![("image".into(), "/tmp/image.png".into())]
+        );
     }
 }

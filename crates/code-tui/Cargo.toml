@@ -15,14 +15,14 @@ code-config = { path = "../code-config" }
 code-engine = { path = "../code-engine" }
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml_ng = "0.10"
+serde-saphyr = "2.1"
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-similar = "2.7"
+similar = "3.2"
 ignore = "0.4"
 unicode-width = "0.2"
 vt100 = "0.18"

@@ -1,4 +1,4 @@
-//! Provider usage (D85), live quota (m7) and soft budgets (D87) as plain
+//! Provider usage, live quota and soft budgets as plain
 //! view types, plus the `cockpit-code.usage/1` parser and display helpers.
 //! The data comes through the engine adapter; nothing here runs commands.
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -54,7 +54,7 @@ impl Limit {
     }
 }
 
-/// A soft per-provider budget (D87); `spent` is what the harness recorded.
+/// A soft per-provider budget; `spent` is what the harness recorded.
 #[derive(Clone, Debug)]
 pub struct Budget {
     pub usd: f64,
@@ -86,7 +86,7 @@ pub struct ProviderUsage {
     pub label: String,
     /// Every model of the provider bills by subscription.
     pub subscription: bool,
-    /// The provider declares a `usage` command (D85).
+    /// The provider declares a `usage` command.
     pub declared: bool,
     pub account: Option<String>,
     pub limits: Vec<Limit>,
@@ -100,7 +100,7 @@ pub struct ProviderUsage {
     pub stale: bool,
     /// The engine is running the usage command now.
     pub refreshing: bool,
-    /// Calls in the budget period with no known cost (D87).
+    /// Calls in the budget period with no known cost.
     pub unknown_cost_calls: usize,
     /// Advisory 80%/100% budget warnings.
     pub warnings: Vec<String>,
@@ -281,7 +281,7 @@ pub fn quota_limit(v: &Value) -> Option<Limit> {
     (l.used_percent.is_some() || l.remaining.is_some() || l.resets_at.is_some()).then_some(l)
 }
 
-/// Discovery `account` metadata: a D85-shaped `limits` list, a `quota`
+/// Discovery `account` metadata: a usage-protocol `limits` list, a `quota`
 /// object, or the account itself carrying quota fields.
 pub fn account_limits(account: &Value) -> Vec<Limit> {
     if let Some(a) = account["limits"].as_array() {

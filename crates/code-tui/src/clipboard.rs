@@ -1,7 +1,7 @@
 //! Clipboard delivery, adapted from FlyCockpit's Cockpit (sealed
 //! values, redaction, generations and the daemon route left out).
 //!
-//! Every copy goes out through all routes that can reach a clipboard (D130):
+//! Every copy goes out through all routes that can reach a clipboard:
 //! native (`arboard`, local only, HTML plus a plain-text alternative, or an
 //! executable — `pbcopy`, `wl-copy`, `xclip`/`xsel` — when native fails),
 //! **always** OSC 52 written to the tty (tmux-aware, see [`build_sequence`]),

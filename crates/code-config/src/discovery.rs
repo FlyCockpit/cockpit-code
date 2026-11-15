@@ -111,14 +111,6 @@ fn cache_failure(provider: &Provider, cache: &Path, error: &DiscoveryError) {
         let _ = atomic_write(&failure_path(cache), &bytes);
     }
 }
-/// Compatibility entry point. Snapshot callers also receive structured errors.
-pub fn discover(
-    provider: &Provider,
-    cache: &Path,
-    refresh: bool,
-) -> Result<Option<serde_json::Value>> {
-    discover_cached(provider, cache, refresh, true).map_err(|e| ConfigError::Invalid(e.to_string()))
-}
 fn discover_cached(
     provider: &Provider,
     cache: &Path,
@@ -345,5 +337,21 @@ pub(super) fn enrich_selected(
                 snapshot.errors.push(format!("{id}/{mid}: {warning}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_without_a_discover_command_returns_no_override() {
+        let provider: Provider =
+            serde_json::from_value(serde_json::json!({"type":"openai-chat"})).unwrap();
+        assert!(
+            discover_cached(&provider, Path::new("unused-cache"), false, false)
+                .unwrap()
+                .is_none()
+        );
     }
 }

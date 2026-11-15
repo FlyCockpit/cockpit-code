@@ -1,4 +1,4 @@
-//! D137 advertisement is independent of D111 availability. Filter capabilities first.
+//! Advertisement is independent of availability. Filter capabilities first.
 use crate::{tool_names::Names, tools::ToolDefinition};
 use code_config::{Snapshot, tools::Profile};
 use std::collections::BTreeMap;
@@ -81,7 +81,7 @@ pub(crate) fn native(
 }
 pub(crate) const HINT: &str = "Extensions via script: graph for relationship shortlists, context_pack for scoped maps, change_impact for explicit diff impact, available lsp for semantic identity, web_search/web_fetch for external pages, models for unfamiliar child models, decide/decisions for lasting choices. Known tool: call directly or tools.describe(name=...) for its schema. tools.search(query=...) returns a list of dicts, tools.describe a dict with schema. grep(pattern=...) searches files. Inspect tools.describe(name='...'), then call the described function. code and history are native; batch/filter before printing bounded answers.";
 
-/// Hints become part of the frozen catalog; D111 description overrides may replace them.
+/// Hints become part of the frozen catalog; description overrides may replace them.
 pub(crate) fn add_hints(definitions: &mut [ToolDefinition]) {
     for tool in definitions {
         let hint = match tool.name.as_str() {

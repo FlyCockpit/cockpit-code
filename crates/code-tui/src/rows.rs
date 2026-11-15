@@ -29,7 +29,7 @@ pub enum Btn {
     CopyUser,
     /// The n-th paste chip of a user message: view it.
     Paste(usize),
-    /// The n-th attachment chip of a user message: open it (D79).
+    /// The n-th attachment chip of a user message: open it.
     Attachment(usize),
     /// Composer paste chip `.0`: view it read-only.
     ChipView(usize),
@@ -41,9 +41,9 @@ pub enum Btn {
     ChipRemove(usize),
     /// Composer attachment chip `.0`: open the file in the system viewer.
     ChipOpen(usize),
-    /// An "answered via fork" row: reopen the fork's saved chat (D64).
+    /// An "answered via fork" row: reopen the fork's saved chat.
     OpenFork,
-    /// A tool's saved full output (D129): open it in the pager.
+    /// A tool's saved full output: open it in the pager.
     Output,
 }
 

@@ -1,4 +1,4 @@
-//! `/decisions` (D128): the ledger of choices agents made on the user's
+//! `/decisions`: the ledger of choices agents made on the user's
 //! behalf. Open records first (closed ones behind a toggle); each shows its
 //! question, choice, alternatives, reason, deciding agent, affected files
 //! and criteria, and time. Keep closes it, change sends steering to the

@@ -234,7 +234,7 @@ pub(crate) fn blocks(
     Ok(blocks)
 }
 impl Session {
-    /// Lift legacy composer tags only at the frontend input boundary. Pasted
+    /// Import current composer tags only at the frontend input boundary. Pasted
     /// text is opaque, and recorded/model/tool messages never pass through here.
     pub(crate) fn import_attachment_tags(
         &self,

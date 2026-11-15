@@ -46,7 +46,7 @@ impl Pty {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                &raw mut size,
             )
         } != 0
         {
@@ -117,6 +117,10 @@ impl Pty {
 }
 pub(crate) struct ProcessGroup(pub i32);
 impl ProcessGroup {
+    pub fn new(pgid: i32) -> Self {
+        crate::process_groups::track(pgid);
+        Self(pgid)
+    }
     pub fn signal(&self, signal: i32) {
         unsafe {
             libc::kill(-self.0, signal);
@@ -126,6 +130,7 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.signal(libc::SIGKILL);
+        crate::process_groups::forget(self.0);
     }
 }
 impl AsyncRead for Reader {

@@ -1,4 +1,4 @@
-//! D62 question sets, validation and compatibility with older single text questions.
+//! Question sets, validation and current text-question shorthand.
 use crate::{Control, schema::*};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -184,5 +184,20 @@ impl Control {
         self.emit(EngineEvent::Committed { envelope });
         self.changed.notify_waiters();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_text_shorthand_becomes_a_structured_question() {
+        let specs = parse(&json!({"text":"Where?"})).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "q1");
+        assert_eq!(specs[0].kind, QuestionKind::Text);
+        assert!(parse(&json!({"questions":[]})).is_err());
+        assert!(parse(&json!({"text":"  "})).is_err());
     }
 }

@@ -25,7 +25,7 @@ pub struct CriterionCheck {
     pub timeout_secs: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct Finding {
     pub text: String,
     pub evidence: String,
@@ -382,7 +382,7 @@ impl GoalContract {
     pub fn completion_criteria(&self) -> impl Iterator<Item = &Criterion> {
         self.acceptance.iter().chain(&self.findings)
     }
-    /// Acceptance and findings both define completion for D96 review.
+    /// Acceptance and findings both define completion for review.
     pub fn has_completion_criteria(&self) -> bool {
         self.completion_criteria().any(|c| c.status != "withdrawn")
     }
@@ -1146,4 +1146,37 @@ fn query(state: &State, args: &Value) -> Result<String, EngineError> {
 
 pub(crate) fn task_criteria_schema() -> Value {
     json!({"type":"array","maxItems":32,"items":{"anyOf":[{"type":"string","maxLength":4096},{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string","maxLength":4096},"check":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeoutSecs":{"type":"integer","minimum":1,"maximum":600}},"required":["command"],"additionalProperties":false}},"required":["text"],"additionalProperties":false}]}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn findings_require_current_structured_evidence_fields() {
+        let value = serde_json::json!({"text":"Unchecked input", "evidence":"src/lib.rs:1 inspection",
+            "severity":"low", "locations":["src/lib.rs:1"], "fix":"Validate input",
+            "verification":"Inspection", "confidence":0.9});
+        let finding: Finding = serde_json::from_value(value.clone()).unwrap();
+        finding.validate().unwrap();
+        for field in [
+            "text",
+            "evidence",
+            "severity",
+            "locations",
+            "fix",
+            "verification",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<Finding>(missing).is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<Finding>(serde_json::json!({"text":"old", "evidence":"old"}))
+                .is_err()
+        );
+    }
 }

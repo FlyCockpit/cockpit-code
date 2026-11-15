@@ -1,4 +1,4 @@
-//! Vim mode for the composer (D54), adapted from FlyCockpit's
+//! Vim mode for the composer, adapted from FlyCockpit's
 //! Cockpit composer vim dispatch: normal, insert,
 //! operator-pending and visual (charwise and linewise) modes with the
 //! common motions, operators, text objects and one unnamed register.
@@ -7,7 +7,7 @@
 //! an operator range touching a chip widens over the whole chip, and the
 //! register keeps wire text so a yanked chip is put back as a chip.
 //!
-//! Esc (Cockpit's rule, D54): in insert mode Esc only switches to normal
+//! Esc (Cockpit's rule): in insert mode Esc only switches to normal
 //! mode; in normal mode Esc clears a pending `g`/`f`/operator/text object
 //! and is otherwise passed on, keeping its app meaning (clear the
 //! selection, clear and save input, then cancel a turn on an empty box).
@@ -128,11 +128,21 @@ impl Vim {
         self.mode = Mode::Insert;
     }
 
+    /// A paste invalidates the visual anchor; keep the cursor in normal mode.
+    pub fn before_paste(&mut self) {
+        if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            self.clear_pending();
+            self.mode = Mode::Normal;
+        }
+    }
+
     /// The highlighted range in visual modes.
     pub fn visual_range(&self, buf: &TextBuf) -> Option<(usize, usize)> {
         let (lo, hi) = (
-            self.anchor.min(buf.cursor).min(buf.text.len()),
-            self.anchor.max(buf.cursor).min(buf.text.len()),
+            buf.text
+                .floor_char_boundary(self.anchor.min(buf.cursor).min(buf.text.len())),
+            buf.text
+                .floor_char_boundary(self.anchor.max(buf.cursor).min(buf.text.len())),
         );
         match self.mode {
             Mode::Visual => Some(buf.widen(lo, buf.next(hi).max(lo))),
@@ -931,5 +941,28 @@ fn text_object(buf: &TextBuf, obj: char, around: bool) -> Option<(usize, usize)>
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visual_ranges_clamp_stale_multibyte_anchors() {
+        let mut buf = TextBuf::default();
+        buf.set("éab");
+        buf.cursor = 0;
+        let mut vim = Vim {
+            mode: Mode::Visual,
+            anchor: 1,
+            ..Vim::default()
+        };
+        assert_eq!(vim.visual_range(&buf), Some((0, 2)));
+        vim.mode = Mode::VisualLine;
+        assert_eq!(vim.visual_range(&buf), Some((0, 4)));
+        vim.before_paste();
+        assert_eq!(vim.mode, Mode::Normal);
+        assert_eq!(vim.visual_range(&buf), None);
     }
 }

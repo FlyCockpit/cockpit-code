@@ -1,13 +1,13 @@
-//! tui-v13 transcript rows for the agent tree: D132 partial reports,
-//! subtree growth, finalize progress, D131 stop and status-ask outcomes,
-//! the D125 compaction suggestion, and the D134 wake header.
+//! Transcript rows for the agent tree: partial reports,
+//! subtree growth, finalize progress, stop and status-ask outcomes,
+//! the compaction suggestion, and the wake header.
 use super::App;
 use crate::agents::Tree;
 use crate::engine::TreeRow;
 use crate::transcript::{Card, CardPart, Tone, Transcript};
 use crate::wrap::truncate;
 
-/// Live wrap-up progress of one `agents finalize` request (D132).
+/// Live wrap-up progress of one `agents finalize` request.
 pub(super) struct Finalizing {
     /// Who asked (its transcript holds the row).
     pub caller: String,
@@ -252,7 +252,7 @@ pub(super) fn finalize_card(tree: &Tree, f: &Finalizing, live: bool) -> Card {
     }
 }
 
-/// D125: the root compaction suggestion, once per crossing.
+/// The root compaction suggestion, once per crossing.
 pub(super) fn compact_card(pct: u64, used: u64, window: u64) -> Card {
     use crate::picker::fmt_tokens;
     Card {
@@ -271,7 +271,7 @@ pub(super) fn compact_card(pct: u64, used: u64, window: u64) -> Card {
 }
 
 impl App {
-    /// A live tree row (D131/D132) committed in `agent`'s journal.
+    /// A live tree row committed in `agent`'s journal.
     pub(super) fn on_tree(&mut self, agent: String, row: TreeRow) {
         match &row {
             TreeRow::Partial { child, .. } => {
@@ -349,7 +349,7 @@ impl App {
         self.refresh_panels();
     }
 
-    /// D134: root started a turn by itself. When mail woke it (children
+    /// Root started a turn by itself. When mail woke it (children
     /// reported, a message, a scope request), say so above the turn.
     pub(super) fn wake_header(&mut self) {
         let reasons = std::mem::take(&mut self.wake_reasons);
@@ -387,7 +387,7 @@ fn own_growth(tree: &Tree, agent: &str, lines: &[String]) -> Option<TreeRow> {
         let mut it = id.splitn(2, '-');
         let role = it.next().unwrap_or_default();
         let rest = it.next().unwrap_or_default();
-        format!("{role}-{}", &rest[..rest.len().min(8)])
+        format!("{role}-{}", rest.chars().take(8).collect::<String>())
     };
     let me = [agent.to_string(), short(agent), tree.label(agent)];
     let kept: Vec<String> = lines

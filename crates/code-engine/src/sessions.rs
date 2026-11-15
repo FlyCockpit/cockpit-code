@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
@@ -17,6 +17,12 @@ pub fn now() -> String {
 }
 fn bad(e: impl std::fmt::Display) -> EngineError {
     EngineError::bad(format!("session storage: {e}"))
+}
+/// Session directories hold verbatim tool output (which can include secrets
+/// the agent read), so they are private to the owner.
+fn create_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path).map_err(bad)
 }
 fn valid_id(id: &str) -> Result<()> {
     if id.is_empty()
@@ -43,11 +49,8 @@ pub struct SessionHeader {
     pub cwd: PathBuf,
     pub created_at: String,
     pub title: String,
-    #[serde(default)]
     pub title_source: TitleSource,
-    #[serde(default)]
     pub title_turns: u64,
-    #[serde(default)]
     pub title_generation: u64,
     pub fork_of: Option<ForkPoint>,
     #[serde(default)]
@@ -68,7 +71,7 @@ pub struct SessionSettings {
     pub disabled_providers: BTreeSet<String>,
     pub compact_at: BTreeMap<String, f64>,
     pub strict_tools: BTreeMap<String, bool>,
-    /// D138 server resolution, including empty results, frozen for the session.
+    /// Server resolution, including empty results, frozen for the session.
     pub lsp_servers: Option<BTreeMap<String, code_config::lsp::LspServer>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -349,6 +352,126 @@ fn context_path(dir: &Path, agent: &str, context: u32) -> PathBuf {
         .join("contexts")
         .join(format!("{context:04}.jsonl"))
 }
+/// Run an append under the caller's journal guard, rolling back partial writes
+/// and failed syncs before another append can observe them.
+fn with_append_rollback(
+    file: &mut File,
+    append: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let original_len = file.metadata()?.len();
+    if let Err(error) = append(file) {
+        if let Err(rollback) = file.set_len(original_len).and_then(|()| file.sync_all()) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("append failed ({error}); rollback failed ({rollback})"),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Discard only an invalid, unterminated final record. Return whether a valid
+/// final record needs a newline before appending. Usually just the last byte
+/// needs checking; scan backwards in chunks only when the newline is missing.
+fn repair_context_tail(file: &mut File) -> io::Result<bool> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(false);
+    }
+    let mut end = len;
+    let mut chunk = [0; 8192];
+    let tail_start = loop {
+        let start = end.saturating_sub(chunk.len() as u64);
+        let size = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk[..size])?;
+        if let Some(index) = chunk[..size].iter().rposition(|b| *b == b'\n') {
+            break start + index as u64 + 1;
+        }
+        if start == 0 {
+            break 0;
+        }
+        end = start;
+    };
+    file.seek(SeekFrom::Start(tail_start))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    if serde_json::from_slice::<EventEnvelope>(&tail).is_ok() {
+        return Ok(true);
+    }
+    file.set_len(tail_start)?;
+    file.sync_all()?;
+    Ok(false)
+}
+
+fn append_context(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    let needs_newline = repair_context_tail(file)?;
+    with_append_rollback(file, |file| {
+        if needs_newline {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// Complete records are strict; a crash may leave an invalid final byte tail.
+/// Read bytes so a split UTF-8 character in that tail is recoverable too.
+pub(crate) fn context_events(
+    path: &Path,
+) -> Result<impl Iterator<Item = Result<EventEnvelope>> + '_> {
+    context_events_containing(path, None)
+}
+
+/// Like [`context_events`], but only parses lines that contain `needle`
+/// (other lines are skipped unparsed), so callers that need a few event
+/// kinds do not materialize whole transcripts.
+pub(crate) fn context_events_containing<'a>(
+    path: &'a Path,
+    needle: Option<&'a [u8]>,
+) -> Result<impl Iterator<Item = Result<EventEnvelope>> + 'a> {
+    let mut reader = BufReader::new(File::open(path).map_err(bad)?);
+    let mut line = Vec::new();
+    let mut line_number = 0;
+    Ok(std::iter::from_fn(move || {
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return None,
+                Err(error) => return Some(Err(bad(error))),
+                Ok(_) => line_number += 1,
+            }
+            match needle {
+                Some(needle) if !line.windows(needle.len()).any(|w| w == needle) => continue,
+                _ => break,
+            }
+        }
+        let event: EventEnvelope = match serde_json::from_slice(&line) {
+            Ok(event) => event,
+            Err(_) if !line.ends_with(b"\n") => return None,
+            Err(_) => {
+                return Some(Err(bad(format!(
+                    "invalid event at {}:{}; refusing to alter canonical history",
+                    path.display(),
+                    line_number
+                ))));
+            }
+        };
+        Some(if event.version == 1 {
+            Ok(event)
+        } else {
+            Err(bad("unsupported session event version"))
+        })
+    }))
+}
+
 pub(crate) fn read_contexts(
     dir: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<u32, Vec<EventEnvelope>>>> {
@@ -375,22 +498,7 @@ pub(crate) fn read_contexts(
                 .and_then(|s| s.to_str())
                 .and_then(|s| s.parse::<u32>().ok())
                 .ok_or_else(|| bad("invalid context filename"))?;
-            let mut events = vec![];
-            for line in BufReader::new(File::open(&path).map_err(bad)?).lines() {
-                let line = line.map_err(bad)?;
-                let mut event: EventEnvelope = serde_json::from_str(&line).map_err(|_| {
-                    bad(format!(
-                        "invalid event at {}:{}; refusing to alter canonical history",
-                        path.display(),
-                        events.len() + 1
-                    ))
-                })?;
-                if event.version != 1 {
-                    return Err(bad("unsupported session event version"));
-                }
-                crate::injection::canonicalize(&mut event.event, &event.id);
-                events.push(event);
-            }
+            let events = context_events(&path)?.collect::<Result<Vec<_>>>()?;
             contexts.insert(n, events);
         }
         all.insert(id, contexts);
@@ -401,7 +509,7 @@ pub(crate) struct Journal {
     pub guidance_selections: BTreeMap<String, crate::guidance_selector::GuidanceSelection>,
     pub subscriptions: BTreeMap<String, Vec<PathBuf>>,
     pub subscription_pending: BTreeMap<String, crate::subscriptions::Pending>,
-    /// D122 local command notices not yet delivered, per agent.
+    /// Local command notices not yet delivered, per agent.
     pub local_commands: BTreeMap<String, VecDeque<String>>,
     pub wait_edges: BTreeMap<String, (String, String)>,
     pub scopes: BTreeMap<String, crate::scopes::AgentScope>,
@@ -419,6 +527,7 @@ pub(crate) struct Journal {
     pub histories: BTreeMap<String, Vec<HistoryEvent>>,
     pub contexts: BTreeMap<String, u32>,
     pub totals: SessionTotals,
+    usage_calls_seen: BTreeSet<String>,
     pub agent_totals: BTreeMap<String, SessionTotals>,
     pub contracts: BTreeMap<String, crate::goal::GoalContract>,
     pub questions: BTreeMap<String, QuestionRecord>,
@@ -501,6 +610,7 @@ impl Journal {
             histories: BTreeMap::new(),
             contexts: BTreeMap::from([("root".into(), 1)]),
             totals: SessionTotals::default(),
+            usage_calls_seen: BTreeSet::new(),
             agent_totals: BTreeMap::new(),
             contracts: BTreeMap::new(),
             questions: BTreeMap::new(),
@@ -552,7 +662,7 @@ impl Journal {
             return Ok(());
         }
         fs::create_dir_all(self.dir.parent().unwrap()).map_err(bad)?;
-        fs::create_dir(&self.dir).map_err(bad)?;
+        create_private_dir(&self.dir)?;
         let result = (|| {
             let _guard = Guard::acquire(&self.dir)?;
             let lock = LockRecord {
@@ -645,6 +755,7 @@ impl Journal {
                 histories: BTreeMap::new(),
                 contexts: BTreeMap::new(),
                 totals: SessionTotals::default(),
+                usage_calls_seen: BTreeSet::new(),
                 agent_totals: BTreeMap::new(),
                 contracts: BTreeMap::new(),
                 questions: BTreeMap::new(),
@@ -752,7 +863,10 @@ impl Journal {
         valid_id(id)?;
         let dir = store.directories.data.join("sessions").join(id);
         let _guard = Guard::acquire(&dir)?;
-        let header = read_json(&dir.join("session.json"))?;
+        let header: SessionHeader = read_json(&dir.join("session.json"))?;
+        if header.id != id {
+            return Err(bad("source session header id does not match requested id"));
+        }
         let settings = read_json(&dir.join("settings.json"))?;
         let contexts = read_contexts(&dir)?;
         let mut agents = BTreeMap::new();
@@ -780,6 +894,7 @@ impl Journal {
             return Err(bad("unsupported snapshot version"));
         }
         let source = snapshot.header.id.clone();
+        valid_id(&source)?;
         let explicit_point = point.is_some();
         let point = point.unwrap_or_else(|| {
             let (context, events) = snapshot
@@ -827,7 +942,7 @@ impl Journal {
         let root = store.directories.data.join("sessions");
         fs::create_dir_all(&root).map_err(bad)?;
         let dir = root.join(&id);
-        fs::create_dir(&dir).map_err(bad)?;
+        create_private_dir(&dir)?;
         snapshot.header.id = id.clone();
         snapshot.header.created_at = now();
         snapshot.header.title.clear();
@@ -870,6 +985,12 @@ impl Journal {
                     if agent == point.agent_id && *n > point.context {
                         continue;
                     }
+                    if agent != point.agent_id
+                        && *n > 1
+                        && events.first().is_some_and(|e| e.ts > boundary)
+                    {
+                        continue;
+                    }
                     let mut file = File::create(context_path(&dir, &agent, *n)).map_err(bad)?;
                     for (i, envelope) in events.iter().enumerate() {
                         if agent == point.agent_id && *n == point.context && i >= point.line {
@@ -904,6 +1025,15 @@ impl Journal {
             .join("jobs");
         if source_jobs.is_dir() {
             copy_assets(&source_jobs, &dir.join("jobs"))?;
+        }
+        let source_outputs = store
+            .directories
+            .data
+            .join("sessions")
+            .join(&snapshot.header.fork_of.as_ref().unwrap().session_id)
+            .join("outputs");
+        if source_outputs.is_dir() {
+            copy_assets(&source_outputs, &dir.join("outputs"))?;
         }
         Self::load(store, &id, false)
     }
@@ -984,7 +1114,6 @@ impl Journal {
             | HistoryEvent::SystemReminder { .. }
             | HistoryEvent::SettingChange { .. }
             | HistoryEvent::Message { .. }
-            | HistoryEvent::Answer { .. }
             | HistoryEvent::QuestionsAnswered { .. } => None,
             _ => self.activities.get(agent).and_then(|a| a.1.clone()),
         };
@@ -1007,13 +1136,13 @@ impl Journal {
             .ok_or_else(|| bad("agent is not registered"))?;
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(context_path(&self.dir, agent, context))
             .map_err(bad)?;
         let mut bytes = serde_json::to_vec(&envelope).map_err(bad)?;
         bytes.push(b'\n');
-        file.write_all(&bytes).map_err(bad)?;
-        file.sync_all().map_err(bad)?;
+        append_context(&mut file, &bytes).map_err(bad)?;
         self.metadata(agent, &envelope.event);
         self.agent_activity
             .insert(agent.into(), envelope.ts.clone());
@@ -1134,7 +1263,9 @@ impl Journal {
             HistoryEvent::AgentRequest { checkpoint } => {
                 self.requests.insert(agent.into(), *checkpoint.clone());
             }
-            HistoryEvent::Usage { usage } => {
+            HistoryEvent::Usage { usage }
+                if self.usage_calls_seen.insert(usage.call_id.clone()) =>
+            {
                 self.totals.add(usage);
                 self.agent_totals
                     .entry(agent.into())
@@ -1156,17 +1287,9 @@ impl Journal {
             HistoryEvent::AgentStarted {
                 agent,
                 execution,
-                task_call_id,
+                task_call_id: _,
             } => {
-                let launch = if execution.launch_id.is_empty() {
-                    format!(
-                        "{}:{}",
-                        agent.agent_id,
-                        task_call_id.as_deref().unwrap_or("legacy")
-                    )
-                } else {
-                    execution.launch_id.clone()
-                };
+                let launch = execution.launch_id.clone();
                 if self.launches_seen.insert(launch.clone()) {
                     self.partial_reports.remove(&agent.agent_id);
                     self.finalizing.remove(&agent.agent_id);
@@ -1289,9 +1412,6 @@ impl Journal {
             HistoryEvent::Question { question } => {
                 self.questions.insert(question.id.clone(), question.clone());
             }
-            HistoryEvent::Answer { id, text } => {
-                self.deliver_answer(id, text.clone(), None);
-            }
             HistoryEvent::QuestionsAnswered { id, answers } => {
                 self.deliver_answer(
                     id,
@@ -1410,11 +1530,11 @@ impl Journal {
             envelopes.push(envelope);
         }
         let mut file = OpenOptions::new()
+            .read(true)
             .append(true)
             .open(context_path(&self.dir, "root", self.contexts["root"]))
             .map_err(bad)?;
-        file.write_all(&bytes).map_err(bad)?;
-        file.sync_all().map_err(bad)?;
+        append_context(&mut file, &bytes).map_err(bad)?;
         for envelope in &envelopes {
             self.metadata("root", &envelope.event);
             reduce(
@@ -1597,6 +1717,7 @@ fn retained_parent(agents: &BTreeMap<String, AgentRecord>, parent: &str, boundar
     })
 }
 fn copy_assets(source: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).map_err(bad)?;
     for e in fs::read_dir(source).map_err(bad)? {
         let e = e.map_err(bad)?;
         let ty = e.file_type().map_err(bad)?;
@@ -1637,4 +1758,412 @@ pub(crate) fn usage_records(data: &Path) -> Vec<(String, UsageRecord)> {
         }
     }
     records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture() -> (tempfile::TempDir, ConfigStore, Journal) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::load(code_config::Directories {
+            config: temp.path().join("config"),
+            data: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        let journal =
+            Journal::create(&store, temp.path().to_owned(), SessionSettings::default()).unwrap();
+        (temp, store, journal)
+    }
+
+    #[test]
+    fn current_session_headers_require_title_metadata() {
+        let (_temp, _store, journal) = fixture();
+        let saved = serde_json::to_value(&journal.header).unwrap();
+        let restored: SessionHeader = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), saved);
+        for field in ["titleSource", "titleTurns", "titleGeneration"] {
+            let mut missing = saved.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<SessionHeader>(missing).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    fn user(text: &str) -> HistoryEvent {
+        HistoryEvent::User {
+            text: text.into(),
+            attachments: vec![],
+        }
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn usage_is_counted_once_across_rotation_and_replay() {
+        let (_temp, store, mut journal) = fixture();
+        let usage: UsageRecord = serde_json::from_value(serde_json::json!({
+            "callId":"call-1", "model":"m", "kind":"agent",
+            "sessionId":journal.header.id, "agentId":"root", "provider":"p", "endpoint":"p:command", "attempt":0,
+            "tokens":{"inputTokens":100,"outputTokens":20},
+            "costUsd":0.25, "partial":false
+        }))
+        .unwrap();
+        let event = HistoryEvent::Usage { usage };
+        journal.append("root", event.clone()).unwrap();
+        journal.rotate("root", vec![event]).unwrap();
+        assert_eq!(journal.totals.calls, 1);
+        assert_eq!(journal.totals.input_tokens, 100);
+        assert_eq!(journal.totals.output_tokens, 20);
+        assert_eq!(journal.totals.known_cost_usd, 0.25);
+        assert_eq!(journal.agent_totals["root"].calls, 1);
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+        let loaded = Journal::load(&store, &id, false).unwrap();
+        assert_eq!(loaded.contexts["root"], 2);
+        assert_eq!(loaded.totals.calls, 1);
+        assert_eq!(loaded.totals.input_tokens, 100);
+        assert_eq!(loaded.totals.output_tokens, 20);
+        assert_eq!(loaded.totals.known_cost_usd, 0.25);
+        assert_eq!(loaded.agent_totals["root"].calls, 1);
+        assert_eq!(
+            list_in(&store.directories.data, None).unwrap()[0]
+                .totals
+                .calls,
+            1
+        );
+    }
+
+    #[test]
+    fn fork_skips_sibling_contexts_that_start_after_the_boundary() {
+        let (_temp, store, mut journal) = fixture();
+        journal.append("root", user("boundary")).unwrap();
+        let mut sibling = journal.agents["root"].clone();
+        sibling.agent_id = "build-child".into();
+        sibling.parent_id = Some("root".into());
+        sibling.created_at = "2026-01-01T00:00:00Z".into();
+        journal.register(sibling).unwrap();
+        journal.append("build-child", user("before")).unwrap();
+        journal.rotate("build-child", vec![user("after")]).unwrap();
+        let mut snapshot = journal.snapshot().unwrap();
+        snapshot
+            .contexts
+            .get_mut("root")
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()[0]
+            .ts = "2026-01-02T00:00:00Z".into();
+        snapshot
+            .contexts
+            .get_mut("build-child")
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()[0]
+            .ts = "2026-01-01T12:00:00Z".into();
+        snapshot
+            .contexts
+            .get_mut("build-child")
+            .unwrap()
+            .get_mut(&2)
+            .unwrap()[0]
+            .ts = "2026-01-03T00:00:00Z".into();
+        let fork = Journal::restore(
+            &store,
+            snapshot,
+            Some(ForkPoint {
+                session_id: journal.header.id.clone(),
+                agent_id: "root".into(),
+                context: 1,
+                line: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(fork.contexts["build-child"], 1);
+        assert!(
+            matches!(&fork.histories["build-child"][0], HistoryEvent::User { text, .. } if text == "before")
+        );
+        assert!(!context_path(&fork.dir, "build-child", 2).exists());
+    }
+
+    #[test]
+    fn restore_rejects_invalid_source_ids_before_creating_files() {
+        let (_temp, store, journal) = fixture();
+        let snapshot = journal.snapshot().unwrap();
+        for id in ["/tmp/foreign", "../foreign", ""] {
+            let mut snapshot = snapshot.clone();
+            snapshot.header.id = id.into();
+            let error = Journal::restore(&store, snapshot, None).err().unwrap();
+            assert!(error.message.contains("invalid session/agent id"));
+            assert!(!store.directories.data.join("sessions").exists());
+        }
+    }
+
+    #[test]
+    fn fork_rejects_a_mismatched_source_header() {
+        let (_temp, store, mut journal) = fixture();
+        journal.append("root", user("one")).unwrap();
+        let mut header = journal.header.clone();
+        header.id = "another-valid-id".into();
+        write_json(&journal.dir.join("session.json"), &header).unwrap();
+        let error = Journal::fork(&store, &journal.header.id, None)
+            .err()
+            .unwrap();
+        assert!(error.message.contains("header id does not match"));
+        assert_eq!(
+            fs::read_dir(store.directories.data.join("sessions"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_load_ignores_only_a_torn_final_record() {
+        for tail in [b"{\"version\":1,".as_slice(), b"{\"text\":\"\xf0\x9f"] {
+            let (_temp, store, mut journal) = fixture();
+            let first = journal.append("root", user("one")).unwrap();
+            let second = journal.append("root", user("two")).unwrap();
+            let path = context_path(&journal.dir, "root", 1);
+            append_raw(&path, tail);
+            let original_len = fs::metadata(&path).unwrap().len();
+            let id = journal.header.id.clone();
+            journal.close().unwrap();
+
+            let loaded = Journal::load(&store, &id, false).unwrap();
+            let snapshot = loaded.snapshot().unwrap();
+            let events = &snapshot.contexts["root"][&1];
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].id, first.id);
+            assert_eq!(events[1].id, second.id);
+            assert_eq!(loaded.histories["root"].len(), 2);
+            // Reading does not mutate canonical history.
+            assert_eq!(fs::metadata(path).unwrap().len(), original_len);
+        }
+    }
+
+    #[test]
+    fn append_after_torn_tail_repairs_the_file() {
+        let (_temp, store, mut journal) = fixture();
+        let first = journal.append("root", user("one")).unwrap();
+        let path = context_path(&journal.dir, "root", 1);
+        append_raw(&path, b"{\"version\":1,");
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+        let mut loaded = Journal::load(&store, &id, false).unwrap();
+
+        let second = loaded.append("root", user("two")).unwrap();
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let events: Vec<EventEnvelope> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, first.id);
+        assert_eq!(events[1].id, second.id);
+        assert_eq!(second.sequence, first.sequence + 1);
+    }
+
+    #[test]
+    fn settings_append_also_repairs_a_torn_tail() {
+        let (_temp, store, mut journal) = fixture();
+        journal.append("root", user("one")).unwrap();
+        let path = context_path(&journal.dir, "root", 1);
+        append_raw(&path, b"{\"version\":");
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+        let mut loaded = Journal::load(&store, &id, false).unwrap();
+
+        loaded
+            .change_settings(vec![
+                ("model".into(), Value::String("test/model".into())),
+                ("effort".into(), Value::String("high".into())),
+            ])
+            .unwrap();
+        let contexts = read_contexts(&loaded.dir).unwrap();
+        assert_eq!(contexts["root"][&1].len(), 3);
+        assert_eq!(loaded.settings.model.as_deref(), Some("test/model"));
+        assert_eq!(loaded.settings.effort.as_deref(), Some("high"));
+        assert!(fs::read(path).unwrap().ends_with(b"\n"));
+    }
+
+    #[test]
+    fn corrupt_complete_records_still_fail_to_load() {
+        for corrupt_middle in [false, true] {
+            let (_temp, store, mut journal) = fixture();
+            journal.append("root", user("one")).unwrap();
+            let path = context_path(&journal.dir, "root", 1);
+            let complete = fs::read(&path).unwrap();
+            append_raw(&path, b"not JSON\n");
+            if corrupt_middle {
+                append_raw(&path, &complete);
+            }
+            let original = fs::read(&path).unwrap();
+            let id = journal.header.id.clone();
+            journal.close().unwrap();
+
+            let error = Journal::load(&store, &id, false).err().unwrap();
+            assert!(error.message.contains("invalid event at"));
+            assert!(error.message.contains(":2;"));
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn valid_unterminated_final_record_is_preserved_on_append() {
+        let (_temp, _store, mut journal) = fixture();
+        // Exercise the backwards scan over more than one chunk, both with
+        // and without an earlier newline to find.
+        for text in ["a".repeat(20_000), "b".repeat(20_000)] {
+            let before = journal.append("root", user(&text)).unwrap();
+            let path = context_path(&journal.dir, "root", 1);
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+            let contexts = read_contexts(&journal.dir).unwrap();
+            assert_eq!(contexts["root"][&1].last().unwrap().id, before.id);
+            let after = journal.append("root", user("after")).unwrap();
+            let contexts = read_contexts(&journal.dir).unwrap();
+            let events = &contexts["root"][&1];
+            assert_eq!(events[events.len() - 2].id, before.id);
+            assert_eq!(events.last().unwrap().id, after.id);
+            assert!(fs::read(path).unwrap().ends_with(b"\n"));
+        }
+    }
+
+    #[test]
+    fn unsupported_version_in_an_unterminated_record_is_still_an_error() {
+        let (_temp, store, mut journal) = fixture();
+        let mut event = journal.append("root", user("one")).unwrap();
+        event.version = 2;
+        let path = context_path(&journal.dir, "root", 1);
+        fs::write(&path, serde_json::to_vec(&event).unwrap()).unwrap();
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+
+        let error = Journal::load(&store, &id, false).err().unwrap();
+        assert!(error.message.contains("unsupported session event version"));
+    }
+
+    #[test]
+    fn entirely_torn_context_can_be_appended_to() {
+        let (_temp, store, mut journal) = fixture();
+        journal.ensure_persisted().unwrap();
+        let path = context_path(&journal.dir, "root", 1);
+        append_raw(&path, b"{\"version\":1");
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+        let mut loaded = Journal::load(&store, &id, false).unwrap();
+        assert!(loaded.snapshot().unwrap().contexts["root"][&1].is_empty());
+        let appended = loaded.append("root", user("first complete")).unwrap();
+        let contexts = read_contexts(&loaded.dir).unwrap();
+        assert_eq!(contexts["root"][&1].len(), 1);
+        assert_eq!(contexts["root"][&1][0].id, appended.id);
+    }
+
+    #[test]
+    fn failed_append_restores_the_original_bytes_and_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("journal.jsonl");
+        let original = b"complete record\n";
+        fs::write(&path, original).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        for (written, message) in [
+            (b"partial".as_slice(), "injected write failure"),
+            (b"complete new record\n".as_slice(), "injected sync failure"),
+        ] {
+            let error = with_append_rollback(&mut file, |file| {
+                file.write_all(written)?;
+                Err(io::Error::other(message))
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert_eq!(file.metadata().unwrap().len(), original.len() as u64);
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        with_append_rollback(&mut file, |file| {
+            file.write_all(b"next\n")?;
+            file.sync_all()
+        })
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"complete record\nnext\n");
+    }
+
+    #[test]
+    fn session_directories_are_private_including_forks() {
+        let (_temp, store, mut journal) = fixture();
+        journal.append("root", user("one")).unwrap();
+        assert_eq!(
+            fs::metadata(&journal.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let fork = Journal::fork(&store, &journal.header.id, None).unwrap();
+        assert_eq!(
+            fs::metadata(&fork.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn stored_notice_bytes_are_preserved_during_replay() {
+        let (_temp, store, mut journal) = fixture();
+        let event = journal
+            .append(
+                "root",
+                HistoryEvent::SystemReminder {
+                    text: "current notice".into(),
+                },
+            )
+            .unwrap();
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+        let mut restored = Journal::load(&store, &id, false).unwrap();
+        let actual = restored.histories["root"]
+            .iter()
+            .find(|e| matches!(e, HistoryEvent::SystemReminder { .. }))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(event.event).unwrap()
+        );
+        restored.close().unwrap();
+    }
+
+    #[test]
+    fn current_launch_id_is_the_growth_notice_identity() {
+        let (_temp, _store, mut journal) = fixture();
+        let execution: AgentExecution = serde_json::from_value(serde_json::json!({
+            "launchId":"launch-1", "agentId":"child", "cwd":journal.header.cwd,
+            "title":"", "modelPolicy":[],
+            "remainingDepth":null, "task":"task", "originalTask":"task", "background":false
+        }))
+        .unwrap();
+        let agent = AgentRecord {
+            agent_id: "child".into(),
+            parent_id: Some("root".into()),
+            agent: "build".into(),
+            model: None,
+            status: "running".into(),
+            created_at: now(),
+            stable_prompt: String::new(),
+        };
+        let event = HistoryEvent::AgentStarted {
+            agent,
+            execution,
+            task_call_id: None,
+        };
+        journal.metadata("root", &event);
+        journal.metadata("root", &event);
+        assert_eq!(journal.launches_seen.len(), 1);
+        assert!(journal.launches_seen.contains("launch-1"));
+    }
 }

@@ -1,5 +1,7 @@
 //! Session-owned background jobs. Output is streamed to disk; status is canonical history.
 use crate::{Control, schema::*, sessions, tools::CommitBarrier};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -14,7 +16,9 @@ pub(crate) struct JobHandle {
     pub id: String,
     pub cancel: CancellationToken,
     pub barrier: Arc<CommitBarrier>,
-    output: Mutex<File>,
+    // Under this mutex, output is closed iff completed is true. Completion drops
+    // the synced file before publishing the flag, even when journaling fails.
+    output: Mutex<Option<File>>,
     pub(crate) completed: AtomicBool,
     done: tokio::sync::Notify,
     pub(crate) task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -35,6 +39,9 @@ impl JobHandle {
     }
     pub fn append(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut output = self.output.lock().unwrap();
+        let Some(output) = output.as_mut() else {
+            return Ok(());
+        };
         let offset = output.metadata()?.len();
         output.write_all(bytes)?;
         if let Some(tx) = &*self.terminal_tx.lock().unwrap() {
@@ -67,9 +74,11 @@ impl Control {
         } else {
             None
         };
-        let output = OpenOptions::new()
-            .create_new(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let output = options
             .open(
                 output_path
                     .clone()
@@ -97,7 +106,7 @@ impl Control {
             id: id.clone(),
             cancel,
             barrier,
-            output: Mutex::new(output),
+            output: Mutex::new(Some(output)),
             completed: AtomicBool::new(false),
             done: tokio::sync::Notify::new(),
             task: tokio::sync::Mutex::new(None),
@@ -154,6 +163,14 @@ impl Control {
             .get(id)
             .cloned()
             .ok_or_else(|| EngineError::bad("job not found"))?;
+        // Forks retain immutable envelopes, whose output path can name the source.
+        // Once that source is gone, use the fork's own copy of the artifact.
+        if let Some(path) = &row.output_path
+            && !path.exists()
+            && let Some(name) = path.file_name()
+        {
+            row.output_path = Some(j.dir.join("outputs").join(name));
+        }
         row.output_bytes = std::fs::metadata(
             row.output_path
                 .clone()
@@ -193,11 +210,10 @@ impl Control {
             }
         }
         let result = (|| {
-            if let Some(handle) = self.runtime.jobs.lock().unwrap().get(id) {
-                handle
-                    .output
-                    .lock()
-                    .unwrap()
+            if let Some(handle) = self.runtime.jobs.lock().unwrap().get(id)
+                && let Some(output) = handle.output.lock().unwrap().as_ref()
+            {
+                output
                     .sync_all()
                     .map_err(|e| EngineError::bad(e.to_string()))?;
             }
@@ -226,7 +242,11 @@ impl Control {
             Ok(())
         })();
         if let Some(handle) = self.runtime.jobs.lock().unwrap().get(id) {
-            handle.completed.store(true, Ordering::Release);
+            {
+                let mut output = handle.output.lock().unwrap();
+                drop(output.take());
+                handle.completed.store(true, Ordering::Release);
+            }
             handle.done.notify_waiters();
             handle.input_ready.notify_waiters();
         }
@@ -426,5 +446,175 @@ impl Control {
             }
         }
         self.read_job_input(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn completed_jobs_close_output_and_ignore_late_appends() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let session =
+            crate::Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        session
+            .control
+            .commit(
+                "root",
+                HistoryEvent::SystemReminder {
+                    text: "test".into(),
+                },
+            )
+            .unwrap();
+        for kind in ["bash", "task"] {
+            let handle = session
+                .control
+                .start_job(
+                    "root",
+                    kind,
+                    "test".into(),
+                    None,
+                    CancellationToken::new(),
+                    Arc::default(),
+                )
+                .unwrap();
+            handle.append(b"kept").unwrap();
+            let path = {
+                let j = session.control.journal.lock().unwrap();
+                j.jobs[&handle.id]
+                    .output_path
+                    .clone()
+                    .unwrap_or_else(|| j.dir.join("jobs").join(format!("{}.log", handle.id)))
+            };
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(handle.output.lock().unwrap().is_some());
+            assert!(!handle.completed.load(Ordering::Acquire));
+            session
+                .control
+                .finish_job(&handle.id, "done", "finished".into(), None)
+                .unwrap();
+            assert!(handle.completed.load(Ordering::Acquire));
+            assert!(handle.output.lock().unwrap().is_none());
+            handle.append(b"ignored").unwrap();
+            session
+                .control
+                .finish_job(&handle.id, "done", "again".into(), None)
+                .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"kept");
+        }
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_closes_output_even_if_journaling_fails() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let session =
+            crate::Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        session
+            .control
+            .journal
+            .lock()
+            .unwrap()
+            .ensure_persisted()
+            .unwrap();
+        let handle = session
+            .control
+            .start_job(
+                "root",
+                "bash",
+                "test".into(),
+                None,
+                CancellationToken::new(),
+                Arc::default(),
+            )
+            .unwrap();
+        handle.append(b"kept").unwrap();
+        session.control.journal.lock().unwrap().close().unwrap();
+        assert!(
+            session
+                .control
+                .finish_job(&handle.id, "done", "finished".into(), None)
+                .is_err()
+        );
+        assert!(handle.completed.load(Ordering::Acquire));
+        assert!(handle.output.lock().unwrap().is_none());
+        handle.append(b"ignored").unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_job_output_survives_source_session_deletion() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let source =
+            crate::Session::create(store.clone(), temp.path().to_owned(), Default::default())
+                .unwrap();
+        source
+            .control
+            .commit(
+                "root",
+                HistoryEvent::SystemReminder {
+                    text: "test".into(),
+                },
+            )
+            .unwrap();
+        let handle = source
+            .control
+            .start_job(
+                "root",
+                "bash",
+                "background".into(),
+                None,
+                CancellationToken::new(),
+                Arc::default(),
+            )
+            .unwrap();
+        handle.append(b"background output").unwrap();
+        source
+            .control
+            .finish_job(&handle.id, "done", "finished".into(), None)
+            .unwrap();
+        let mut spool = tempfile::tempfile().unwrap();
+        spool.write_all(b"foreground output").unwrap();
+        let foreground = source
+            .control
+            .store_bash_output("root", "foreground", "call-1", &mut spool, true)
+            .unwrap();
+        let (source_id, source_dir) = {
+            let j = source.control.journal.lock().unwrap();
+            (j.header.id.clone(), j.dir.clone())
+        };
+        let journal = sessions::Journal::fork(&store, &source_id, None).unwrap();
+        let fork_dir = journal.dir.clone();
+        let fork = crate::Session::from_journal(store, journal, None).unwrap();
+        source.shutdown().await.unwrap();
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        for (id, expected) in [
+            (&handle.id, "background output"),
+            (&foreground, "foreground output"),
+        ] {
+            let recorded = fork.control.journal.lock().unwrap().jobs[id]
+                .output_path
+                .clone()
+                .unwrap();
+            assert!(recorded.starts_with(&source_dir));
+            let job = fork.control.job_record(id).unwrap();
+            assert_eq!(job.output_bytes, expected.len() as u64);
+            assert_eq!(
+                job.output_path.unwrap(),
+                fork_dir.join("outputs").join(recorded.file_name().unwrap())
+            );
+            let output: serde_json::Value =
+                serde_json::from_str(&fork.control.jobs_output(id, 0, 8192).unwrap()).unwrap();
+            assert_eq!(output["output"], expected);
+            assert_eq!(output["totalBytes"], expected.len());
+        }
+        fork.shutdown().await.unwrap();
     }
 }

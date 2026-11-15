@@ -1,5 +1,5 @@
-//! An owned terminal screen for the right sidebar (D144 user terminals,
-//! D140 tty jobs). Bytes are parsed by `vt100` into this struct's grid and
+//! An owned terminal screen for the right sidebar (user terminals,
+//! tty jobs). Bytes are parsed by `vt100` into this struct's grid and
 //! painted as plain cells: no escape sequence ever reaches the host
 //! terminal, and title/clipboard/bell requests from the program are
 //! dropped (vt100's default callbacks do nothing). Private screens are

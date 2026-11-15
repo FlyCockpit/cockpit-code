@@ -19,26 +19,26 @@ pub enum ScrollId {
     /// Whatever overlay is open (picker, list, pager, dialog, cost).
     Overlay,
     Goals,
-    /// The queue box above the composer (D73).
+    /// The queue box above the composer.
     Queue,
     /// The slash command popup above the composer.
     Slash,
-    /// The `@` completion popup (D118).
+    /// The `@` completion popup.
     Mentions,
     /// A second scrollable pane of the open overlay (the `/diff` file list).
     OverlayList,
-    /// The sidebar terminal's scrollback (D144).
+    /// The sidebar terminal's scrollback.
     Terminal,
 }
 
-/// A queued message's action chip (D73).
+/// A queued message's action chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QAct {
     /// Its class buttons: set this class (interrupt is send now).
     Set(crate::engine::QueueClass),
     /// Keyboard `t`: next turn ↔ steer.
     Toggle,
-    /// Interrupt: stop the agent and send it now (D74).
+    /// Interrupt: stop the agent and send it now.
     SendNow,
     /// Back into the composer.
     Edit,
@@ -83,14 +83,14 @@ pub enum Target {
     QueueAct(u64, QAct),
     /// A URL in the transcript: open it.
     Url(String),
-    /// An `@` completion item (D118).
+    /// An `@` completion item.
     Mention(usize),
     /// A file location (`path`, 1-based line): open it in the pager (a
-    /// finding's `file:line`, D126).
+    /// finding's `file:line`).
     Open(String, Option<usize>),
-    /// An action chip of the agent strip for agent `.0` (D131).
+    /// An action chip of the agent strip for agent `.0`.
     StripAct(String, StripAct),
-    /// The terminal sidebar (D144, D140).
+    /// The terminal sidebar.
     Term(TermAct),
 }
 
@@ -118,7 +118,7 @@ pub enum TermAct {
     Edge,
 }
 
-/// The agent strip's actions on the viewed child (D131).
+/// The agent strip's actions on the viewed child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripAct {
     Ask,
@@ -143,9 +143,9 @@ pub enum StatusSeg {
     /// The git branch and dirty counts: opens `/diff`.
     Git,
     Pending,
-    /// Open D128 decisions: opens `/decisions`.
+    /// Open decisions: opens `/decisions`.
     Decisions,
-    /// Terminals (D144): shows or hides the sidebar.
+    /// Terminals: shows or hides the sidebar.
     Terminals,
 }
 
@@ -194,7 +194,7 @@ impl ScrollGeom {
 pub struct Hits {
     pub rects: Vec<(Rect, Target)>,
     pub scrolls: Vec<(ScrollId, ScrollGeom)>,
-    /// Areas the wheel scrolls (D130: the view under the pointer), topmost
+    /// Areas the wheel scrolls (the view under the pointer), topmost
     /// last. Only areas whose content can differ from their scrollbar's
     /// owner need one; everything else falls back to its pane's wheel.
     pub regions: Vec<(Rect, ScrollId)>,
@@ -288,7 +288,7 @@ pub fn scrollbar(
     hits.scrolls.push((id, geom));
 }
 
-/// How a hovered element is highlighted (D63, Cockpit's `chip_style`).
+/// How a hovered element is highlighted (Cockpit's `chip_style`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverKind {
     /// Buttons and chips: the wash, the accent foreground, bold.

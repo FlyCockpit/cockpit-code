@@ -117,16 +117,13 @@ fn instances() -> &'static Mutex<BTreeMap<PathBuf, Weak<Cache>>> {
     INSTANCES.get_or_init(Mutex::default)
 }
 fn fingerprint(provider: &Provider) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&(
-                provider.usage_argv(),
-                provider.connection_command().map(|c| &c.env)
-            ))
-            .unwrap_or_default()
-        )
-    )
+    crate::hex::hex(&Sha256::digest(
+        serde_json::to_vec(&(
+            provider.usage_argv(),
+            provider.connection_command().map(|c| &c.env),
+        ))
+        .unwrap_or_default(),
+    ))
 }
 impl Cache {
     /// Starts at frontend startup; all sessions in this process share the same cache.
@@ -329,9 +326,10 @@ impl Cache {
                     }
                     entry.clone()
                 };
-                let path = cache
-                    .cache_dir
-                    .join(format!("{:x}.json", Sha256::digest(id.as_bytes())));
+                let path = cache.cache_dir.join(format!(
+                    "{}.json",
+                    crate::hex::hex(&Sha256::digest(id.as_bytes()))
+                ));
                 let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                     std::fs::create_dir_all(path.parent().unwrap())?;
                     use std::io::Write;
@@ -544,7 +542,7 @@ async fn read_command(provider: &Provider) -> Result<Document, EngineError> {
     let mut child = command
         .spawn()
         .map_err(|_| EngineError::bad("could not spawn usage command"))?;
-    let _group = crate::model::command::ProcessGroup(child.id().unwrap());
+    let _group = crate::model::command::ProcessGroup::new(child.id().unwrap());
     let stdout = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {

@@ -67,10 +67,9 @@ pub struct PreparedRequest {
     pub capability_catalog: Option<Vec<ToolDefinition>>,
     pub session_id: String,
     /// Provider prompt-cache routing identity, independent of conversation identity.
-    #[serde(default)]
     pub cache_key: String,
-    /// Command conversation/replay identity. Empty only in legacy saved requests.
-    #[serde(default)]
+    /// Required command conversation/replay identity.
+    #[serde(deserialize_with = "nonempty_identity")]
     pub conversation_id: String,
     pub agent_id: String,
     pub kind: String,
@@ -83,6 +82,42 @@ pub struct PreparedRequest {
     #[serde(default)]
     pub assets_dir: Option<std::path::PathBuf>,
 }
+fn nonempty_identity<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let identity = String::deserialize(deserializer)?;
+    if identity.trim().is_empty() {
+        return Err(serde::de::Error::custom("conversation_id must be nonempty"));
+    }
+    Ok(identity)
+}
+
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+/// Stop polling as soon as the bounded prefix is full, even for an endless body.
+pub(crate) async fn error_body_prefix<B: AsRef<[u8]>, E>(
+    stream: impl futures_util::Stream<Item = std::result::Result<B, E>>,
+) -> std::result::Result<String, E> {
+    futures_util::pin_mut!(stream);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let chunk = chunk.as_ref();
+        let take = chunk.len().min(ERROR_BODY_LIMIT - bytes.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if bytes.len() == ERROR_BODY_LIMIT {
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut end = text.len().min(ERROR_BODY_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    Ok(text)
+}
+
 mod utf8_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -98,12 +133,10 @@ mod utf8_bytes {
 pub struct ChildRequest {
     #[serde(default)]
     pub provider_id: String,
-    #[serde(default)]
-    pub primary_config: Option<ModelConfig>,
+    pub primary_config: ModelConfig,
     #[serde(default)]
     pub primary_effort: Option<String>,
-    #[serde(default)]
-    pub primary_caching: Option<PromptCaching>,
+    pub primary_caching: PromptCaching,
     pub request: PreparedRequest,
     pub system: String,
     pub compacted_estimate: Option<u64>,
@@ -121,21 +154,11 @@ impl PreparedRequest {
             .as_deref()
             .unwrap_or(&self.offered_tools)
     }
-    /// Old saved requests used the session ID; retain that identity on replay.
     pub fn cache_identity(&self) -> &str {
-        if self.cache_key.is_empty() {
-            &self.session_id
-        } else {
-            &self.cache_key
-        }
+        &self.cache_key
     }
-    /// Legacy command requests used their stored cache identity for conversation state.
     pub fn conversation_identity(&self) -> &str {
-        if self.conversation_id.is_empty() {
-            self.cache_identity()
-        } else {
-            &self.conversation_id
-        }
+        &self.conversation_id
     }
     pub(crate) fn canonical_tool_name<'a>(&'a self, name: &'a str) -> &'a str {
         self.tool_aliases
@@ -235,34 +258,6 @@ impl PreparedRequest {
         next.input_estimate = count_request_tokens(&next.body);
         Ok(next)
     }
-    /// Utility calls may force one tool; author requests never use this transformation.
-    pub fn force_tool(&mut self, name: &str) -> Result<()> {
-        if !self.offered_tools.iter().any(|t| t.name == name) {
-            return Err(EngineError::bad("forced tool was not offered"));
-        }
-        let (old, new) = match self.wire {
-            ProviderType::Anthropic => (json!({"type":"auto"}), json!({"type":"tool","name":name})),
-            ProviderType::OpenaiChat => (
-                json!("auto"),
-                json!({"type":"function","function":{"name":name}}),
-            ),
-            _ => (json!("auto"), json!({"type":"function","name":name})),
-        };
-        let old = format!("\"tool_choice\":{old}");
-        let new = format!("\"tool_choice\":{new}");
-        let prefix = std::str::from_utf8(&self.prefix)
-            .map_err(|_| EngineError::bad("invalid request prefix"))?;
-        if !prefix.contains(&old) {
-            return Err(EngineError::bad("request tool choice is already forced"));
-        }
-        let prefix = prefix.replacen(&old, &new, 1).into_bytes();
-        let mut body = prefix.clone();
-        body.extend_from_slice(&self.body[self.prefix.len()..]);
-        self.prefix = prefix;
-        self.body = body;
-        self.input_estimate = count_request_tokens(&self.body);
-        Ok(())
-    }
     /// Disable tool choice for a final report while retaining tools[] byte-for-byte.
     /// Command providers are additionally enforced by the engine dispatcher.
     pub fn disable_tools(&mut self) -> Result<()> {
@@ -320,56 +315,6 @@ impl PreparedRequest {
     }
     pub fn shares_author_prefix(&self, branch: &Self) -> bool {
         branch.body.starts_with(self.author_prefix())
-    }
-    /// Append a volatile tail without reserializing any of the author's cached history.
-    /// Anthropic's existing cache breakpoint is retained as well as marking the new last block.
-    pub fn with_reminder_tail(&self, text: &str) -> Result<Self> {
-        if self.wire == ProviderType::Command {
-            return self.with_history_tail(&[HistoryEvent::SystemReminder {
-                text: crate::injection::notice(text),
-            }]);
-        }
-        let notice = crate::injection::notice(text);
-        let text = notice.as_str();
-        let mut block = json!({"type":"text","text":text});
-        if let Some(cache) = &self.cache {
-            block["cache_control"] = cache.clone();
-        }
-        let message = if self.wire == ProviderType::Anthropic {
-            json!({"role":"user","content":[block]})
-        } else {
-            json!({"role":"user","content":text})
-        };
-        let mut body = self.author_prefix().to_vec();
-        if self.history_items > 0 {
-            body.push(b',');
-        }
-        body.extend(
-            serde_json::to_vec(&message)
-                .map_err(|_| EngineError::bad("tail serialization failed"))?,
-        );
-        body.extend_from_slice(b"]}");
-        let input_estimate = count_request_tokens(&body);
-        Ok(Self {
-            tool_aliases: self.tool_aliases.clone(),
-            prefix: self.prefix.clone(),
-            body,
-            wire: self.wire,
-            cache: self.cache.clone(),
-            history_items: self.history_items + 1,
-            offered_tools: self.offered_tools.clone(),
-            capability_catalog: self.capability_catalog.clone(),
-            session_id: self.session_id.clone(),
-            cache_key: self.cache_key.clone(),
-            conversation_id: self.conversation_id.clone(),
-            agent_id: self.agent_id.clone(),
-            kind: self.kind.clone(),
-            input_estimate,
-            retry_limit: self.retry_limit,
-            fallback_ready: self.fallback_ready,
-            command_context: self.command_context.clone(),
-            assets_dir: self.assets_dir.clone(),
-        })
     }
 }
 impl Model {
@@ -460,11 +405,12 @@ impl Model {
                 _ => {}
             }
         }
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| EngineError::bad("could not create HTTP client"))?;
+        let client = crate::http_client(|| {
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(30))
+        })
+        .map_err(|_| EngineError::bad("could not create HTTP client"))?;
         Ok(Self {
             client,
             provider,
@@ -537,7 +483,7 @@ impl Model {
         // logical identity in PreparedRequest/command routing; hash long wire keys.
         let wire_cache_key = if session_id.len() > 64 {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(session_id.as_bytes()))
+            crate::hex::hex(&Sha256::digest(session_id.as_bytes()))
         } else {
             session_id.to_owned()
         };
@@ -758,7 +704,9 @@ impl Model {
                             } else {
                                 retry_limit
                             }
-                            || (e.kind == ErrorKind::Network && !request.fallback_ready)) =>
+                            || (e.kind == ErrorKind::Network
+                                && !request.fallback_ready
+                                && retry_limit > 0)) =>
                 {
                     let delay = e
                         .retry_after_secs
@@ -898,7 +846,7 @@ impl Model {
                 .get("retry-after")
                 .and_then(|h| h.to_str().ok())
                 .and_then(crate::retry::retry_after);
-            let body = tokio::select! { _ = cancel.cancelled() => return Err(EngineError::cancelled()), b = timeout_at(first_deadline,response.text()) => b.ok().and_then(|v|v.ok()).unwrap_or_default() };
+            let body = tokio::select! { _ = cancel.cancelled() => return Err(EngineError::cancelled()), b = timeout_at(first_deadline,error_body_prefix(response.bytes_stream())) => b.ok().and_then(|v|v.ok()).unwrap_or_default() };
             let mut err = classify(status, &body);
             err.retry_after_secs = after;
             return Err(err);
@@ -938,7 +886,7 @@ impl Model {
             }
             let value: Value = serde_json::from_slice(&body)
                 .map_err(|_| EngineError::bad("malformed provider JSON"))?;
-            if value.get("error").is_some() || value["type"] == "error" {
+            if is_provider_error(&value) {
                 return Err(classify(500, &value.to_string()));
             }
             state.observe_cost(locator, &value);
@@ -966,9 +914,12 @@ impl Model {
                 }
                 let value: Value = serde_json::from_str(&data)
                     .map_err(|_| EngineError::unavailable("malformed provider SSE data"))?;
-                if value.get("error").is_some() || value["type"] == "error" {
+                if is_provider_error(&value) {
                     let error = value.get("error").unwrap_or(&value);
-                    let status = error["code"].as_u64().unwrap_or(500) as u16;
+                    let status = error["code"]
+                        .as_u64()
+                        .and_then(|c| u16::try_from(c).ok())
+                        .unwrap_or(500);
                     return Err(classify(status, &error.to_string()));
                 }
                 state.observe_cost(locator, &value);
@@ -1000,6 +951,10 @@ impl Model {
         Ok(())
     }
 }
+fn is_provider_error(value: &Value) -> bool {
+    value.get("error").is_some_and(|error| !error.is_null()) || value["type"] == "error"
+}
+
 fn classify(status: u16, body: &str) -> EngineError {
     let lower = body.to_ascii_lowercase();
     let usage_limited = status == 402
@@ -1275,6 +1230,8 @@ struct State {
     refusal: bool,
     strip_leaks: bool,
     leaks: crate::text_recovery::LeakStripper,
+    /// Memory retained by command-provider reasoning `details`.
+    details_cost: u64,
 }
 impl State {
     fn text(&mut self, s: &str, tx: &EventSender) {
@@ -1380,7 +1337,15 @@ impl State {
                 self.done = true;
             }
             ProviderType::OpenaiChat => {
-                self.event(kind, &json!({"usage":v["usage"],"choices":[{"delta":v["choices"][0]["message"],"finish_reason":v["choices"][0]["finish_reason"]}]}),tx)?;
+                let mut message = v["choices"][0]["message"].clone();
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for (index, call) in calls.iter_mut().enumerate() {
+                        if let Some(call) = call.as_object_mut() {
+                            call.entry("index").or_insert_with(|| json!(index));
+                        }
+                    }
+                }
+                self.event(kind, &json!({"usage":v["usage"],"choices":[{"delta":message,"finish_reason":v["choices"][0]["finish_reason"]}]}),tx)?;
                 self.done = true;
             }
             _ => {
@@ -1962,8 +1927,218 @@ pub fn count_tokens(bytes: &[u8]) -> u64 {
 
 pub(crate) fn history_hash(history: &[HistoryEvent]) -> String {
     use sha2::{Digest, Sha256};
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(history).expect("history serialization"))
-    )
+    crate::hex::hex(&Sha256::digest(
+        serde_json::to_vec(history).expect("history serialization"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_tokens;
+    use futures_util::StreamExt;
+
+    #[test]
+    fn json_and_sse_error_predicates_accept_null_errors() {
+        use super::*;
+        let body: Value =
+            serde_json::from_str(r#"{"status":"completed","error":null,"output":[]}"#).unwrap();
+        assert!(!is_provider_error(&body));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State::default();
+        state
+            .body(ProviderType::OpenaiResponses, &body, &tx)
+            .unwrap();
+        assert!(state.done);
+
+        let mut parser = sse::Parser::default();
+        let frames = parser.push(b"data: {\"type\":\"response.completed\",\"error\":null,\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        let event: Value = serde_json::from_str(&frames[0]).unwrap();
+        assert!(!is_provider_error(&event));
+        let mut state = State::default();
+        state
+            .event(ProviderType::OpenaiResponses, &event, &tx)
+            .unwrap();
+        assert!(state.done);
+        for error in [
+            json!({"error":{"message":"failed"}}),
+            json!({"type":"error","error":null}),
+        ] {
+            assert!(is_provider_error(&error));
+        }
+    }
+
+    #[test]
+    fn chat_json_tool_calls_without_indices_remain_separate() {
+        use super::*;
+        let body = json!({"choices":[{"message":{"tool_calls":[
+            {"id":"first","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},
+            {"id":"second","type":"function","function":{"name":"write","arguments":"{\"path\":\"b\"}"}}
+        ]},"finish_reason":"tool_calls"}]});
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State::default();
+        state.body(ProviderType::OpenaiChat, &body, &tx).unwrap();
+        assert!(state.done);
+        assert_eq!(state.calls.len(), 2);
+        for (index, id, name, args) in [
+            (0, "first", "read", r#"{"path":"a"}"#),
+            (1, "second", "write", r#"{"path":"b"}"#),
+        ] {
+            let call = &state.calls[&index];
+            assert_eq!(
+                (call.id.as_str(), call.name.as_str(), call.args.as_str()),
+                (id, name, args)
+            );
+        }
+        assert!(
+            body["choices"][0]["message"]["tool_calls"][0]
+                .get("index")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn chat_json_preserves_existing_tool_call_indices() {
+        use super::*;
+        let body = json!({"choices":[{"message":{"tool_calls":[
+            {"index":4,"id":"first","function":{"name":"read","arguments":"{}"}},
+            {"index":7,"id":"second","function":{"name":"write","arguments":"{}"}}
+        ]},"finish_reason":"tool_calls"}]});
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State::default();
+        state.body(ProviderType::OpenaiChat, &body, &tx).unwrap();
+        assert_eq!(state.calls.keys().copied().collect::<Vec<_>>(), vec![4, 7]);
+    }
+
+    #[test]
+    fn cl100k_token_counts_keep_bundled_encoding_and_special_tokens() {
+        assert_eq!(count_tokens(b""), 0);
+        assert_eq!(count_tokens(b"hello world"), 2);
+        assert_eq!(count_tokens(b"<|endoftext|>"), 1);
+        assert_eq!(count_tokens(&[0xff]), count_tokens("�".as_bytes()));
+    }
+
+    #[test]
+    fn rustls_client_builds_https_json_and_query_requests() {
+        let client = crate::http_client(|| reqwest::Client::builder().no_proxy()).unwrap();
+        let request = client
+            .post("https://example.invalid/model")
+            .query(&[("q", "a & b")])
+            .json(&serde_json::json!({"stream": true}))
+            .build()
+            .unwrap();
+        assert_eq!(request.url().query(), Some("q=a+%26+b"));
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(
+            request.body().unwrap().as_bytes().unwrap(),
+            br#"{"stream":true}"#
+        );
+    }
+
+    pub(super) fn request_value() -> serde_json::Value {
+        serde_json::json!({"prefix":"{}", "body":"{}", "wire":"command", "cache":null,
+            "history_items":0, "offered_tools":[], "capability_catalog":[], "session_id":"session",
+            "cache_key":"family", "conversation_id":"session:root", "agent_id":"root", "kind":"agent",
+            "input_estimate":0, "retry_limit":0})
+    }
+
+    #[test]
+    fn child_checkpoints_require_primary_settings_and_preserve_active_settings() {
+        let value = serde_json::json!({
+            "providerId":"fallback", "primaryConfig":{"maxOutputTokens":100},
+            "primaryEffort":null, "primaryCaching":"off", "request":request_value(),
+            "system":"system", "compactedEstimate":null, "warnedContext":false,
+            "config":{"maxOutputTokens":200}, "effort":"high", "caching":"auto",
+            "historyLen":0, "historyHash":"hash", "context":1
+        });
+        let checkpoint: super::ChildRequest = serde_json::from_value(value).unwrap();
+        let saved = serde_json::to_value(checkpoint).unwrap();
+        assert_eq!(saved["primaryConfig"]["maxOutputTokens"], 100);
+        assert_eq!(saved["config"]["maxOutputTokens"], 200);
+        assert!(saved["primaryEffort"].is_null());
+        assert_eq!(saved["effort"], "high");
+        assert_eq!(saved["primaryCaching"], "off");
+        assert_eq!(saved["caching"], "auto");
+        let restored: super::ChildRequest = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), saved);
+        for field in ["primaryConfig", "primaryCaching"] {
+            let mut missing = saved.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<super::ChildRequest>(missing).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+            let mut null = saved.clone();
+            null[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<super::ChildRequest>(null).is_err());
+        }
+    }
+
+    #[test]
+    fn saved_requests_require_and_preserve_conversation_identity() {
+        let value = request_value();
+        let request: super::PreparedRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.cache_identity(), "family");
+        assert_eq!(request.conversation_identity(), "session:root");
+        let saved = serde_json::to_value(request).unwrap();
+        let replay: super::PreparedRequest = serde_json::from_value(saved).unwrap();
+        assert_eq!(replay.conversation_identity(), "session:root");
+        for identity in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  "),
+        ] {
+            let mut invalid = value.clone();
+            invalid["conversation_id"] = identity;
+            assert!(serde_json::from_value::<super::PreparedRequest>(invalid).is_err());
+        }
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("conversation_id");
+        assert!(serde_json::from_value::<super::PreparedRequest>(missing).is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_error_prefix_caps_chunks_and_stops_polling() {
+        let chunks = futures_util::stream::iter([
+            Ok::<_, ()>(vec![b'a'; super::ERROR_BODY_LIMIT - 1]),
+            Ok(vec![b'b'; 100]),
+        ])
+        .chain(futures_util::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<Vec<u8>, ()>>> {
+                panic!("stream polled after prefix was full")
+            },
+        ));
+        let body = super::error_body_prefix(chunks).await.unwrap();
+        assert_eq!(body.len(), super::ERROR_BODY_LIMIT);
+        assert!(body.ends_with('b'));
+    }
+
+    #[tokio::test]
+    async fn provider_error_prefix_preserves_small_utf8_and_empty_bodies() {
+        for text in ["", "provider error", "échec 🌍"] {
+            let stream = futures_util::stream::iter([Ok::<_, ()>(text.as_bytes())]);
+            assert_eq!(super::error_body_prefix(stream).await.unwrap(), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_prefix_handles_split_utf8_boundary() {
+        let prefix = "a".repeat(super::ERROR_BODY_LIMIT - 1);
+        let stream =
+            futures_util::stream::iter([Ok::<_, ()>(prefix.as_bytes()), Ok("🌍".as_bytes())]);
+        let body = super::error_body_prefix(stream).await.unwrap();
+        assert_eq!(body, prefix);
+        let invalid = futures_util::stream::iter([Ok::<_, ()>(vec![0xff])]);
+        assert_eq!(super::error_body_prefix(invalid).await.unwrap(), "�");
+    }
+
+    #[tokio::test]
+    async fn provider_error_prefix_reports_stream_errors() {
+        let stream = futures_util::stream::iter([Ok(b"partial".as_slice()), Err("read error")]);
+        assert_eq!(
+            super::error_body_prefix(stream).await.unwrap_err(),
+            "read error"
+        );
+    }
 }

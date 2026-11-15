@@ -70,14 +70,13 @@ impl Out {
         }
     }
 
-    fn write(&self, value: Value) {
+    fn write(&self, value: Value) -> Result<(), RpcError> {
         let text = value.to_string();
-        match prepare_outbound(&text) {
-            Ok(()) => {
-                let _ = self.tx.send(text);
-            }
-            Err(e) => eprintln!("acp: dropped outbound frame: {e}"),
-        }
+        prepare_outbound(&text).map_err(|e| {
+            eprintln!("acp: dropped outbound frame: {e}");
+            RpcError::internal(format!("invalid outbound frame: {e}"))
+        })?;
+        self.tx.send(text).map_err(|_| RpcError::closed())
     }
 
     /// Unchecked send; `run` uses an empty string as the writer's stop sentinel.
@@ -86,7 +85,7 @@ impl Out {
     }
 
     pub fn respond(&self, id: &Value, result: Value) {
-        self.write(json!({"jsonrpc": "2.0", "id": id, "result": result}));
+        let _ = self.write(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
 
     pub fn fail(&self, id: &Value, error: RpcError) {
@@ -94,7 +93,7 @@ impl Out {
         if let Some(data) = error.data {
             body["data"] = data;
         }
-        self.write(json!({"jsonrpc": "2.0", "id": id, "error": body}));
+        let _ = self.write(json!({"jsonrpc": "2.0", "id": id, "error": body}));
     }
 
     pub fn reply(&self, id: &Value, reply: Reply) {
@@ -105,7 +104,7 @@ impl Out {
     }
 
     pub fn notify(&self, method: &str, params: Value) {
-        self.write(json!({"jsonrpc": "2.0", "method": method, "params": params}));
+        let _ = self.write(json!({"jsonrpc": "2.0", "method": method, "params": params}));
     }
 
     /// One `session/update` notification.
@@ -120,19 +119,26 @@ impl Out {
 
     /// Send a request to the client and wait for its response.
     pub async fn request(&self, method: &str, params: Value) -> Reply {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(RpcError::closed());
-        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
+            // Registration and close's drain must share this lock, so a
+            // request can never slip into the registry after it was drained.
+            if self.closed.load(Ordering::Acquire) {
+                return Err(RpcError::closed());
+            }
             if pending.len() >= MAX_OUTBOUND {
                 return Err(RpcError::internal("outbound_request_capacity_exhausted"));
             }
             pending.insert(id, tx);
         }
-        self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        if let Err(error) =
+            self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+        {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(error);
+        }
         rx.await.unwrap_or_else(|_| Err(RpcError::closed()))
     }
 
@@ -157,8 +163,9 @@ impl Out {
 
     /// The peer is gone: fail every pending request and refuse new ones.
     pub fn close(&self) {
+        let mut pending = self.pending.lock().unwrap();
         self.closed.store(true, Ordering::Release);
-        for (_, tx) in self.pending.lock().unwrap().drain() {
+        for (_, tx) in pending.drain() {
             let _ = tx.send(Err(RpcError::closed()));
         }
     }
@@ -177,4 +184,90 @@ pub fn conforms<T: DeserializeOwned>(what: &str, value: &Value) {
 /// Decode request params with the pinned ACP schema type.
 pub fn decode<T: DeserializeOwned>(params: &Value) -> Result<T, RpcError> {
     serde_json::from_value(params.clone()).map_err(|e| RpcError::params(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+    use tokio::time::timeout;
+
+    const DEADLINE: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn failed_channel_write_removes_the_pending_request() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let out = Out::new(tx);
+        drop(rx);
+
+        let error = timeout(DEADLINE, out.request("test", Value::Null))
+            .await
+            .expect("failed write must not hang")
+            .unwrap_err();
+        assert_eq!(error.message, "ACP connection closed");
+        assert!(out.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_removes_the_pending_request() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = Out::new(tx);
+        let oversized = Value::String("x".repeat(crate::codec::MAX_FRAME_BYTES));
+
+        let error = timeout(DEADLINE, out.request("test", oversized))
+            .await
+            .expect("rejected frame must not hang")
+            .unwrap_err();
+        assert!(error.message.contains("invalid outbound frame"));
+        assert!(out.pending.lock().unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+        // A rejected request does not poison the connection.
+        let request = out.request("test", Value::Null);
+        let response = async {
+            let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            out.on_response(&json!({"id": frame["id"], "result": "ok"}));
+        };
+        let (reply, ()) = timeout(DEADLINE, async { tokio::join!(request, response) })
+            .await
+            .expect("next valid request must complete");
+        assert_eq!(reply.unwrap(), json!("ok"));
+        assert!(out.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_after_close_fails_promptly_without_sending() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = Out::new(tx);
+        out.close();
+
+        let error = timeout(DEADLINE, out.request("test", Value::Null))
+            .await
+            .expect("request after close must not hang")
+            .unwrap_err();
+        assert_eq!(error.message, "ACP connection closed");
+        assert!(out.pending.lock().unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn close_drains_requests_registered_before_it() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = Arc::new(Out::new(tx));
+        let requester = out.clone();
+        let request = tokio::spawn(async move { requester.request("test", Value::Null).await });
+        timeout(DEADLINE, rx.recv())
+            .await
+            .expect("request must be sent")
+            .unwrap();
+        assert_eq!(out.pending.lock().unwrap().len(), 1);
+
+        out.close();
+        let error = timeout(DEADLINE, request)
+            .await
+            .expect("close must release the waiter")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.message, "ACP connection closed");
+        assert!(out.pending.lock().unwrap().is_empty());
+    }
 }

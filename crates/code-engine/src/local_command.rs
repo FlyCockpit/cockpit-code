@@ -1,4 +1,4 @@
-//! D122 `!cmd`: the user ran a shell command locally in the frontend. The
+//! `!cmd`: the user ran a shell command locally in the frontend. The
 //! agent learns that it happened (command, exit code, duration, output
 //! size), never the output itself, at its next model request.
 use crate::{Session, schema::*};
@@ -25,7 +25,7 @@ pub(crate) fn notice_text(
 }
 
 impl Session {
-    /// D122: record that the user ran `command` locally for `agent` (the
+    /// Record that the user ran `command` locally for `agent` (the
     /// viewed agent). Durable: the notice survives resume and is delivered
     /// once before the agent's next model request. It never starts a turn
     /// and never carries the command's output.

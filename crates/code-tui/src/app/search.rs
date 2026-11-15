@@ -1,8 +1,8 @@
 //! Ctrl+F (Cmd+F where the terminal reports Super) transcript search: a
 //! find bar in place of the composer, matches highlighted in the visible
-//! rows, Enter/↑ to the older match, Shift+Enter/↓ to the newer one (D122:
-//! ↑/↓ always step; once Enter committed the query, k/j step too), Tab
-//! (or a click) keeps the position, Esc restores the view. Collapsed
+//! rows, Enter/↑ to the older match, Shift+Enter/↓ to the newer one.
+//! ↑/↓ always step; once Enter committed the query, k/j step too. Tab
+//! (or a click) keeps the position; Esc restores the view. Collapsed
 //! earlier contexts are searched too (a match expands its section), and
 //! stepping past the oldest match loads the next context still on disk.
 use super::App;
@@ -15,7 +15,7 @@ pub struct Search {
     /// (entry, row within the entry), oldest first.
     pub matches: Vec<(usize, usize)>,
     pub cur: Option<usize>,
-    /// Enter committed the query (D122): j/k step instead of typing.
+    /// Enter committed the query: j/k step instead of typing.
     pub committed: bool,
     /// The view to restore on Esc.
     saved_scroll: Option<usize>,

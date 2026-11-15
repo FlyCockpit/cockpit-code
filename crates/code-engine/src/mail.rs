@@ -55,7 +55,7 @@ impl Session {
         self.control.root_mail_pending()
     }
 
-    /// Whether a user cancel suspended automatic root mail turns (D134):
+    /// Whether a user cancel suspended automatic root mail turns:
     /// mail waits until the user sends the next message. Survives resume.
     pub fn root_mail_suspended(&self) -> bool {
         self.coordinator.lock().unwrap().mail_suspended

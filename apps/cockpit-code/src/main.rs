@@ -31,7 +31,11 @@ struct Args {
     /// Model to use, as provider/model (overrides the configured default).
     #[arg(long, global = true, value_name = "PROVIDER/MODEL")]
     model: Option<String>,
-    #[arg(long, global = true, help = "Use one-layer subagents; fixed after the first message")]
+    #[arg(
+        long,
+        global = true,
+        help = "Use one-layer subagents; fixed after the first message"
+    )]
     flat: bool,
     /// Reasoning effort level for the model.
     #[arg(long, global = true, value_name = "LEVEL")]
@@ -402,9 +406,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("Session: {}", session.id());
     let cancel_session = session.clone();
+    let signal_session_id = session.id();
     let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_session.cancel();
+        let mut interrupts = HeadlessInterrupts::default();
+        while tokio::signal::ctrl_c().await.is_ok() {
+            match interrupts.next() {
+                InterruptAction::Cancel => cancel_session.cancel(),
+                InterruptAction::Exit(code) => {
+                    eprintln!("{}", forced_exit_message(&signal_session_id));
+                    // exit() skips destructors, so kill tool, provider and terminal
+                    // process groups explicitly instead of leaving them running.
+                    code_engine::process_groups::kill_all();
+                    std::process::exit(code);
+                }
+            }
         }
     });
     let result = async {
@@ -452,7 +467,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
     }
     .await;
-    signal.abort();
     if args.json
         && result
             .as_ref()
@@ -465,10 +479,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({"type":"goal_result","contract":state.contract,"goal":state,"exitCode":1})
         );
     }
-    shutdown(&session, args.json).await?;
+    let shutdown_result = shutdown(&session, args.json).await;
+    signal.abort();
+    shutdown_result?;
     eprintln!("{}", session.totals().summary());
     result
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum InterruptAction {
+    Cancel,
+    Exit(i32),
+}
+
+#[derive(Default)]
+struct HeadlessInterrupts {
+    cancel_requested: bool,
+}
+
+impl HeadlessInterrupts {
+    fn next(&mut self) -> InterruptAction {
+        if std::mem::replace(&mut self.cancel_requested, true) {
+            InterruptAction::Exit(130)
+        } else {
+            InterruptAction::Cancel
+        }
+    }
+}
+
 fn settling_events(
     session: &Session,
     mut events: tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
@@ -652,6 +690,24 @@ async fn tty_question(
     }
     answer
 }
+/// Cancellation can retire a dialog while its blocking tty read is still open.
+fn resolve_tty_dialog(
+    result: Result<(), code_engine::schema::EngineError>,
+) -> Result<(), code_engine::schema::EngineError> {
+    match result {
+        Err(error)
+            if error.kind == code_engine::schema::ErrorKind::BadRequest
+                && matches!(
+                    error.message.as_str(),
+                    "approval is not pending" | "question set not found" | "question not found"
+                ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 async fn consume(
     session: &Session,
     mut events: tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
@@ -773,7 +829,7 @@ async fn consume(
                         feedback: "user unavailable: no controlling /dev/tty".into(),
                     },
                 };
-                session.respond_approval(&request.id, decision)?;
+                resolve_tty_dialog(session.respond_approval(&request.id, decision))?;
             }
             EngineEvent::ProposalRequest { agent_id, proposal } => {
                 session.resolve_proposal(&agent_id,&proposal.id,"reject",Some("Headless owner unavailable; preserve the approved criterion or raise a roadblock.".into()))?;
@@ -782,24 +838,12 @@ async fn consume(
                 if question.recipient.is_none()
                     && session.question_answer(&question.id).is_none() =>
             {
-                if question.questions.is_empty() {
-                    let answer = tty_line(format!(
-                        "\n{} asks: {}\nAnswer: ",
-                        question.breadcrumb, question.text
-                    ))
-                    .await
-                    .unwrap_or_else(|| "user unavailable".into());
-                    if session.question_answer(&question.id).is_none() {
-                        session.answer(&question.id, answer)?;
-                    }
-                } else {
-                    let mut answers = Vec::new();
-                    for spec in &question.questions {
-                        answers.push(tty_question(spec).await);
-                    }
-                    if session.question_answer(&question.id).is_none() {
-                        session.answer_questions(&question.id, answers)?;
-                    }
+                let mut answers = Vec::new();
+                for spec in &question.questions {
+                    answers.push(tty_question(spec).await);
+                }
+                if session.question_answer(&question.id).is_none() {
+                    resolve_tty_dialog(session.answer_questions(&question.id, answers))?;
                 }
             }
             EngineEvent::Pruned { report } if !json => eprintln!(
@@ -990,7 +1034,7 @@ async fn provider_test(
         }
     }
 }
-/// First run: install the bundled config skill into `~/.agents/skills/` (§3).
+/// First run: install the bundled config skill into `~/.agents/skills/`.
 /// Failures are reported but never block startup.
 fn install_bundled_skills() {
     let (Some(home), Ok(dirs)) = (std::env::var_os("HOME"), Directories::resolve()) else {
@@ -1019,3 +1063,61 @@ impl std::fmt::Display for GoalExit {
     }
 }
 impl std::error::Error for GoalExit {}
+
+fn forced_exit_message(session_id: &str) -> String {
+    format!("cockpit-code: forced exit; resume with --resume {session_id} --claim-lock")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forced_exit_explains_how_to_claim_the_session_lock() {
+        assert_eq!(
+            super::forced_exit_message("session-id"),
+            "cockpit-code: forced exit; resume with --resume session-id --claim-lock"
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn late_tty_answers_to_retired_dialogs_are_non_fatal() {
+        use code_engine::schema::EngineError;
+        assert!(resolve_tty_dialog(Ok(())).is_ok());
+        for message in [
+            "approval is not pending",
+            "question set not found",
+            "question not found",
+        ] {
+            assert!(resolve_tty_dialog(Err(EngineError::bad(message))).is_ok());
+        }
+    }
+
+    #[test]
+    fn tty_answers_preserve_other_errors() {
+        use code_engine::schema::EngineError;
+        for error in [
+            EngineError::bad("answer does not match question q1"),
+            EngineError::bad("approval caller ended"),
+            EngineError::unavailable("question set not found"),
+        ] {
+            let actual = resolve_tty_dialog(Err(error.clone())).unwrap_err();
+            assert_eq!(actual.kind, error.kind);
+            assert_eq!(actual.message, error.message);
+        }
+    }
+
+    #[test]
+    fn first_headless_interrupt_requests_graceful_cancellation() {
+        let mut interrupts = HeadlessInterrupts::default();
+        assert_eq!(interrupts.next(), InterruptAction::Cancel);
+    }
+
+    #[test]
+    fn second_and_later_headless_interrupts_force_exit_130() {
+        let mut interrupts = HeadlessInterrupts::default();
+        assert_eq!(interrupts.next(), InterruptAction::Cancel);
+        assert_eq!(interrupts.next(), InterruptAction::Exit(130));
+        assert_eq!(interrupts.next(), InterruptAction::Exit(130));
+    }
+}

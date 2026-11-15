@@ -6,6 +6,9 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 impl Control {
     pub(crate) fn retain_text(&self, call_id: &str, text: &str) -> Result<String, EngineError> {
         if text.len() <= 8192 {
@@ -42,10 +45,11 @@ impl Control {
                 })
                 .collect::<String>();
             let path = dir.join(format!("{name}.txt"));
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&path)?;
             source.seek(SeekFrom::Start(0))?;
             std::io::copy(source, &mut file)?;
             file.flush()?;
@@ -87,4 +91,36 @@ pub(crate) fn preview(path: &std::path::Path) -> std::io::Result<String> {
         String::from_utf8_lossy(&tail),
         path.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn retained_output_is_private_and_never_overwrites_an_existing_file() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let session =
+            crate::Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        session
+            .control
+            .journal
+            .lock()
+            .unwrap()
+            .ensure_persisted()
+            .unwrap();
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"private output").unwrap();
+        let path = session.control.save_output("call-1", &mut source).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(session.control.save_output("call-1", &mut source).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"private output");
+        session.shutdown().await.unwrap();
+    }
 }

@@ -117,7 +117,7 @@ fn reconnect_text(attempt: usize, delay_ms: u64) -> String {
     )
 }
 
-/// A reply that stopped early (engine-n): an output limit or a provider
+/// A reply that stopped early: an output limit or a provider
 /// pause keeps the text and continues; anything else was discarded.
 fn partial_text(status: &str, text: &str) -> String {
     let words = text.split_whitespace().count();
@@ -132,7 +132,7 @@ fn partial_text(status: &str, text: &str) -> String {
     }
 }
 
-/// A D119 backup switch, live and replayed.
+/// A backup switch, live and replayed.
 fn switch_text(from: &str, to: &str, reason: &str) -> String {
     let reason = reason.lines().next().unwrap_or_default();
     format!(
@@ -204,27 +204,27 @@ enum DialogPurpose {
     Approval(String),
     /// Switch sessions although work is running; text to refill the composer.
     Switch(EngineTarget, String, Option<String>),
-    /// Cache-aware model switch confirmation (D49): the new model.
+    /// Cache-aware model switch confirmation: the new model.
     ModelSwitch(String),
-    /// `/exclusive` step 1 (D67): use a safety model? (the model)
+    /// `/exclusive` step 1: use a safety model? (the model)
     ExclusiveSafety(String),
     /// `/exclusive` step 2: also block web tools and remote MCP servers?
     ExclusiveBlock(String, Option<String>),
-    /// The `/goal` draft approval (D93).
+    /// The `/goal` draft approval.
     GoalDraft,
-    /// A criteria proposal: (agent, proposal id) (D89).
+    /// A criteria proposal: (agent, proposal id).
     Proposal(String, String),
-    /// A root roadblock: its id (D91).
+    /// A root roadblock: its id.
     Roadblock(String),
     /// The `/goal` status dialog.
     GoalStatus,
-    /// Trust project reviewer guidance (D107): its request id.
+    /// Trust project reviewer guidance: its request id.
     Guidance(String),
     GoalClear,
     /// `/resume`: rename or delete that session (its id).
     RenameSession(String),
     DeleteSession(String),
-    /// A D120 scope request root owns: its id.
+    /// A scope request root owns: its id.
     Scope(String),
     /// `/prune` confirmation.
     Prune,
@@ -232,7 +232,7 @@ enum DialogPurpose {
     Viewer,
     /// A dialog opened from a panel (`/agents`, `/decisions`, `/subagents`).
     Panel(panels::PanelDialog),
-    /// Close a private terminal with an optional note (D144): its id.
+    /// Close a private terminal with an optional note: its id.
     TerminalClose(String),
 }
 
@@ -254,17 +254,17 @@ enum Overlay {
     Cost(CostView),
     Usage(UsageView),
     Menu(Box<Menu>),
-    /// One or several `question` calls (D62, D64).
+    /// One or several `question` calls.
     Questions(Box<QDialog>),
-    /// "Chat about this in a fork" (D64).
+    /// "Chat about this in a fork".
     ForkChat(Box<ForkChat>),
-    /// `/criteria` (D110).
+    /// `/criteria`.
     Criteria(Box<crate::criteria::CriteriaView>),
-    /// The contract editor (D93).
+    /// The contract editor.
     Contract(Box<crate::criteria::ContractEditor>, EditPurpose),
-    /// `/agents` (D131).
+    /// `/agents`.
     Agents(Box<crate::agentsview::AgentsView>),
-    /// `/decisions` (D128).
+    /// `/decisions`.
     Decisions(Box<crate::decisionsview::DecisionsView>),
 }
 
@@ -274,9 +274,9 @@ enum Prompt {
     Question(QuestionView, bool),
     /// A goal draft, proposal or roadblock, and whether it was put off.
     Goal(GoalPrompt, bool),
-    /// Project reviewer guidance to trust (D107), and whether put off.
+    /// Project reviewer guidance to trust, and whether put off.
     Guidance(crate::engine::GuidanceView, bool),
-    /// A D120 scope request root owns, and whether put off.
+    /// A scope request root owns, and whether put off.
     Scope(crate::engine::ScopeView, bool),
 }
 
@@ -286,11 +286,11 @@ pub struct App {
         std::sync::mpsc::Sender<String>,
         std::sync::mpsc::Receiver<String>,
     ),
-    /// D119: the backup model serving this turn, if one took over.
+    /// The backup model serving this turn, if one took over.
     backup_model: Option<String>,
     /// The `/resume` filter, kept across its rename/delete dialogs.
     resume_filter: String,
-    /// The `@` completion popup (D118).
+    /// The `@` completion popup.
     mentions: mention::Mentions,
     /// The Ctrl+F find bar, while open.
     search: Option<search::Search>,
@@ -310,7 +310,7 @@ pub struct App {
     phase: Phase,
     turn_started: Instant,
     user_cancelled: bool,
-    // ---- queue box (D73) ----
+    // ---- queue box ----
     /// The queued message with keyboard focus.
     queue_focus: Option<u64>,
     queue_scroll: usize,
@@ -330,11 +330,11 @@ pub struct App {
     goal: Option<GoalView>,
     /// A goal action waiting for root to be idle.
     deferred_goal: Option<GoalAction>,
-    /// An older context being read for scroll-back (D103): agent, number.
+    /// An older context being read for scroll-back: agent, number.
     older_job: Option<(String, u32, std::sync::mpsc::Receiver<Vec<ReplayItem>>)>,
-    /// Skills invocable as slash commands (D109), read at open and turn end.
+    /// Skills invocable as slash commands, read at open and turn end.
     skills: Vec<crate::engine::SkillView>,
-    /// The last keystroke (typing restarts the D100 idle timer).
+    /// The last keystroke (typing restarts the idle timer).
     last_key: Instant,
     /// The goal state last announced in the transcript.
     goal_announced: Option<String>,
@@ -347,11 +347,11 @@ pub struct App {
     /// The overlay a pager was opened from (a finding location in
     /// `/criteria`, an output in `/agents`); Esc returns to it.
     overlay_back: Option<Overlay>,
-    /// A fork chat set aside while its own web-tool approval is shown (D64);
+    /// A fork chat set aside while its own web-tool approval is shown;
     /// it comes back when no fork-chat approval is left.
     parked_fork: Option<Box<ForkChat>>,
     slash_sel: usize,
-    /// The wheel's top row of the slash / `@` popups (D130); None follows
+    /// The wheel's top row of the slash / `@` popups; None follows
     /// the selection. Any key resets them.
     slash_top: Option<usize>,
     mention_top: Option<usize>,
@@ -368,7 +368,7 @@ pub struct App {
     /// The subagent whose transcript is open; None is root.
     view: Option<String>,
     wide: bool,
-    // ---- pointer, hover, selection (tui-v4) ----
+    // ---- pointer, hover, selection ----
     hits: Hits,
     mouse_pos: Option<(u16, u16)>,
     hover: Option<(Rect, Target)>,
@@ -388,7 +388,7 @@ pub struct App {
     sticky: Option<usize>,
     /// (view, transcript generation) the selection and focus belong to.
     sel_owner: (Option<String>, u64),
-    // ---- agent strip (D50) ----
+    // ---- agent strip ----
     strip_focus: bool,
     strip_sel: usize,
     strip_scroll: usize,
@@ -399,47 +399,44 @@ pub struct App {
     comp_area: Rect,
     comp_skip: usize,
     // ---- model switch, context ----
-    /// Compact with the current model, then switch to this one (D49).
+    /// Compact with the current model, then switch to this one.
     pending_switch: Option<String>,
-    /// The context meter is an estimate (resume without usage, D48).
+    /// The context meter is an estimate (resume without usage).
     ctx_estimate: bool,
     /// The provider reports no context (meter source `unknown`): `ctx ?`.
     ctx_unknown: bool,
-    // ---- tui-v5 ----
     /// A pending `$EDITOR` run, serviced by the event loop.
     pub editor: Option<EditorReq>,
     /// Composer chip rects from the last draw: (rect, block index).
     chip_rects: Vec<(Rect, usize)>,
-    /// The session title (auto or `/rename`, D55).
+    /// The session title (auto or `/rename`).
     title: Option<String>,
-    /// The model picker is choosing for `/exclusive` (D67): None the
+    /// The model picker is choosing for `/exclusive`: None the
     /// exclusive model, Some(model) its safety model.
     exclusive_pick: Option<Option<String>>,
-    /// The startup MCP health check runs until this instant (D69).
+    /// The startup MCP health check runs until this instant.
     mcp_check_until: Option<Instant>,
     /// Servers the health check reported (shown once; marked in /mcp).
     pub(super) mcp_problems: BTreeMap<String, String>,
-    // ---- tui-v9: usage, quota ----
-    /// The latest live quota report per provider (m7 `UsageRecord.quota`).
+    // ---- usage, quota ----
+    /// The latest live quota report per provider (`UsageRecord.quota`).
     quotas: BTreeMap<String, crate::usage::Limit>,
-    /// The latest background usage read (D85).
+    /// The latest background usage read.
     usage: Vec<crate::usage::ProviderUsage>,
-    // ---- tui-v13 ----
-    /// Live `agents finalize` progress (D132).
+    /// Live `agents finalize` progress.
     finalizing: Vec<tree_rows::Finalizing>,
-    /// Mail that arrived while root was idle: why its next turn started (D134).
+    /// Mail that arrived while root was idle: why its next turn started.
     wake_reasons: Vec<String>,
-    /// Open D128 decisions (status bar).
+    /// Open decisions (status bar).
     decision_count: usize,
-    /// Root mail held by a user cancel (D134).
+    /// Root mail held by a user cancel.
     mail_held: bool,
     /// Finished `agents ask` / `stop` calls.
     agent_done: (
         std::sync::mpsc::Sender<crate::engine::AgentDone>,
         std::sync::mpsc::Receiver<crate::engine::AgentDone>,
     ),
-    // ---- tui-v14 ----
-    /// The terminal sidebar (D144, D140).
+    /// The terminal sidebar.
     terms: Terms,
 }
 
@@ -478,7 +475,7 @@ fn mode_color(mode: Mode) -> Color {
 }
 
 fn short(id: &str) -> &str {
-    &id[..id.len().min(8)]
+    &id[..id.char_indices().nth(8).map_or(id.len(), |(at, _)| at)]
 }
 
 impl App {
@@ -598,12 +595,12 @@ impl App {
         if let Some(id) = deferred {
             app.activate_model(id);
         }
-        // The engine's usage cache started with the process (D85).
+        // The engine's usage cache started with the process.
         app.usage = app.engine.provider_usage();
         app
     }
 
-    /// D107: show the project's reviewer guidance and ask for trust.
+    /// Show the project's reviewer guidance and ask for trust.
     fn guidance_dialog(&mut self, g: &crate::engine::GuidanceView) {
         let rel = g
             .path
@@ -613,7 +610,7 @@ impl App {
             .to_string();
         let sha = &g.sha256[..g.sha256.len().min(12)];
         let (title, md, trust, trust_why, decline_why) = if g.tampered {
-            // D115: the file already holds the restored, approved bytes; the
+            // The file already holds the restored, approved bytes; the
             // proposal is quarantined until the user approves it.
             let restored = std::fs::read_to_string(&g.path).unwrap_or_default();
             let change = if g.deleted {
@@ -621,7 +618,9 @@ impl App {
                     "An agent **deleted** `{rel}` without your approval. The approved file was restored.\n\nApprove the deletion?"
                 )
             } else {
-                let diff = similar::TextDiff::from_lines(&restored, &g.content)
+                let diff = similar::TextDiff::configure()
+                    .algorithm(similar::Algorithm::RawMyers)
+                    .diff_lines(&restored, &g.content)
                     .unified_diff()
                     .context_radius(3)
                     .header(&format!("approved/{rel}"), &format!("proposed/{rel}"))
@@ -647,7 +646,7 @@ impl App {
                 "keep the restored content",
             )
         } else if g.library {
-            // D121: a project guidance library file, not reviewer guidance.
+            // A project guidance library file, not reviewer guidance.
             (
                 "Trust project guidance library?",
                 format!(
@@ -729,7 +728,7 @@ impl App {
         }
     }
 
-    /// D103: near the top of a transcript with contexts still on disk, read
+    /// Near the top of a transcript with contexts still on disk, read
     /// the next older one in the background; insert it when it arrives,
     /// keeping the rows on screen where they are.
     fn poll_older(&mut self) -> bool {
@@ -772,7 +771,7 @@ impl App {
         false
     }
 
-    /// D100: tell the engine whether the frontend is idle; it compacts root
+    /// Tell the engine whether the frontend is idle; it compacts root
     /// once per idle period when the model enables `autocompactAtIdle`.
     fn idle_tick(&mut self) {
         if self.read_only.is_some() || self.running || self.compacting {
@@ -908,7 +907,7 @@ impl App {
         if self.poll_agent_done() {
             changed = true;
         }
-        // Live `/agents` rows; the decision count and held root mail (D134).
+        // Live `/agents` rows; the decision count and held root mail.
         if self.tick.is_multiple_of(10) {
             if matches!(self.overlay, Overlay::Agents(_)) {
                 self.refresh_panels();
@@ -1050,6 +1049,7 @@ impl App {
     /// Reset the UI for the engine's (new) session and replay its transcript.
     fn load_session(&mut self, events: EventRx, how: &str) {
         self.events = Some(events);
+        self.shells.clear();
         self.terms_reset();
         self.running = false;
         self.compacting = false;
@@ -1106,7 +1106,7 @@ impl App {
         }
         let resumed = !replay.current.is_empty() || earlier > 0;
         fill(&mut self.transcript, replay.current, &self.tree, "root");
-        // Show the context meter at once (D48), before the first send.
+        // Show the context meter at once, before the first send.
         let rc = self.engine.resume_context();
         self.ctx = (rc.used, rc.window);
         self.ctx_estimate = rc.estimate;
@@ -1119,7 +1119,7 @@ impl App {
         for q in self.engine.pending_questions() {
             self.prompts.push_back(Prompt::Question(q, false));
         }
-        // Goal dialogs waiting from before (D93): draft, proposals, roadblock.
+        // Goal dialogs waiting from before: draft, proposals, roadblock.
         for ev in self.engine.goal_requests() {
             if let Some(p) = goal_prompt(ev) {
                 self.prompts.push_back(Prompt::Goal(p, false));
@@ -1128,7 +1128,7 @@ impl App {
         for g in self.engine.pending_guidance() {
             self.prompts.push_front(Prompt::Guidance(g, false));
         }
-        // D120: pending scope requests come back as rows and, for root's,
+        // Pending scope requests come back as rows and, for root's,
         // the owner dialog.
         for v in self.engine.pending_scopes() {
             self.on_scope(v);
@@ -1477,16 +1477,17 @@ impl App {
             return;
         }
         // Never pop a dialog over a terminal being typed in: keys meant
-        // for it (a password) must not land in a dialog field (D144). The
+        // for it (a password) must not land in a dialog field. The
         // prompt waits (status line) until ctrl+] leaves the terminal.
         if self.term_typing() {
             return;
         }
         if self.parked_fork.is_some()
-            && !self
-                .prompts
-                .iter()
-                .any(|p| matches!(p, Prompt::Approval(a) if fork_approval(a)))
+            && !self.prompts.iter().any(|p| match p {
+                Prompt::Approval(a) => fork_approval(a),
+                Prompt::Question(q, false) => q.blocking,
+                _ => false,
+            })
         {
             self.overlay = Overlay::ForkChat(self.parked_fork.take().unwrap());
             return;
@@ -1578,7 +1579,7 @@ impl App {
             Prompt::Question(q, _) => {
                 let first = q.clone();
                 // Several open questions: one dialog over all of them, grouped
-                // by asker (D64); any subset can be answered at once.
+                // by asker; any subset can be answered at once.
                 let mut open: Vec<QuestionView> = self
                     .prompts
                     .iter()
@@ -1788,7 +1789,6 @@ impl App {
             UiEvent::Interrupted => self.transcript.interrupted(),
             UiEvent::QueueChanged => self.queue_changed(),
             UiEvent::UserRecorded(text) => self.composer.remember(text),
-            UiEvent::Todo(items) => self.transcript.todo(items),
             UiEvent::Usage(u) => self.record_usage(u),
             UiEvent::Retry {
                 attempt,
@@ -1890,12 +1890,14 @@ impl App {
                     .any(|p| matches!(p, Prompt::Question(x, _) if x.id == q.id));
                 if !known {
                     if q.blocking {
-                        // A blocked asker opens its dialog at once (D51).
+                        // A blocked asker opens its dialog at once.
                         if !matches!(
                             &self.overlay,
                             Overlay::Dialog(_, DialogPurpose::Approval(_)) | Overlay::Questions(_)
-                        ) {
-                            self.overlay = Overlay::None;
+                        ) && let Overlay::ForkChat(c) =
+                            std::mem::replace(&mut self.overlay, Overlay::None)
+                        {
+                            self.parked_fork = Some(c);
                         }
                         self.prompts.push_front(Prompt::Question(q, false));
                     } else {
@@ -2035,8 +2037,7 @@ impl App {
                 );
             }
             UiEvent::Partial { status, text } => {
-                let t = partial_text(&status, &text);
-                self.transcript.notice(Level::Warn, t);
+                self.transcript.partial(partial_text(&status, &text));
             }
             UiEvent::SettingsChanged => {}
             UiEvent::TitleChanged { title, auto } => {
@@ -2114,7 +2115,7 @@ impl App {
                         .unwrap_or_else(|| format!("{} job", job.kind));
                     self.wake_reasons.push(format!("{who} {}", job.status));
                 }
-                // A foreground child moved to the background (D72/D74) gets
+                // A foreground child moved to the background gets
                 // its badge from the running task job; not a second start.
                 if !terminal
                     && job.kind == "task"
@@ -2176,7 +2177,7 @@ impl App {
     fn agent_status(&mut self, id: &str, status: &str) {
         if id == "root" {
             // A turn the engine started by itself: queued next-turn input
-            // after a turn ended (D73) or a question answer (D62, D64).
+            // after a turn ended or a question answer.
             let starting = status == "running" || status.starts_with("queued");
             if starting && !self.running && !self.compacting && self.read_only.is_none() {
                 self.wake_header();
@@ -2268,7 +2269,6 @@ impl App {
                 reason,
             } => tr.moved_to_background(&call_id, &job, &reason),
             UiEvent::Interrupted => tr.interrupted(),
-            UiEvent::Todo(items) => tr.todo(items),
             UiEvent::Retry {
                 attempt,
                 delay_ms,
@@ -2308,9 +2308,7 @@ impl App {
                 }
             }
             UiEvent::TurnEnd { .. } => tr.seal(),
-            UiEvent::Partial { status, text } => {
-                tr.notice(Level::Warn, partial_text(&status, &text))
-            }
+            UiEvent::Partial { status, text } => tr.partial(partial_text(&status, &text)),
             // The summary closes the old context and heads the new one; show it once.
             UiEvent::Compacted(summary)
                 if !tr
@@ -2458,7 +2456,7 @@ impl App {
     }
 
     fn send(&mut self, text: String) {
-        // Mail rides along with the user's message (D134).
+        // Mail rides along with the user's message.
         self.wake_reasons.clear();
         self.mail_held = false;
         self.transcript.push(Kind::User(text.clone()));
@@ -2509,7 +2507,7 @@ impl App {
             }
         }
         // A session that froze the private terminal tool cannot become
-        // unattended (D61, D144): the cycle passes over it, with a hint.
+        // unattended: the cycle passes over it, with a hint.
         if next == Mode::Unattended
             && let Err(e) = self.engine.set_mode(next)
         {
@@ -2520,7 +2518,7 @@ impl App {
         self.set_mode(next);
     }
 
-    // ---- /exclusive (D67) ------------------------------------------------
+    // ---- /exclusive ------------------------------------------------
 
     fn exclusive_command(&mut self, arg: &str) {
         if arg == "off" {
@@ -2673,6 +2671,12 @@ impl App {
             }
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if let Some(search) = &mut self.search {
+                    search.query.push_str(&text.replace('\n', " "));
+                    search.committed = false;
+                    self.search_run(true);
+                    return;
+                }
                 if matches!(self.overlay, Overlay::None) && self.term_paste(&text) {
                     self.next_prompt();
                     return;
@@ -2685,8 +2689,8 @@ impl App {
                     }
                     Overlay::ForkChat(c) => c.input.insert(&text),
                     Overlay::Contract(ed, _) => ed.paste(&text),
+                    Overlay::Questions(d) => d.paste(&text),
                     Overlay::Criteria(_)
-                    | Overlay::Questions(_)
                     | Overlay::Picker(_)
                     | Overlay::List(..)
                     | Overlay::Pager(_)
@@ -2697,9 +2701,12 @@ impl App {
                     | Overlay::Decisions(_)
                     | Overlay::Menu(_) => {}
                     Overlay::None => {
+                        if let Some(vim) = &mut self.composer.vim {
+                            vim.before_paste();
+                        }
                         // Pasted image paths (a drag-and-drop) and an empty
                         // paste with an image on the clipboard become
-                        // attachment chips (D79).
+                        // attachment chips.
                         if text.trim().is_empty() {
                             self.paste_clipboard_image(true);
                         } else if let Some(paths) =
@@ -2708,7 +2715,7 @@ impl App {
                             for p in paths {
                                 self.attach_path(&p);
                             }
-                        // Large pastes become one atomic chip (D53).
+                        // Large pastes become one atomic chip.
                         } else if crate::paste::should_collapse(
                             &text,
                             self.catalog.paste_collapse_lines,
@@ -2836,7 +2843,7 @@ impl App {
                     self.kill_agent(&id);
                 }
             }
-            // D131: ask status, stop the branch, finalize the selected child.
+            // Ask status, stop the branch, finalize the selected child.
             KeyCode::Char(c @ ('a' | 's' | 'f')) => {
                 let id = match items.get(self.strip_sel) {
                     Some(view::StripItem::Child(id)) => Some(id.clone()),
@@ -3028,7 +3035,7 @@ impl App {
     }
 
     /// Slash-menu entries for the composer's `/word`: built-ins first, then
-    /// skills (D109). A skill named like a built-in is offered as
+    /// skills. A skill named like a built-in is offered as
     /// `/skill:<name>`; project skills that override global ones say so.
     fn slash_matches(&self) -> Vec<(String, String)> {
         let text = self.composer.text();
@@ -3227,7 +3234,7 @@ impl App {
             }
             Overlay::None => {}
         }
-        // The terminal sidebar: typing, panel keys, ctrl+] (D144).
+        // The terminal sidebar: typing, panel keys, ctrl+].
         if self.term_key(key) {
             return;
         }
@@ -3557,11 +3564,11 @@ impl App {
         if ctrl && key.code == KeyCode::Char('g') {
             return self.edit_composer();
         }
-        // Ctrl+V: the clipboard's image as an attachment chip (D79).
+        // Ctrl+V: the clipboard's image as an attachment chip.
         if ctrl && key.code == KeyCode::Char('v') {
             return self.paste_clipboard_image(false);
         }
-        // The `@` popup takes ↑↓, Tab and Enter (D118).
+        // The `@` popup takes ↑↓, Tab and Enter.
         if self.mention_open() && !shift && !alt {
             match key.code {
                 KeyCode::Up => return self.mention_move(true),
@@ -3698,7 +3705,7 @@ impl App {
     }
 
     /// Attachments the active model can't take: an error naming them, before
-    /// anything is sent (D79).
+    /// anything is sent.
     fn unsupported_attachments(&self) -> Option<String> {
         let blocks: Vec<_> = self
             .composer
@@ -3752,7 +3759,7 @@ impl App {
         let text = self.composer.take();
         self.slash_sel = 0;
         if text.trim().is_empty() {
-            // Enter on an empty composer escalates the newest queued message (D73).
+            // Enter on an empty composer escalates the newest queued message.
             self.escalate_last();
             return;
         }
@@ -4088,7 +4095,7 @@ impl App {
         }
     }
 
-    // ---- titles (D55) -----------------------------------------------------
+    // ---- titles -----------------------------------------------------
 
     fn set_title(&mut self, title: Option<String>) {
         self.title = title.filter(|t| !t.trim().is_empty());
@@ -4234,7 +4241,7 @@ impl App {
             questions::Outcome::Pending => {}
             questions::Outcome::Later => {
                 // Later puts off every waiting question, not only these:
-                // /answer reopens them together (D64).
+                // /answer reopens them together.
                 for p in &mut self.prompts {
                     if let Prompt::Question(q, deferred) = p
                         && (ids.contains(&q.id) || !q.blocking)
@@ -4296,9 +4303,9 @@ impl App {
                     let Some(q) = self.question(&id) else {
                         continue;
                     };
-                    self.remove_prompt(&id);
                     match self.engine.answer_questions(&id, &q.questions, &answers) {
                         Ok(started) => {
+                            self.remove_prompt(&id);
                             let summary = crate::engine::answers_text(&q.questions, &answers)
                                 .replace('\n', " · ");
                             let row = format!("answered: {summary}");
@@ -4308,7 +4315,7 @@ impl App {
                                 tr.notice(Level::Answer, row);
                             }
                             // A whenever answer while root is idle starts a
-                            // root turn carrying it (D62); it shows as this
+                            // root turn carrying it; it shows as this
                             // row, not as a typed message.
                             if started && !self.running {
                                 self.transcript.begin_attempt();
@@ -4316,7 +4323,17 @@ impl App {
                                 self.phase = Phase::Waiting;
                             }
                         }
-                        Err(e) => self.transcript.notice(Level::Error, e),
+                        Err(e) => {
+                            for p in &mut self.prompts {
+                                if let Prompt::Question(q, deferred) = p
+                                    && q.id == id
+                                {
+                                    *deferred = true;
+                                }
+                            }
+                            self.transcript.notice(Level::Error, &e);
+                            self.hint(format!("{e} · /answer to retry"));
+                        }
                     }
                 }
                 let left = ids.len().saturating_sub(n);
@@ -4330,7 +4347,7 @@ impl App {
         }
     }
 
-    /// A fork-chat event (D64): it belongs to the overlay showing that fork;
+    /// A fork-chat event: it belongs to the overlay showing that fork;
     /// with no such overlay only closure matters (the answer row comes
     /// from the committed answer).
     fn fork_chat_event(
@@ -4353,7 +4370,11 @@ impl App {
         match kind.as_str() {
             "opened" => c.load(messages),
             "tool_start" => c.tool_start(call),
-            "tool" => c.tool(text, call, result),
+            "tool" => {
+                if let (Some(call), Some(result)) = (call, result) {
+                    c.tool(call, result);
+                }
+            }
             "user" | "assistant" => c.message(&kind, text),
             "status" => c.status = text,
             "idle" => c.status.clear(),
@@ -4396,7 +4417,7 @@ impl App {
         self.overlay = Overlay::ForkChat(Box::new(chat));
     }
 
-    /// Keys in the fork-chat view (D64).
+    /// Keys in the fork-chat view.
     fn fork_chat_key(&mut self, key: KeyEvent) {
         let Overlay::ForkChat(c) = &mut self.overlay else {
             return;
@@ -4610,7 +4631,7 @@ impl App {
     }
 
     /// Pick a new root model. While the current model's prompt cache is
-    /// probably warm, ask first (D49).
+    /// probably warm, ask first.
     fn activate_model(&mut self, id: String) {
         let Some(m) = self.catalog.get(&id).cloned() else {
             return;
@@ -4711,7 +4732,7 @@ impl App {
 }
 
 /// "2 background jobs and 1 subagent are running"
-/// A D109 skill message (`<skill id=… name="N">body … Arguments: A</skill …>`)
+/// A skill message (`<skill id=… name="N">body … Arguments: A</skill …>`)
 /// as the command the user typed: `/N A`.
 fn skill_invocation(text: &str) -> Option<String> {
     let after = text.trim().strip_prefix("<skill id=\"")?;
@@ -4796,7 +4817,7 @@ fn message_text(tree: &Tree, from: &str, to: &str, text: &str) -> String {
     }
 }
 
-/// The body of a user message that is only D52 `<system-message id="R">`
+/// The body of a user message that is only `<system-message id="R">`
 /// blocks (engine-injected), joined; None for typed text.
 fn system_message(text: &str) -> Option<String> {
     let mut rest = text.trim();
@@ -4833,7 +4854,7 @@ fn fill(t: &mut Transcript, items: Vec<ReplayItem>, tree: &Tree, agent: &str) {
             ReplayItem::CompactSuggested(pct, used, window) => {
                 t.card(tree_rows::compact_card(pct, used, window))
             }
-            // An engine-started turn (a question answer, D62) carries a
+            // An engine-started turn (a question answer) carries a
             // tagged block, not typed text: a compact row.
             ReplayItem::User(text, ts) => match system_message(&text) {
                 Some(body) => t.notice(Level::Answer, truncate(&body.replace('\n', " · "), 200)),
@@ -5004,7 +5025,322 @@ fn prompt_key(p: &Prompt) -> String {
     }
 }
 
-/// An approval raised by a D64 fork chat (its breadcrumb ends in `fork chat`).
+/// An approval raised by a fork chat (its breadcrumb ends in `fork chat`).
 fn fork_approval(a: &ApprovalView) -> bool {
     a.breadcrumb.ends_with("fork chat")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::test_support::{self, TestDir};
+    use crate::engine::{AgentView, QAnswer, QItem, QKind, QueueClass, Queued};
+
+    fn app() -> (TestDir, App) {
+        let (dir, engine, rx) = test_support::engine();
+        (dir, App::new(engine, rx, None))
+    }
+
+    fn question() -> QuestionView {
+        QuestionView {
+            id: "question".into(),
+            asker: "root".into(),
+            breadcrumb: "root".into(),
+            note: None,
+            blocking: true,
+            questions: vec![QItem {
+                id: Some("item".into()),
+                text: "Why?".into(),
+                kind: QKind::Text,
+                options: vec![],
+                multi: false,
+            }],
+        }
+    }
+
+    fn fork(draft: &str) -> Overlay {
+        let mut chat = ForkChat::with_summary("root".into(), vec![]);
+        chat.input.set(draft);
+        Overlay::ForkChat(Box::new(chat))
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn short_ids_use_characters() {
+        assert_eq!(short("界界界"), "界界界");
+        assert_eq!(short("界界界界界界界界界"), "界界界界界界界界");
+        assert_eq!(short("123456789"), "12345678");
+    }
+
+    #[tokio::test]
+    async fn paste_leaves_visual_mode_before_multibyte_insert_and_yank() {
+        let (_dir, mut app) = app();
+        app.composer.vim = Some(crate::vim::Vim::default());
+        app.composer.buf.set("ab");
+        for code in [KeyCode::Esc, KeyCode::Char('v'), KeyCode::Char('h')] {
+            app.on_key(key(code));
+        }
+        assert_eq!(
+            app.composer.vim.as_ref().unwrap().mode,
+            crate::vim::Mode::Visual
+        );
+        app.on_term_event(Event::Paste("é".into()));
+        assert_eq!(app.composer.text(), "éab");
+        assert_eq!(
+            app.composer.vim.as_ref().unwrap().mode,
+            crate::vim::Mode::Normal
+        );
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.composer.wire(), "éab");
+        assert_eq!(
+            app.composer
+                .vim
+                .as_ref()
+                .unwrap()
+                .visual_range(&app.composer.buf),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_drops_old_shell_receivers() {
+        let (_dir, mut app) = app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.shells.push(shell::Shell {
+            id: "old-shell".into(),
+            agent: "root".into(),
+            rx,
+        });
+        let (_, events) = tokio::sync::mpsc::unbounded_channel();
+        app.load_session(events, "new");
+        assert!(app.shells.is_empty());
+        assert!(
+            tx.send((
+                String::new(),
+                false,
+                crate::engine::LocalRun {
+                    command: "old command".into(),
+                    exit_code: Some(0),
+                    duration_ms: 0,
+                    output_bytes: 0,
+                }
+            ))
+            .is_err()
+        );
+        assert!(!app.poll_shells());
+    }
+
+    #[tokio::test]
+    async fn root_and_child_partial_events_preserve_committed_reply() {
+        let (_dir, mut app) = app();
+        app.tree.add(
+            AgentView {
+                id: "child".into(),
+                parent: "root".into(),
+                role: "worker".into(),
+                model: None,
+                status: "running".into(),
+                task: String::new(),
+                background: false,
+                created: String::new(),
+                call_id: None,
+            },
+            true,
+        );
+        for status in ["max_tokens", "pause_turn"] {
+            for child in [false, true] {
+                for event in [
+                    UiEvent::Text("committed".into()),
+                    UiEvent::Partial {
+                        status: status.into(),
+                        text: "committed".into(),
+                    },
+                    UiEvent::Text("retry".into()),
+                    UiEvent::StreamReset,
+                ] {
+                    if child {
+                        app.child_event("child", event);
+                    } else {
+                        app.on_engine_event(Some(event));
+                    }
+                }
+                let tr = if child {
+                    &app.tree.get("child").unwrap().transcript
+                } else {
+                    &app.transcript
+                };
+                assert!(
+                    tr.entries
+                        .iter()
+                        .any(|e| matches!(&e.kind, Kind::Assistant(t) if t == "committed"))
+                );
+                assert!(
+                    !tr.entries
+                        .iter()
+                        .any(|e| matches!(&e.kind, Kind::Assistant(t) if t == "retry"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_question_parks_fork_draft_until_deferred_or_answered() {
+        for defer in [true, false] {
+            let (_dir, mut app) = app();
+            app.overlay = fork("unsent 界");
+            app.on_engine_event(Some(UiEvent::Question(question())));
+            assert!(app.parked_fork.is_some());
+            app.next_prompt();
+            assert!(matches!(app.overlay, Overlay::Questions(_)));
+            if defer {
+                app.question_outcome(questions::Outcome::Later);
+            } else {
+                app.on_engine_event(Some(UiEvent::Answered("question".into())));
+            }
+            app.next_prompt();
+            let Overlay::ForkChat(chat) = &app.overlay else {
+                panic!("fork not restored")
+            };
+            assert_eq!(chat.input.text, "unsent 界");
+            assert!(app.parked_fork.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn paste_search_takes_priority_and_refreshes_matches() {
+        let (_dir, mut app) = app();
+        app.transcript.append_text("find 界 here");
+        app.overlay = fork("keep draft");
+        app.layout.area.width = 80;
+        app.open_search();
+        app.search.as_mut().unwrap().committed = true;
+        app.on_term_event(Event::Paste("界\r\nhere".into()));
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.query, "界 here");
+        assert!(!search.committed);
+        assert!(!search.matches.is_empty());
+        assert!(app.composer.is_empty());
+        let Overlay::ForkChat(chat) = &app.overlay else {
+            panic!("fork changed")
+        };
+        assert_eq!(chat.input.text, "keep draft");
+    }
+
+    #[tokio::test]
+    async fn paste_reaches_question_answer_field() {
+        let (_dir, mut app) = app();
+        app.on_engine_event(Some(UiEvent::Question(question())));
+        app.next_prompt();
+        app.on_term_event(Event::Paste("é\nanswer".into()));
+        let Overlay::Questions(dialog) = &app.overlay else {
+            panic!("questions closed")
+        };
+        assert!(matches!(&dialog.answers()[0].1[0], QAnswer::Text(t) if t == "é answer"));
+        assert!(app.composer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_answer_stays_deferred_and_reopenable() {
+        let (_dir, mut app) = app();
+        // The UI has the question, but the engine no longer knows it.
+        app.on_engine_event(Some(UiEvent::Question(question())));
+        app.next_prompt();
+        app.question_outcome(questions::Outcome::Submit(vec![(
+            "question".into(),
+            vec![QAnswer::Text("answer".into())],
+        )]));
+        assert!(
+            app.prompts
+                .iter()
+                .any(|p| matches!(p, Prompt::Question(q, true) if q.id == "question"))
+        );
+        assert!(app.hint.as_ref().unwrap().0.contains("/answer"));
+        app.next_prompt();
+        assert!(matches!(app.overlay, Overlay::None));
+        app.command("answer", "");
+        app.next_prompt();
+        assert!(matches!(app.overlay, Overlay::Questions(_)));
+    }
+
+    #[tokio::test]
+    async fn queued_attachment_survives_edit_restore_and_cancel() {
+        let (dir, mut app) = app();
+        let source = dir.0.join("input.txt");
+        std::fs::write(&source, "attachment contents").unwrap();
+        let wire = crate::paste::attach_wire("input", "file", source.to_str().unwrap());
+        let crate::engine::QueueOutcome::Held(id) = app
+            .engine
+            .queue_message("root", wire, QueueClass::NextTurn)
+            .unwrap();
+        app.queue_act(id, crate::ui::QAct::Edit);
+        assert_eq!(app.composer.buf.blocks.len(), 1);
+        let imported = app.composer.buf.blocks[0].full.clone();
+        assert_ne!(imported, source.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(&imported).unwrap(),
+            "attachment contents"
+        );
+        app.composer.buf.insert(" edited");
+        app.restore_queue_edit(true);
+        assert!(app.composer.is_empty());
+        let queued = app.engine.queued("root");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(crate::paste::attachments(&queued[0].text).len(), 1);
+        app.user_cancelled = true;
+        app.finish_turn("cancelled".into());
+        assert_eq!(app.composer.buf.blocks.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&app.composer.buf.blocks[0].full).unwrap(),
+            "attachment contents"
+        );
+        assert!(app.composer.text().contains("edited"));
+        assert_eq!(app.engine.queued_count(), 0);
+    }
+
+    fn missing_agent_item(text: &str) -> Queued {
+        Queued {
+            id: 1,
+            agent: "missing-agent".into(),
+            text: text.into(),
+            class: QueueClass::NextTurn,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_edited_enqueue_restores_wire_draft() {
+        let (_dir, mut app) = app();
+        let wire = crate::paste::attach_wire("input", "image", "/missing/image.png");
+        app.view = Some("missing-agent".into());
+        app.queue_edit = Some((missing_agent_item("old draft"), 0));
+        app.enqueue(wire.clone());
+        assert_eq!(
+            crate::paste::attachments(&app.composer.wire()),
+            crate::paste::attachments(&wire)
+        );
+        assert_eq!(app.engine.queued_count(), 0);
+        assert!(app.queue_edit.is_none());
+        assert!(!app.hint.as_ref().unwrap().0.contains("queued ·"));
+    }
+
+    #[tokio::test]
+    async fn failed_queue_restore_keeps_original_or_edited_draft() {
+        for edited in [false, true] {
+            let (_dir, mut app) = app();
+            let original = crate::paste::attach_wire("input", "image", "/original.png");
+            let changed = crate::paste::attach_wire("input", "image", "/edited.png");
+            app.composer.set_wire(&changed);
+            app.queue_edit = Some((missing_agent_item(&original), 0));
+            app.restore_queue_edit(edited);
+            let expected = if edited { &changed } else { &original };
+            assert_eq!(
+                crate::paste::attachments(&app.composer.wire()),
+                crate::paste::attachments(expected)
+            );
+            assert!(!app.composer.is_empty());
+            assert!(!app.hint.as_ref().unwrap().0.contains("went back"));
+        }
+    }
 }

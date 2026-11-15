@@ -8,7 +8,7 @@ pub enum Profile {
     Full,
     Core,
 }
-/// Global profile; D111 global overrides remain in tools.json.
+/// Global profile; global overrides remain in tools.json.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profiles {

@@ -1,4 +1,4 @@
-//! Best-of-N candidates share the author's exact prepared request (D56).
+//! Best-of-N candidates share the author's exact prepared request.
 use crate::{
     Control,
     hidden_fork::{ForkTask, HiddenFork},
@@ -260,18 +260,7 @@ pub(crate) async fn select(
         .or_else(|| selected.get("select"))
         .unwrap_or(&selected);
     let synthesize = selected.get("synthesize").is_some() || selected["action"] == "synthesize";
-    let legacy = selected.get("choice").is_some();
-    let choice = if synthesize {
-        decision["fallbackIndex"].as_u64()
-    } else if legacy {
-        selected["choice"].as_u64().and_then(|n| n.checked_sub(1))
-    } else {
-        decision["index"].as_u64()
-    };
-    let choice = choice
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|n| *n < candidates.len())
-        .unwrap_or(0);
+    let choice = candidate_index(decision, synthesize, candidates.len());
     let rationale = decision["rationale"]
         .as_str()
         .or_else(|| decision["reason"].as_str())
@@ -356,4 +345,40 @@ async fn validate_candidate(
     }
     crate::tools::ToolBox::validate_combined_edit(op, call)
         .map_err(|e| EngineError::bad(e.to_string()))
+}
+
+fn candidate_index(decision: &Value, synthesize: bool, candidates: usize) -> usize {
+    decision[if synthesize { "fallbackIndex" } else { "index" }]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n < candidates)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn judge_indices_are_zero_based_and_bounded() {
+        for index in [0, 1, 2] {
+            assert_eq!(
+                candidate_index(&serde_json::json!({"index":index}), false, 3),
+                index
+            );
+            assert_eq!(
+                candidate_index(&serde_json::json!({"fallbackIndex":index}), true, 3),
+                index
+            );
+        }
+        for value in [
+            serde_json::json!({"index":3}),
+            serde_json::json!({"index":-1}),
+            serde_json::json!({"index":"1"}),
+            serde_json::json!({"choice":2}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(candidate_index(&value, false, 3), 0);
+        }
+    }
 }

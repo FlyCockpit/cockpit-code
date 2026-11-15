@@ -94,7 +94,7 @@ Tool tiers use `tools.profile: "full" | "core"` in config.json, provider entries
 
 LSP defaults auto-detect installed Rust, JS/TS, Python, Go and C/C++ servers only for languages present when the session starts. `lsp.<name>` partially overrides/adds a server; `enabled:false` disables a default. `init`/`doctor` show detections and install hints without downloads. Server resolution and LSP availability freeze per session; see `references/config-json.md` for names and fields.
 
-The standalone repository `search` tool is retired; use grep for text and code for syntax. `tools.search(query=...)` still discovers allowed capabilities.
+Use grep for repository text and code for syntax. `tools.search(query=...)` discovers allowed capabilities.
 
 Core includes native code (19 root / 21 tree child / 15 flat child tools before disables (plus terminal when the interactive frontend opts in)). Graph, context_pack and change_impact are script-only in every profile.
 

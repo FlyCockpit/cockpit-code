@@ -1,4 +1,4 @@
-//! `/goal` and `/criteria` (D88–D97, D110): the draft approval, proposal
+//! `/goal` and `/criteria`: the draft approval, proposal
 //! and roadblock dialogs, the goal status dialog, the contract editor and
 //! the actions the engine accepts only between turns.
 use super::{App, DialogPurpose, EditTarget, EditorReq, Overlay, Prompt};
@@ -350,7 +350,7 @@ impl App {
                 };
                 let old_check = current.and_then(|c| c.check.as_deref());
                 let new_check = proposal.check.as_deref();
-                // engine-o: the proposal replaces the check too; no check removes it.
+                // The proposal replaces the check too; no check removes it.
                 let checks = if old_check.map(str::trim) == new_check.map(str::trim) {
                     format!("**Check** {} _(unchanged)_", check(new_check))
                 } else if new_check.is_none() {

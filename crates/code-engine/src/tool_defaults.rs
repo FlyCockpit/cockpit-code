@@ -5,7 +5,6 @@ use std::{fs, path::Path};
 
 pub fn definitions() -> Vec<ToolDefinition> {
     let mut defs = ToolBox::definitions();
-    defs.retain(|d| d.name != "todo");
     defs.push(crate::script::definition());
     defs.extend(crate::session_tools::definitions());
     defs.extend(crate::tree::definitions(None, true));
@@ -74,16 +73,6 @@ pub fn install(config: &Path, data: &Path, force: bool) -> std::io::Result<bool>
             pins.insert(name.clone(), json!(hash(default)));
         }
     }
-    // Retired defaults are removed only when untouched; edited entries remain inert
-    // compatibility data for old frozen sessions.
-    if entries
-        .get("search")
-        .is_some_and(|v| pins.get("search").and_then(Value::as_str) == Some(hash(v).as_str()))
-    {
-        entries.remove("search");
-        pins.remove("search");
-        changed = true;
-    }
     if changed {
         fs::create_dir_all(config)?;
         atomic_json(&path, &value)?;
@@ -100,4 +89,34 @@ fn atomic_json(path: &Path, value: &Value) -> std::io::Result<()> {
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_writes_current_defaults_and_preserves_unknown_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let data = temp.path().join("data");
+        assert!(install(&config, &data, false).unwrap());
+        let path = config.join("tools.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(value.get("search").is_none());
+        for name in crate::intel::NAMES {
+            assert!(value.get(name).is_some());
+        }
+        value["search"] = json!({"enabled":true});
+        value["unknown"] = json!({"enabled":true});
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let marker = data.join("tool-defaults.json");
+        let mut pins: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        pins["search"] = json!(hash(&value["search"]));
+        fs::write(&marker, serde_json::to_vec(&pins).unwrap()).unwrap();
+        install(&config, &data, false).unwrap();
+        let after: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(after["search"], value["search"]);
+        assert_eq!(after["unknown"], value["unknown"]);
+    }
 }

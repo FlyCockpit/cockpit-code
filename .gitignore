@@ -2,3 +2,9 @@
 *.swp
 .DS_Store
 .env
+.env.*
+!.env.example
+*.swo
+*~
+.idea/
+.vscode/

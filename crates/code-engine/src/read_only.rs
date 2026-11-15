@@ -36,7 +36,7 @@ fn digest(path: &std::path::Path) -> Option<String> {
     }
     std::fs::read(path)
         .ok()
-        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .map(|bytes| crate::hex::hex(&Sha256::digest(bytes)))
 }
 struct Scope(Vec<PathBuf>);
 #[async_trait]
@@ -55,7 +55,7 @@ impl PermissionGate for Scope {
         Ok(())
     }
 }
-/// D64 fork chats may use the web tools; they pass through the session's policy.
+/// Fork chats may use the web tools; they pass through the session's policy.
 #[derive(Clone)]
 pub(crate) struct WebAccess {
     pub gate: Arc<dyn PermissionGate>,
@@ -130,7 +130,7 @@ impl ReadOnly {
         self.web = Some(web);
         self
     }
-    /// `web_search`/`web_fetch` for a D64 fork chat; unavailable to reviewers.
+    /// `web_search`/`web_fetch` for a fork chat; unavailable to reviewers.
     pub(crate) async fn web(
         &self,
         call: &ToolCall,

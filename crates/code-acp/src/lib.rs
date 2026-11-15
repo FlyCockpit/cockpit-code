@@ -1,4 +1,4 @@
-//! ACP front end (milestone 9): `cockpit-code acp` serves the Agent Client
+//! ACP front end: `cockpit-code acp` serves the Agent Client
 //! Protocol v1 over stdio for editors such as Zed.
 //!
 //! Adapted from FlyCockpit's Cockpit: the LF codec (`codec`), the

@@ -110,13 +110,13 @@ pub struct QuestionView {
     pub breadcrumb: String,
     /// Escalation note from the agent that passed the question up.
     pub note: Option<String>,
-    /// The asker is parked until answered (D51).
+    /// The asker is parked until answered.
     pub blocking: bool,
-    /// The structured questions of the call (D62).
+    /// The structured questions of the call.
     pub questions: Vec<QItem>,
 }
 
-/// D62 question kinds.
+/// Question kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QKind {
     Text,
@@ -130,7 +130,7 @@ pub struct QOption {
     pub description: Option<String>,
 }
 
-/// One question of a `question` call (D62).
+/// One question of a `question` call.
 #[derive(Debug, Clone)]
 pub struct QItem {
     pub id: Option<String>,
@@ -140,7 +140,7 @@ pub struct QItem {
     pub multi: bool,
 }
 
-/// The answer to one question (D62): chosen labels plus other text, a
+/// The answer to one question: chosen labels plus other text, a
 /// boolean plus a note, text, or skipped.
 #[derive(Debug, Clone)]
 pub enum QAnswer {
@@ -177,12 +177,8 @@ impl QAnswer {
     }
 }
 
-/// Questions of a call: the engine's structured D62 questions; a record
-/// without them (a plain-text question) falls back to its text.
+/// Questions of a call, preserving the engine's structured item IDs.
 fn structured_items(q: &code_engine::schema::QuestionRecord) -> Vec<QItem> {
-    if q.questions.is_empty() {
-        return question_items(&q.text);
-    }
     q.questions
         .iter()
         .map(|q| QItem {
@@ -205,64 +201,7 @@ fn structured_items(q: &code_engine::schema::QuestionRecord) -> Vec<QItem> {
         })
         .collect()
 }
-fn question_items(text: &str) -> Vec<QItem> {
-    let parsed = serde_json::from_str::<Value>(text.trim())
-        .ok()
-        .and_then(|v| {
-            let qs = v.get("questions")?.as_array()?;
-            let items: Vec<QItem> = qs
-                .iter()
-                .filter_map(|q| {
-                    let text = q.get("text")?.as_str()?.to_string();
-                    let kind = match q.get("kind").and_then(Value::as_str).unwrap_or("text") {
-                        "choice" => QKind::Choice,
-                        "boolean" => QKind::Boolean,
-                        _ => QKind::Text,
-                    };
-                    let options = q
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .map(|os| {
-                            os.iter()
-                                .filter_map(|o| {
-                                    Some(QOption {
-                                        label: o.get("label")?.as_str()?.to_string(),
-                                        description: o
-                                            .get("description")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_string),
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Some(QItem {
-                        id: q.get("id").and_then(Value::as_str).map(str::to_string),
-                        text,
-                        kind,
-                        options,
-                        multi: q
-                            .get("multiSelect")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    })
-                })
-                .collect();
-            (!items.is_empty()).then_some(items)
-        });
-    parsed.unwrap_or_else(|| {
-        vec![QItem {
-            id: None,
-            text: text.to_string(),
-            kind: QKind::Text,
-            options: vec![],
-            multi: false,
-        }]
-    })
-}
-
-/// The answers as one text block (the pre-D62 answer path and the
-/// transcript row).
+/// The answers as one text block for a transcript row.
 pub fn answers_text(items: &[QItem], answers: &[QAnswer]) -> String {
     if items.len() == 1 {
         return answers.first().map(QAnswer::summary).unwrap_or_default();
@@ -343,17 +282,16 @@ pub fn alive(status: &str) -> bool {
     matches!(status, "running" | "waiting" | "compacting") || status.starts_with("queued")
 }
 
-/// An agent status for display. D66 adds `queued` (waiting for a slot on a
+/// An agent status for display, including `queued` (waiting for a slot on a
 /// model or provider with `maxConcurrentContexts`); a queue position shows
 /// as `queued (2nd)`.
 ///
-/// The engine emits `queued:N`; this also accepts older
-/// `queued`, `queued:N` and `queued N`.
+/// The engine emits `queued:N`.
 pub fn status_text(status: &str) -> String {
-    let Some(rest) = status.strip_prefix("queued") else {
+    let Some(rest) = status.strip_prefix("queued:") else {
         return status.to_string();
     };
-    let n: Option<usize> = rest.trim_start_matches([':', ' ']).parse().ok();
+    let n: Option<usize> = rest.parse().ok();
     match n {
         Some(n) => {
             let suffix = match (n % 10, n % 100) {
@@ -374,7 +312,7 @@ pub enum ApprovalChoice {
     Deny(String),
 }
 
-/// A skill the user can invoke as `/<name>` (D109).
+/// A skill the user can invoke as `/<name>`.
 #[derive(Debug, Clone)]
 pub struct SkillView {
     pub name: String,
@@ -385,22 +323,22 @@ pub struct SkillView {
     pub shadows_global: bool,
 }
 
-/// Project reviewer guidance awaiting trust (D107): the exact content.
+/// Project reviewer guidance awaiting trust: the exact content.
 #[derive(Debug, Clone)]
 pub struct GuidanceView {
     pub id: String,
     pub path: PathBuf,
     pub sha256: String,
     pub content: String,
-    /// D115: an unapproved change was restored; `content` is the quarantined proposal.
+    /// An unapproved change was restored; `content` is the quarantined proposal.
     pub tampered: bool,
-    /// D115: the proposal is to delete the file.
+    /// The proposal is to delete the file.
     pub deleted: bool,
-    /// D121: a project guidance library file, not reviewer guidance.
+    /// A project guidance library file, not reviewer guidance.
     pub library: bool,
 }
 
-/// A D120 out-of-scope write/edit routed to the scope's owner.
+/// An out-of-scope write/edit routed to the scope's owner.
 #[derive(Debug, Clone)]
 pub struct ScopeView {
     pub id: String,
@@ -435,7 +373,7 @@ fn scope_view(r: code_engine::scopes::ScopeRequest) -> ScopeView {
     }
 }
 
-/// The owner's answer to a scope request (D120).
+/// The owner's answer to a scope request.
 #[derive(Debug, Clone)]
 pub enum ScopeChoice {
     Apply,
@@ -443,7 +381,7 @@ pub enum ScopeChoice {
     Grant(Vec<PathBuf>),
 }
 
-/// One changed path of a D120 subscription notice.
+/// One changed path of a subscription notice.
 #[derive(Debug, Clone)]
 pub struct ChangeView {
     pub path: PathBuf,
@@ -464,7 +402,7 @@ fn change_views(changes: Vec<code_engine::subscriptions::SubscriptionChange>) ->
         .collect()
 }
 
-/// A D121 guidance selection: what was injected after a write, and why.
+/// A guidance selection: what was injected after a write, and why.
 #[derive(Debug, Clone)]
 pub struct GuidanceSel {
     pub id: String,
@@ -503,7 +441,7 @@ fn guidance_sel(s: code_engine::guidance_selector::GuidanceSelection) -> Guidanc
     }
 }
 
-/// A `/prune` preview or result (engine-n).
+/// A `/prune` preview or result.
 #[derive(Debug, Clone, Default)]
 pub struct PruneView {
     pub before: u64,
@@ -527,7 +465,7 @@ fn prune_view(r: code_engine::PruneReport) -> PruneView {
     }
 }
 
-/// D122: the facts of a `!cmd` run, as the agent was told (never the output).
+/// The facts of a `!cmd` run, as the agent was told (never the output).
 #[derive(Debug, Clone)]
 pub struct LocalRun {
     pub command: String,
@@ -551,7 +489,7 @@ fn guidance_view(r: code_engine::ReviewerGuidanceRequest) -> GuidanceView {
 /// Frontend view of one engine event.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// D144/D140 terminal metadata (never its bytes).
+    /// Terminal metadata (never its bytes).
     Terminal(TermInfo),
     Text(String),
     Reasoning(String),
@@ -570,14 +508,14 @@ pub enum UiEvent {
     /// An inner tool call of a `script` run: started, completed or error.
     ScriptCall {
         job: Option<String>,
-        /// The containing script call (engine-m).
+        /// The containing script call.
         parent: Option<String>,
         call: ToolCall,
         result: Option<ToolResultData>,
         status: String,
     },
     /// A sidecar safety review of a call started (`result` None) or
-    /// finished: (safe, verdict, reason) (D46).
+    /// finished: (safe, verdict, reason).
     SafetyReview {
         call_id: String,
         model: String,
@@ -590,21 +528,20 @@ pub enum UiEvent {
         details: ToolResultDetails,
     },
     /// A steer or interrupt moved foreground call `call_id` to the
-    /// background as job `job` (D72).
+    /// background as job `job`.
     MovedToBackground {
         call_id: String,
         job: String,
         /// `steer` or `interrupt`.
         reason: String,
     },
-    /// An interrupt (D74) stopped the stream: the partial text is kept,
+    /// An interrupt stopped the stream: the partial text is kept,
     /// tentative tool calls are dropped.
     Interrupted,
     /// The engine's queue changed (delivered, reclassified); redraw.
     QueueChanged,
     /// A durably recorded root user message for composer recall.
     UserRecorded(String),
-    Todo(Vec<TodoItem>),
     Usage(Usage),
     Retry {
         attempt: usize,
@@ -612,12 +549,12 @@ pub enum UiEvent {
         reason: Option<String>,
     },
     StreamReset,
-    /// The network dropped: the engine probes and retries by itself (engine-n).
+    /// The network dropped: the engine probes and retries by itself.
     Reconnecting {
         attempt: usize,
         delay_ms: u64,
     },
-    /// D119: a backup model took over for the rest of this turn.
+    /// A backup model took over for the rest of this turn.
     ModelSwitched {
         from: String,
         to: String,
@@ -641,50 +578,50 @@ pub enum UiEvent {
     Approval(ApprovalView),
     Question(QuestionView),
     Answered(String),
-    /// Project reviewer guidance needs the user's trust (D107).
+    /// Project reviewer guidance needs the user's trust.
     GuidanceTrust(GuidanceView),
-    /// A D120 scope request changed state (upsert by id).
+    /// A scope request changed state (upsert by id).
     Scope(ScopeView),
-    /// D120: subscribed paths changed (delivered to `agent`).
+    /// Subscribed paths changed (delivered to `agent`).
     Subscription {
         agent: String,
         changes: Vec<ChangeView>,
         overflow: bool,
     },
-    /// D121: guidance was selected (or nothing / a failure) after a write.
+    /// Guidance was selected (or nothing / a failure) after a write.
     Guidance(GuidanceSel),
     /// `/prune` finished.
     Pruned(PruneView),
-    /// Root was compacted while the tree was idle (D100).
+    /// Root was compacted while the tree was idle.
     IdleCompacted,
     RootCompactionSuggested {
         used: u64,
         window: u64,
     },
-    /// A durable tree row (D131/D132) committed in `agent`'s journal.
+    /// A durable tree row committed in `agent`'s journal.
     Tree {
         agent: String,
         row: TreeRow,
     },
-    /// The D128 ledger changed: the open count after the change.
+    /// The ledger changed: the open count after the change.
     Decision {
         open_count: usize,
     },
-    /// Background model discovery finished (engine-l): re-read the catalog.
+    /// Background model discovery finished: re-read the catalog.
     DiscoveryUpdated,
-    /// An agent's criteria contract changed (D88).
+    /// An agent's criteria contract changed.
     ContractChanged(String),
-    /// `/goal` drafted a contract: open the approval dialog (D93).
+    /// `/goal` drafted a contract: open the approval dialog.
     GoalDraft(ContractView),
     /// The `/goal` run changed (disposition, phase, counters); read it
     /// back with `Engine::goal` (events can trail the state).
     GoalUpdate,
-    /// An agent proposes a change to a user-owned criterion (D89).
+    /// An agent proposes a change to a user-owned criterion.
     ProposalRequest {
         agent: String,
         proposal: ProposalView,
     },
-    /// A root roadblock awaits pivot, stop or override (D91), in every mode.
+    /// A root roadblock awaits pivot, stop or override, in every mode.
     RoadblockRequest {
         agent: String,
         roadblock: RoadblockView,
@@ -696,12 +633,12 @@ pub enum UiEvent {
         text: String,
     },
     SettingsChanged,
-    /// The session title changed (D55), automatically or by `/rename`.
+    /// The session title changed, automatically or by `/rename`.
     TitleChanged {
         title: String,
         auto: bool,
     },
-    /// A hidden fork (auto title, D56) finished: its purpose and success.
+    /// A hidden fork (auto title) finished: its purpose and success.
     HiddenFork {
         purpose: String,
         ok: bool,
@@ -730,7 +667,7 @@ pub enum UiEvent {
         text: String,
     },
     Job(JobView),
-    /// A question fork's chat event (D64), routed by fork id into the
+    /// A question fork's chat event, routed by fork id into the
     /// fork-chat overlay: `opened` (with the saved `messages` as (role,
     /// text)), `user`, `assistant`, `tool` ("name: output"), `status`,
     /// `idle`, `closed` or `error`.
@@ -739,37 +676,16 @@ pub enum UiEvent {
         kind: String,
         text: String,
         messages: Vec<ForkChatMessage>,
-        /// `tool_start` / `tool`: the structured call and result (engine-m).
+        /// `tool_start` / `tool`: the structured call and result.
         call: Option<ToolCall>,
         result: Option<ToolResultData>,
     },
-    /// A question fork answered question `id` of `asker` (D64).
+    /// A question fork answered question `id` of `asker`.
     ForkAnswered {
         id: String,
         asker: String,
         summary: String,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct TodoItem {
-    pub content: String,
-    pub status: String,
-}
-
-pub fn todo_items(value: &Value) -> Vec<TodoItem> {
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .map(|i| TodoItem {
-                    content: i["content"].as_str().unwrap_or_default().to_string(),
-                    status: i["status"].as_str().unwrap_or("pending").to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -781,7 +697,7 @@ pub struct Usage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost: Option<f64>,
-    /// A live quota report of the call (m7 `UsageRecord.quota`).
+    /// A live quota report of the call (`UsageRecord.quota`).
     pub quota: Option<Limit>,
 }
 
@@ -872,7 +788,7 @@ pub struct Catalog {
     pub attention: String,
     pub vim: bool,
     pub paste_collapse_lines: usize,
-    /// `queueDefault` (D73).
+    /// `queueDefault`.
     pub queue_default: QueueClass,
     /// Resolved config directory and the variable that chose it, if any.
     pub config_dir: PathBuf,
@@ -955,7 +871,7 @@ impl From<String> for OpenError {
     }
 }
 
-/// How a queued user message is delivered (D73, D74).
+/// How a queued user message is delivered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum QueueClass {
     /// Held until the agent's turn ends (root) or its next task (child).
@@ -1006,7 +922,7 @@ impl QueueClass {
     }
 }
 
-/// A queued user message (D73).
+/// A queued user message.
 #[derive(Clone, Debug)]
 pub struct Queued {
     pub id: u64,
@@ -1022,9 +938,6 @@ pub struct Queued {
 pub enum QueueOutcome {
     /// Held in the queue under this id.
     Held(u64),
-    /// Handed to the agent already (it arrives at its next boundary).
-    #[allow(dead_code)]
-    Delivered,
 }
 
 pub enum Target {
@@ -1077,7 +990,7 @@ pub enum ReplayItem {
         is_error: bool,
         details: ToolResultDetails,
     },
-    /// A script host call (engine-m): its containing script and result.
+    /// A script host call: its containing script and result.
     ScriptCall {
         parent: Option<String>,
         call: ToolCall,
@@ -1085,20 +998,20 @@ pub enum ReplayItem {
     },
     Compacted(String),
     Notice(String),
-    /// D119: a backup model took over (from, to, reason).
+    /// A backup model took over (from, to, reason).
     Switched {
         from: String,
         to: String,
         reason: String,
     },
-    /// A turn error, persisted since engine-l: replayed as prominently as live.
+    /// A persisted turn error: replayed as prominently as live.
     Error(String),
-    /// A foreground call moved to the background (D72): call id, reason.
+    /// A foreground call moved to the background: call id, reason.
     Moved {
         id: String,
         reason: String,
     },
-    /// A question answered through its fork (D64): question id, summary.
+    /// A question answered through its fork: question id, summary.
     ForkAnswered {
         id: String,
         summary: String,
@@ -1117,16 +1030,16 @@ pub enum ReplayItem {
     Guidance(GuidanceSel),
     Pruned(PruneView),
     LocalRun(LocalRun),
-    /// A D131/D132 tree row.
+    /// A tree row.
     Tree(TreeRow),
-    /// D125: the root compaction suggestion (percent, used, window).
+    /// The root compaction suggestion (percent, used, window).
     CompactSuggested(u64, u64, u64),
 }
 
 /// A resumed transcript: earlier (compacted) context windows and the current one.
 #[derive(Default)]
 pub struct Replay {
-    /// Context files older than `earlier`, not loaded (D103).
+    /// Context files older than `earlier`, not loaded.
     pub older: Vec<u32>,
     pub earlier: Vec<Vec<ReplayItem>>,
     pub current: Vec<ReplayItem>,
@@ -1155,7 +1068,7 @@ pub fn fmt_cost(totals_known: f64, known_calls: u64, unknown_calls: u64) -> Stri
     if unknown_calls > 0 { base + "+" } else { base }
 }
 
-/// One provider's usage from the engine's shared cache (D85, D87):
+/// One provider's usage from the engine's shared cache:
 /// the `cockpit-code.usage/1` document, budget spend over the period from
 /// the harness's cost records, and stale/refresh state. A provider with no
 /// usage document falls back to its discovery `account` quota.
@@ -1271,7 +1184,7 @@ fn parse_fork(s: &str) -> Result<(String, Option<(u32, usize)>), String> {
     Ok((id.into(), Some((context, line))))
 }
 
-/// `/exclusive` (D67): one model for the whole tree.
+/// `/exclusive`: one model for the whole tree.
 #[derive(Clone, Debug)]
 pub struct Exclusive {
     pub model: String,
@@ -1294,17 +1207,17 @@ pub struct Engine {
     session: Session,
     cwd: PathBuf,
     /// A mode chosen by flag or carried over by /new, applied at the first
-    /// send so an unused session is never written (D44).
+    /// send so an unused session is never written.
     pending_mode: Option<PermissionMode>,
     /// Shutdowns of sessions left by a switch; awaited before exit.
     retired: Vec<tokio::task::JoinHandle<()>>,
     /// `--model` given with a resume/continue/fork: applied by the UI after
-    /// the cache-aware confirmation (D49), not at open.
+    /// the cache-aware confirmation, not at open.
     pub deferred_model: Option<String>,
     /// A background discovery run: its providers and the reloaded store.
     discovery: Option<Discovery>,
     model_selection: Option<std_mpsc::Receiver<Result<String, String>>>,
-    /// Opting a switched-to session into private terminals failed (D144).
+    /// Opting a switched-to session into private terminals failed.
     pub terminal_issue: Option<String>,
 }
 
@@ -1371,7 +1284,7 @@ impl Engine {
             effort: launch.effort.clone(),
         };
         // An existing conversation switches models through the UI's
-        // cache-aware confirmation (D49).
+        // cache-aware confirmation.
         let has_history =
             launch.fork.is_some() || launch.continue_session || launch.resume.is_some();
         let deferred_model = launch.model.clone().filter(|_| has_history);
@@ -1436,7 +1349,7 @@ impl Engine {
             .as_deref()
             .and_then(Mode::parse)
             .map(Mode::engine);
-        // D144: this frontend renders private terminals; opt in before
+        // This frontend renders private terminals; opt in before
         // the first turn.
         let terminal_issue = session.enable_user_terminals().err();
         let rx = subscribe(
@@ -1495,7 +1408,7 @@ impl Engine {
         self.pending_mode = if new { mode } else { None };
         let old = std::mem::replace(&mut self.session, session);
         let terminal_issue = self.enable_terminals().err();
-        // The old session's jobs and children stop (D38); its lock is released after.
+        // The old session's jobs and children stop; its lock is released after.
         self.retired.push(tokio::spawn(async move {
             let _ = old.shutdown().await;
         }));
@@ -1587,7 +1500,7 @@ impl Engine {
 
     /// Transcript of one agent from its context files.
     pub fn replay_agent(&self, agent: &str, with_usage: bool) -> Replay {
-        // D103: only the current context and the one before it are read and
+        // Only the current context and the one before it are read and
         // laid out; older ones stay on disk until scrolled to.
         let mut out = Replay::default();
         if with_usage {
@@ -1619,7 +1532,7 @@ impl Engine {
         out
     }
 
-    /// Read one older context in the background (D103 scroll-back).
+    /// Read one older context in the background (scroll-back).
     pub fn load_context(&self, agent: &str, n: u32) -> std_mpsc::Receiver<Vec<ReplayItem>> {
         let (tx, rx) = std_mpsc::channel();
         let session = self.session.clone();
@@ -1769,7 +1682,7 @@ impl Engine {
         let list = targets.clone();
         let (tx, rx) = std_mpsc::channel();
         std::thread::spawn(move || {
-            // One enrichment pass forces exactly these providers (engine-j);
+            // One enrichment pass forces exactly these providers;
             // the others keep their caches.
             let result = store
                 .refresh_discovery_many(&list)
@@ -1781,7 +1694,7 @@ impl Engine {
     }
 
     /// Where clipboard images are saved before they are sent; the engine
-    /// imports every attachment into the session `assets/` at send (D79).
+    /// imports every attachment into the session `assets/` at send.
     pub fn attachment_dir(&self) -> PathBuf {
         self.directories.cache.join("attachments")
     }
@@ -1809,7 +1722,7 @@ impl Engine {
     }
 
     /// Ask the engine's usage cache to re-run every provider's usage
-    /// command now (D85); without `force` the cache's TTL decides.
+    /// command now; without `force` the cache's TTL decides.
     pub fn refresh_usage(&mut self, force: bool) {
         if force {
             self.session.refresh_usage();
@@ -1912,7 +1825,7 @@ impl Engine {
         let config_var = ["COCKPIT_CODE_HOME", "XDG_CONFIG_HOME"]
             .into_iter()
             .find(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
-        // Discovery failures are structured per provider (engine-j); model
+        // Discovery failures are structured per provider; model
         // warnings ("{id}/{model}: Warning: …") are in the model description
         // already. Anything else is a skipped file.
         let providers: Vec<ProviderView> = snap
@@ -2082,7 +1995,7 @@ impl Engine {
     pub fn cost(&self) -> String {
         cost_of(&self.session.totals())
     }
-    // ---- skills as slash commands (D109) ----------------------------------
+    // ---- skills as slash commands ----------------------------------
 
     pub fn skills(&self) -> Vec<SkillView> {
         self.session
@@ -2108,9 +2021,9 @@ impl Engine {
         self.session.skill_message(name, args).map_err(err)
     }
 
-    // ---- engine-l: idle compaction, reviewer guidance, discovery ---------
+    // ---- idle compaction, reviewer guidance, discovery ---------
 
-    /// The D100 idle hook, called about once a second. `busy` (typing, an
+    /// The idle hook, called about once a second. `busy` (typing, an
     /// open dialog) restarts the engine's idle timer. True when the engine
     /// started compacting root.
     pub fn idle_tick(&mut self, busy: bool) -> bool {
@@ -2129,7 +2042,7 @@ impl Engine {
             .map(guidance_view)
             .collect()
     }
-    // ---- engine-o: scopes, subscriptions, guidance; prune; D122 ----------
+    // ---- scopes, subscriptions, guidance; prune; local commands ----------
 
     pub fn pending_scopes(&self) -> Vec<ScopeView> {
         self.session
@@ -2154,7 +2067,7 @@ impl Engine {
             if let Err(e) = session.resolve_scope_request(&id, decision).await {
                 let _ = done.send(format!(
                     "scope request {}: {}",
-                    &id[..id.len().min(8)],
+                    id.chars().take(8).collect::<String>(),
                     e.message
                 ));
             }
@@ -2171,7 +2084,7 @@ impl Engine {
     pub fn subscriptions(&self) -> std::collections::BTreeMap<String, Vec<PathBuf>> {
         self.session.subscriptions()
     }
-    /// D121 selections, chronological, optionally for one agent.
+    /// Selections, chronological, optionally for one agent.
     pub fn guidance_selections(&self, agent: Option<&str>) -> Vec<GuidanceSel> {
         self.session
             .guidance_selections(agent)
@@ -2197,7 +2110,7 @@ impl Engine {
     pub fn prune(&mut self) {
         drain(self.session.prune());
     }
-    /// D122: tell `agent` that the user ran a local command (no output).
+    /// Tell `agent` that the user ran a local command (no output).
     pub fn post_local_run(&self, agent: &str, run: &LocalRun) -> Result<(), String> {
         self.session
             .post_local_command(
@@ -2223,7 +2136,7 @@ impl Engine {
         }
     }
 
-    // ---- criteria and /goal (D88–D97, D110) -------------------------------
+    // ---- criteria and /goal -------------------------------
 
     /// An agent's criteria contract (empty when it set none).
     pub fn contract(&self, agent: &str) -> ContractView {
@@ -2349,13 +2262,6 @@ impl Engine {
         items: &[QItem],
         answers: &[QAnswer],
     ) -> Result<bool, String> {
-        if items.iter().all(|q| q.id.is_none()) {
-            let active = self.session.is_active();
-            self.session
-                .answer(id, answers_text(items, answers))
-                .map_err(err)?;
-            return Ok(!active && self.session.is_active());
-        }
         if items.len() != answers.len() {
             return Err("submit an answer or skip for every question".into());
         }
@@ -2444,9 +2350,9 @@ impl Engine {
     }
     /// Start a turn. Events arrive on the session subscription; the per-action
     /// receiver is drained by a task (dropping it would cancel the turn).
-    /// Attachment chips (D79) travel as `<attachment>` tags; the engine
+    /// Attachment chips travel as `<attachment>` tags; the engine
     /// imports complete tags into the session `assets/` and strips them from
-    /// the text (engine-j). Text files are inlined for every model; binaries
+    /// the text. Text files are inlined for every model; binaries
     /// need the model's modality or `file` input.
     pub fn send(&mut self, prompt: String) {
         self.apply_pending();
@@ -2511,7 +2417,7 @@ impl Engine {
             })
             .collect()
     }
-    /// Startup health check of the enabled MCP servers (D69): (server,
+    /// Startup health check of the enabled MCP servers: (server,
     /// problem) for each one that is not usable.
     ///
     /// subscribe() starts Session::mcp_health_check once on each open.
@@ -2534,11 +2440,11 @@ impl Engine {
     pub fn set_mcp_enabled(&self, name: &str, enabled: bool) -> Result<(), String> {
         self.session.set_mcp_enabled(name, enabled).map_err(err)
     }
-    /// The session title (D55): a user title, else the automatic one.
+    /// The session title: a user title, else the automatic one.
     pub fn title(&self) -> Option<String> {
         Some(self.session.title()).filter(|t| !t.trim().is_empty())
     }
-    /// Set a user title (persisted; stops automatic titling, D55). The
+    /// Set a user title (persisted; stops automatic titling). The
     /// engine emits `TitleChanged`.
     pub fn rename(&mut self, title: &str) -> Result<(), String> {
         let title: String = title.trim().chars().take(60).collect();
@@ -2561,7 +2467,7 @@ impl Engine {
             unknown_calls: t.unknown_cost_calls,
         }
     }
-    /// The session safety model (D45), persisted in `settings.json`; new
+    /// The session safety model, persisted in `settings.json`; new
     /// sessions default from `permissions.autoModel`.
     pub fn safety_model(&self) -> Option<String> {
         self.session.safety_model()
@@ -2587,7 +2493,7 @@ impl Engine {
         let secs = (chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds();
         Some(secs.max(0) as f64 / 60.0)
     }
-    /// The context meter for a session just opened (D48): the last root
+    /// The context meter for a session just opened: the last root
     /// author call's input plus its output (the reply is in context now)
     /// when it used the current model; otherwise a ~4 chars/token estimate
     /// of the current context.
@@ -2623,7 +2529,7 @@ impl Engine {
             }
             _ => None,
         });
-        // A provider-reported meter (m7) wins; without one, an unknown
+        // A provider-reported meter wins; without one, an unknown
         // provider's context stays unknown rather than estimated.
         if let Some(u) = &last
             && Some(&u.model) == model.as_ref()
@@ -2675,12 +2581,7 @@ impl Engine {
         let jobs = work.jobs.iter().filter(|j| j.kind != "task").count();
         (jobs, work.children.len())
     }
-    /// Steer a running subagent; the text reaches it at its next turn boundary.
-    #[allow(dead_code)] // Compatibility seam for frontends steering a selected child.
-    pub fn steer(&self, agent: &str, text: String) -> Result<(), String> {
-        self.session.steer(agent, text).map_err(err)
-    }
-    // ---- queued messages (D73, D74) ---------------------------------------
+    // ---- queued messages ---------------------------------------
 
     pub fn queue_effect(&self, agent: &str, class: QueueClass) -> &'static str {
         match class {
@@ -2703,23 +2604,22 @@ impl Engine {
         Ok(QueueOutcome::Held(id))
     }
     /// Editing removes the old entry; submitting creates a new ID at the tail.
-    pub fn requeue(&mut self, item: Queued, _at: usize) {
-        if let Err(error) = self.queue_message(&item.agent, item.text, item.class) {
-            eprintln!("could not requeue message: {error}");
-        }
+    pub fn requeue(&mut self, item: Queued, _at: usize) -> Result<(), String> {
+        self.queue_message(&item.agent, item.text, item.class)
+            .map(|_| ())
     }
     pub fn reclassify(&mut self, id: u64, class: QueueClass) -> Result<(), String> {
         self.session.reclassify(id, class.config()).map_err(err)
     }
     pub fn unqueue(&mut self, id: u64) -> Option<(Queued, usize)> {
         let (item, at) = self.session.unqueue(id).ok()??;
-        Some((queued_view(item), at))
+        Some((queued_view(item, &self.assets_dir()), at))
     }
     pub fn queued(&self, agent: &str) -> Vec<Queued> {
         self.session
             .queued_messages(agent)
             .into_iter()
-            .map(queued_view)
+            .map(|item| queued_view(item, &self.assets_dir()))
             .collect()
     }
     pub fn queued_count(&self) -> usize {
@@ -2792,11 +2692,11 @@ impl Engine {
     }
 }
 
-fn queued_view(item: code_engine::QueuedMessage) -> Queued {
+fn queued_view(item: code_engine::QueuedMessage, assets: &Path) -> Queued {
     Queued {
         id: item.id,
         agent: item.agent,
-        text: item.text,
+        text: user_wire(&item.text, &item.attachments, assets),
         class: QueueClass::from_config(item.class),
     }
 }
@@ -2944,9 +2844,9 @@ fn replay_items(agent: &str, envelopes: &[EventEnvelope], assets: &Path) -> Vec<
             HistoryEvent::Compaction { summary } if !spoke => {
                 out.push(ReplayItem::Compacted(summary_text(summary)))
             }
-            HistoryEvent::Answer { text, .. } => {
-                out.push(ReplayItem::Notice(format!("answered: {text}")))
-            }
+            HistoryEvent::QuestionsAnswered { answers, .. } => out.push(ReplayItem::Notice(
+                format!("answered: {}", serde_json::to_string(answers).unwrap()),
+            )),
             HistoryEvent::ModelSwitch { from, to, reason } => out.push(ReplayItem::Switched {
                 from: from.clone(),
                 to: to.clone(),
@@ -3032,7 +2932,7 @@ fn error_kind(kind: &ErrorKind) -> &'static str {
     }
 }
 
-/// Tool output without appended D121 guidance notices (a
+/// Tool output without appended guidance notices (a
 /// `<system-message>` wrapping `<guidance-selection>`): the transcript shows
 /// them as their own row.
 pub fn strip_guidance(s: String) -> String {
@@ -3062,7 +2962,7 @@ pub fn strip_guidance(s: String) -> String {
     out
 }
 
-/// Text without D99 `<ctxPercentage id="R">N</ctxPercentage id="R">` tags:
+/// Text without `<ctxPercentage id="R">N</ctxPercentage id="R">` tags:
 /// they are for the model; the status line shows context use.
 fn strip_ctx(s: &str) -> String {
     const OPEN: &str = "<ctxPercentage id=\"";
@@ -3084,7 +2984,7 @@ fn strip_ctx(s: &str) -> String {
 }
 
 /// A compaction summary without its injection wrapper: the old context's
-/// copy and the new context's head carry different random ids (D52), so
+/// copy and the new context's head carry different random ids, so
 /// the bare text identifies the summary and is what is shown.
 fn summary_text(s: &str) -> String {
     let t = s.trim();
@@ -3250,7 +3150,6 @@ fn translate(event: EngineEvent) -> Option<UiEvent> {
             to: message.agent,
             text: strip_ctx(&message.text),
         },
-        EngineEvent::Todo { items } => UiEvent::Todo(todo_items(&items)),
         EngineEvent::Usage { usage } => {
             if usage.partial {
                 return None;
@@ -3331,9 +3230,9 @@ fn translate(event: EngineEvent) -> Option<UiEvent> {
             text,
         },
         EngineEvent::Committed { envelope } => match envelope.event {
-            HistoryEvent::Answer { id, .. }
-            | HistoryEvent::QuestionsAnswered { id, .. }
-            | HistoryEvent::QuestionDiscussed { id } => UiEvent::Answered(id),
+            HistoryEvent::QuestionsAnswered { id, .. } | HistoryEvent::QuestionDiscussed { id } => {
+                UiEvent::Answered(id)
+            }
             HistoryEvent::QuestionForkAnswered { id, summary, .. } => UiEvent::ForkAnswered {
                 id,
                 asker: envelope.agent_id,
@@ -3432,4 +3331,133 @@ fn translate(event: EngineEvent) -> Option<UiEvent> {
             ok: outcome.succeeded,
         },
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) struct TestDir(pub PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(crate) fn engine() -> (TestDir, Engine, EventRx) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "code-tui-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let directories = Directories {
+            config: path.join("config"),
+            data: path.join("data"),
+            cache: path.join("cache"),
+        };
+        std::fs::create_dir_all(&directories.config).unwrap();
+        std::fs::write(
+            directories.config.join("config.json"),
+            r#"{"skillsDirs":[]}"#,
+        )
+        .unwrap();
+        let store = ConfigStore::load(directories.clone()).unwrap();
+        let session =
+            Session::create(store.clone(), path.clone(), SessionOptions::default()).unwrap();
+        let (_, rx) = mpsc::unbounded_channel();
+        let engine = Engine {
+            directories,
+            store,
+            session,
+            cwd: path.clone(),
+            pending_mode: None,
+            retired: vec![],
+            deferred_model: None,
+            discovery: None,
+            model_selection: None,
+            terminal_issue: None,
+        };
+        (TestDir(path), engine, rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_attachment_survives_composer_edit_and_replay() {
+        let assets = Path::new("/session/assets");
+        let item = code_engine::QueuedMessage {
+            id: 7,
+            agent: "root".into(),
+            text: "look here".into(),
+            attachments: vec![code_engine::schema::Attachment {
+                path: "image.png".into(),
+                name: "image.png".into(),
+                mime_type: "image/png".into(),
+            }],
+            class: code_config::QueueClass::NextTurn,
+        };
+        let queued = queued_view(item.clone(), assets);
+        let mut composer = crate::composer::Composer::default();
+        composer.set_wire(&queued.text);
+        assert_eq!(composer.buf.blocks.len(), 1);
+        assert_eq!(composer.buf.blocks[0].full, "/session/assets/image.png");
+        assert_eq!(composer.buf.blocks[0].attach.as_deref(), Some("image"));
+        assert_eq!(
+            crate::paste::attachments(&composer.wire()),
+            crate::paste::attachments(&user_wire(&item.text, &item.attachments, assets))
+        );
+        composer.buf.insert(" edited");
+        let wire = composer.wire();
+        composer.set_wire(&wire);
+        assert_eq!(composer.buf.blocks.len(), 1);
+        assert_eq!(composer.buf.blocks[0].full, "/session/assets/image.png");
+        assert!(composer.text().ends_with(" edited"));
+    }
+
+    #[test]
+    fn queued_status_uses_current_colon_number_format() {
+        for (n, suffix) in [
+            (1, "st"),
+            (2, "nd"),
+            (3, "rd"),
+            (4, "th"),
+            (11, "th"),
+            (12, "th"),
+            (13, "th"),
+            (21, "st"),
+        ] {
+            assert_eq!(
+                status_text(&format!("queued:{n}")),
+                format!("queued ({n}{suffix})")
+            );
+        }
+        assert_eq!(status_text("running"), "running");
+        assert_eq!(status_text("queued 2"), "queued 2");
+    }
+
+    #[test]
+    fn structured_questions_keep_engine_ids_kinds_and_options() {
+        let q: code_engine::schema::QuestionRecord = serde_json::from_value(serde_json::json!({
+            "id":"set", "asker":"root", "recipient":null, "breadcrumb":"root", "text":"summary", "answer":null, "note":null,
+            "questions":[{"id":"q1", "text":"Pick", "kind":"choice", "options":[{"label":"A"}], "multiSelect":true},
+                {"id":"q2", "text":"Why?", "kind":"text"}]
+        })).unwrap();
+        let items = structured_items(&q);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id.as_deref(), Some("q1"));
+        assert!(matches!(items[0].kind, QKind::Choice));
+        assert!(items[0].multi);
+        assert_eq!(items[0].options[0].label, "A");
+        assert_eq!(items[1].text, "Why?");
+    }
 }

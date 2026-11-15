@@ -383,7 +383,7 @@ struct SafetyVerdict {
 }
 fn operation_key(op: &PreparedOperation) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(serde_json::to_vec(op).unwrap()))
+    crate::hex::hex(&Sha256::digest(serde_json::to_vec(op).unwrap()))
 }
 fn needs_review(op: &PreparedOperation) -> bool {
     matches!(

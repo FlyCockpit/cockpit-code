@@ -1,4 +1,4 @@
-//! D144/D140 terminal adapter. Metadata ([`TermInfo`]) is ordinary frontend
+//! Terminal adapter. Metadata ([`TermInfo`]) is ordinary frontend
 //! data; terminal bytes travel only through [`TermMsg`] on their own channel,
 //! never as a [`super::UiEvent`], and nothing here formats, logs or stores
 //! them. User keystrokes go to the PTY through one ordered worker
@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 #[derive(Clone, Debug)]
 pub struct TermInfo {
     pub id: String,
-    /// A private user terminal (D144); false is a D140 tty job, whose output
+    /// A private user terminal; false is a tty job, whose output
     /// the agent reads.
     pub user: bool,
     pub agent: String,
@@ -97,7 +97,7 @@ pub struct JobPage {
 }
 
 impl Engine {
-    /// Opt this session into private user terminals (D144). Called at open
+    /// Opt this session into private user terminals. Called at open
     /// and after every switch, before the first turn.
     pub(super) fn enable_terminals(&self) -> Result<(), String> {
         self.session.enable_user_terminals().map_err(|e| e.message)

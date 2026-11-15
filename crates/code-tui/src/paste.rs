@@ -6,7 +6,7 @@
 //! messages show the chip instead of the text, and replay re-collapses
 //! chips by parsing the stored tags.
 //!
-//! Attachment chips (D79) ride the same mechanism:
+//! Attachment chips ride the same mechanism:
 //! `<attachment id="R" kind="image">/abs/path</attachment id="R">`.
 use std::io::Read;
 
@@ -30,7 +30,7 @@ pub struct Block {
     /// Display number (`paste #n`, `image #n`), one-based and never reused
     /// in a buffer (pastes and attachments count separately).
     pub n: u32,
-    /// An attachment chip (D79): its kind (image, pdf, audio, video, file);
+    /// An attachment chip: its kind (image, pdf, audio, video, file);
     /// `full` is then the absolute path.
     pub attach: Option<String>,
     /// The active model can't take this attachment's input type.

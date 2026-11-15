@@ -1,4 +1,4 @@
-//! D118 `@` tagging: a popup like the slash menu while the composer's word
+//! `@` tagging: a popup like the slash menu while the composer's word
 //! at the cursor is `@…`.
 //!
 //! - With a slash (or `~`, `/`, `.`) it completes one directory at a time,

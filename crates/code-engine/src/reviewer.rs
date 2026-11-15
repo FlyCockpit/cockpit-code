@@ -71,13 +71,13 @@ pub(crate) async fn check(
         model.model_id,
         cwd.display(),
         format_args!(
-            "{}:{:x}",
+            "{}:{}",
             matches!(category, "write" | "edit"),
-            Sha256::digest(prompt.as_bytes())
+            crate::hex::hex(&Sha256::digest(prompt.as_bytes()))
         )
     );
     let current_guidance = guidance(cwd);
-    let prompt_hash = format!("{:x}", Sha256::digest(prompt.as_bytes()));
+    let prompt_hash = crate::hex::hex(&Sha256::digest(prompt.as_bytes()));
     let library = libraries.0.entry(key).or_insert_with(|| Library {
         prompt: prompt.into(),
         prompt_hash: prompt_hash.clone(),

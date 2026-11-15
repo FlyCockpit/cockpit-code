@@ -101,7 +101,7 @@ fn status_icon(status: &str, tick: usize) -> (&'static str, Color) {
         "waiting" => ("◌", t.yellow),
         s if s.starts_with("queued") => ("⋯", t.fog),
         "done" => ("✓", t.green),
-        // A roadblocked child waits for its parent to pivot, stop or override (D91).
+        // A roadblocked child waits for its parent to pivot, stop or override.
         "roadblocked" => ("⊘", t.keyword),
         "failed" | "killed" | "interrupted" => ("✗", t.red),
         _ => ("·", t.fog),
@@ -165,7 +165,7 @@ impl App {
         } else {
             "message · / for commands · shift+enter newline"
         };
-        // Attachment chips the active model can't take show in yellow (D79).
+        // Attachment chips the active model can't take show in yellow.
         let inputs = self.active_info().map(|m| m.input.clone());
         for b in &mut self.composer.buf.blocks {
             b.warn = match (&b.attach, &inputs) {
@@ -200,10 +200,10 @@ impl App {
             height: trans_h,
             ..area
         };
-        // The terminal sidebar (D144): a right column when wide, else it
+        // The terminal sidebar: a right column when wide, else it
         // covers the chat area.
         let term_panel = self.term_layout(&mut trans_area, self.wide);
-        // Side column: goals only (D50).
+        // Side column: goals only.
         self.goals_area = Rect::default();
         if self.wide && self.show_goals && term_panel.is_none() {
             let side = Rect {
@@ -409,8 +409,8 @@ impl App {
         self.paint_hover(frame);
     }
 
-    /// Hover: the topmost hit under the pointer gets the one hover rule
-    /// (D63): chips get the wash, accent and bold; rows get a full-width
+    /// Hover: the topmost hit under the pointer gets the one hover rule:
+    /// chips get the wash, accent and bold; rows get a full-width
     /// wash with brightened text. A target spread over several rects (the
     /// rows of a past user message) is washed as a whole.
     fn paint_hover(&mut self, frame: &mut Frame) {
@@ -541,7 +541,7 @@ impl App {
             .collect()
     }
 
-    /// Agents blocked on a question to the user (D51).
+    /// Agents blocked on a question to the user.
     pub(super) fn blocked_agents(&self) -> Vec<String> {
         self.prompts
             .iter()
@@ -613,7 +613,7 @@ impl App {
             ));
             x += w;
         }
-        // D120: the viewed child's write scope and subscriptions.
+        // The viewed child's write scope and subscriptions.
         if let Some(id) = self.view.clone() {
             let names = |v: &[std::path::PathBuf]| {
                 v.iter()
@@ -653,7 +653,7 @@ impl App {
             (0, b) => format!("↓ {b} more "),
             (a, b) => format!("↑{a} ↓{b} more "),
         };
-        // D131: actions on the viewed child, right-aligned on the crumb row.
+        // Actions on the viewed child, right-aligned on the crumb row.
         let mut chips: Vec<(String, ui::StripAct)> = vec![];
         if let Some(id) = self.view.clone()
             && let Some(a) = self.tree.get(&id)
@@ -807,7 +807,7 @@ impl App {
         );
     }
 
-    /// The criteria side panel: the viewed agent's contract (D110).
+    /// The criteria side panel: the viewed agent's contract.
     fn draw_goals(&mut self, frame: &mut Frame, area: Rect) {
         let t = theme();
         let inner_w = area.width.saturating_sub(5) as usize;
@@ -866,7 +866,7 @@ impl App {
         frame.render_widget(Clear, area);
         frame.render_widget(Paragraph::new(lines).block(block), area);
         self.goals_area = area;
-        // Finding locations (D126) open in the pager.
+        // Finding locations open in the pager.
         for l in &links {
             let row = links_from + l.row;
             if row < self.goals_scroll || row >= self.goals_scroll + view {
@@ -899,7 +899,7 @@ impl App {
         );
     }
 
-    /// The `@` popup (D118): like the slash menu, paths instead of commands.
+    /// The `@` popup: like the slash menu, paths instead of commands.
     fn draw_mentions(&mut self, frame: &mut Frame, comp: Rect) {
         if !self.mention_open() || !self.slash_matches().is_empty() {
             return;
@@ -912,7 +912,7 @@ impl App {
         }
         let sel = self.mentions.sel.min(items.len() - 1);
         let shown = items.len().min(room);
-        // The wheel scrolls the popup (D130); keys bring the selection back.
+        // The wheel scrolls the popup; keys bring the selection back.
         let first = self
             .mention_top
             .unwrap_or((sel + 1).saturating_sub(shown))
@@ -970,7 +970,7 @@ impl App {
         );
     }
 
-    /// The slash menu: built-ins and skills (D109), scrolling with the
+    /// The slash menu: built-ins and skills, scrolling with the
     /// selection when they outnumber the rows above the composer.
     fn draw_slash(&mut self, frame: &mut Frame, comp: Rect) {
         let t = theme();
@@ -1111,7 +1111,7 @@ impl App {
             );
             push(&mut spans, sep.clone(), None);
         }
-        // `/exclusive` locks the model (D67).
+        // `/exclusive` locks the model.
         let model = match self.engine.exclusive() {
             Some(e) if e.block_remote => format!("⊙ {model} · exclusive, local"),
             Some(_) => format!("⊙ {model} · exclusive"),
@@ -1122,7 +1122,7 @@ impl App {
             Span::styled(model, t.bold()),
             Some(StatusSeg::Model),
         );
-        // D119: a backup is serving this turn.
+        // A backup is serving this turn.
         if let Some(b) = &self.backup_model {
             push(
                 &mut spans,
@@ -1173,7 +1173,7 @@ impl App {
             .1
             .or_else(|| meter_info.and_then(|model| model.context_window));
         let tilde = if estimated { "~" } else { "" };
-        // A provider that reports no context (m7): no window is implied.
+        // A provider that reports no context: no window is implied.
         let unknown =
             context_unknown || (ctx.1.is_none() && meter_info.is_some_and(|i| i.context_unknown));
         match window {
@@ -1230,7 +1230,7 @@ impl App {
                 Some(StatusSeg::Quota),
             );
         }
-        // The goal marker (D93), else root's criteria count.
+        // The goal marker, else root's criteria count.
         if let Some(g) = &self.goal {
             let style = super::goal::goal_style(g);
             push(&mut spans, sep.clone(), None);
@@ -1282,7 +1282,7 @@ impl App {
                 Some(StatusSeg::Jobs),
             );
         }
-        // D144: open terminals (click: show or hide the sidebar).
+        // Open terminals (click: show or hide the sidebar).
         if let Some((text, waiting)) = self.term_status() {
             push(&mut spans, sep.clone(), None);
             push(
@@ -1298,7 +1298,7 @@ impl App {
                 Some(StatusSeg::Terminals),
             );
         }
-        // D128: open decisions made on the user's behalf (click: /decisions).
+        // Open decisions made on the user's behalf (click: /decisions).
         if self.decision_count > 0 {
             push(&mut spans, sep.clone(), None);
             push(
@@ -1314,7 +1314,7 @@ impl App {
                 Some(StatusSeg::Decisions),
             );
         }
-        // D134: a cancel holds root's mail until the next message.
+        // A cancel holds root's mail until the next message.
         if self.mail_held && !self.running {
             push(&mut spans, sep.clone(), None);
             push(
@@ -1610,7 +1610,7 @@ impl App {
         }
         let view_h = area.height as usize;
         let (top, scroll) = top_for(view_h, scroll);
-        // D103: entries more than a few screens away keep only their height.
+        // Entries more than a few screens away keep only their height.
         let margin = view_h.max(10) * 4;
         for i in 0..n {
             let (a, b) = (starts[i], starts[i] + lens[i]);
@@ -1955,7 +1955,7 @@ impl App {
         for (model, s) in &self.stats {
             let info = self.catalog.get(model);
             let label = info.map_or(model.clone(), |m| m.label.clone());
-            // A subscription without rates costs nothing extra per call (m7).
+            // A subscription without rates costs nothing extra per call.
             let subscription =
                 info.is_some_and(|m| m.subscription) && s.unknown_calls == 0 && s.known_cost == 0.0;
             models.push((
@@ -1975,12 +1975,12 @@ impl App {
         }
         let mut agents = vec![("root".to_string(), self.engine.agent_totals("root"))];
         // Automatic titles run on a hidden fork with their own usage,
-        // recorded under the synthetic agent `auto-title` (D55).
+        // recorded under the synthetic agent `auto-title`.
         agents.push((
             "auto-title".to_string(),
             self.engine.agent_totals("auto-title"),
         ));
-        // The goal review panel's evaluator and skeptic (D96).
+        // The goal review panel's evaluator and skeptic.
         let review = self.engine.goal_review_totals();
         if review.calls > 0 || self.goal.is_some() {
             agents.push(("goal review".to_string(), review));

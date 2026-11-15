@@ -50,7 +50,7 @@ pub struct FrozenContext {
     pub offered_tools: Option<Vec<tools::ToolDefinition>>,
     #[serde(default)]
     pub model_tools: BTreeMap<String, Vec<tools::ToolDefinition>>,
-    /// D137 callable catalog, frozen separately from native advertisement.
+    /// Callable catalog, frozen separately from native advertisement.
     #[serde(default)]
     pub offered_catalog: Option<Vec<tools::ToolDefinition>>,
     #[serde(default)]
@@ -433,8 +433,19 @@ pub(crate) fn skill_metadata(
         if front.trim().is_empty() {
             Metadata::default()
         } else {
-            serde_yaml_ng::from_str::<Metadata>(&front)
-                .map_err(|e| EngineError::bad(format!("invalid YAML frontmatter: {e}")))?
+            serde_saphyr::from_str_with_options::<Metadata>(
+                &front,
+                serde_saphyr::options! {
+                    ignore_binary_tag_for_string: true,
+                    merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                    duplicate_keys: serde_saphyr::DuplicateKeyPolicy::PassThrough,
+                    strict_booleans: true,
+                    leading_zero_numbers_as_strings: true,
+                    underscored_numbers_as_strings: true,
+                    non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+                },
+            )
+            .map_err(|e| EngineError::bad(format!("invalid YAML frontmatter: {e}")))?
         }
     } else {
         Metadata::default()
@@ -456,9 +467,76 @@ pub(crate) struct BoundaryState {
     pub frozen: Option<FrozenContext>,
     pub observed_hashes: Option<BTreeMap<PathBuf, Option<String>>>,
     pub external_files: String,
-    pub todos: String,
     pub budget_bucket: u8,
     pub date: String,
     pub reload_error: Option<String>,
     pub announced_capabilities: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skill_metadata;
+
+    #[test]
+    fn skill_binary_tags_keep_literal_string_text() {
+        assert_eq!(
+            skill_metadata(
+                "---\nname: !!binary SGVsbG8=\ndescription: !!binary V29ybGQ=\n---\nbody",
+                "fallback"
+            )
+            .unwrap(),
+            ("SGVsbG8=".into(), "V29ybGQ=".into(), false)
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_retains_typed_strings_nulls_and_block_scalars() {
+        let body = "---\r\nname: 'quoted: skill'\r\ndescription: |\r\n  first\r\n  second\r\ndisable-model-invocation: true\r\nextra: {list: [one, 2, true, null], nested: {key: value}}\r\n---\r\nbody";
+        assert_eq!(
+            skill_metadata(body, "fallback").unwrap(),
+            ("quoted: skill".into(), "first\nsecond\n".into(), true)
+        );
+        for body in [
+            "---\n---\nbody",
+            "---\nname: null\ndescription: ~\n---\nbody",
+            "body",
+        ] {
+            assert_eq!(
+                skill_metadata(body, "fallback").unwrap(),
+                ("fallback".into(), "".into(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn skill_frontmatter_keeps_yaml_12_booleans_and_literal_merge_keys() {
+        let body = "---\ndefaults: &defaults {name: merged}\n<<: *defaults\nextra: .inf\n---\nbody";
+        assert_eq!(
+            skill_metadata(body, "fallback").unwrap(),
+            ("fallback".into(), "".into(), false)
+        );
+        assert!(
+            skill_metadata("---\ndisable-model-invocation: yes\n---\nbody", "fallback").is_err()
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_supports_aliases_and_rejects_invalid_yaml() {
+        assert_eq!(
+            skill_metadata(
+                "---\nname: &name aliased\ndescription: *name\n---\nbody",
+                "fallback"
+            )
+            .unwrap(),
+            ("aliased".into(), "aliased".into(), false)
+        );
+        for body in [
+            "---\nname: [\n---\nbody",
+            "---\nname: x\nname: y\n---\nbody",
+            "---\nname: *missing\n---\nbody",
+            "---\nname: x",
+        ] {
+            assert!(skill_metadata(body, "fallback").is_err(), "{body}");
+        }
+    }
 }

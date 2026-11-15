@@ -24,25 +24,27 @@ impl McpTimeouts {
 pub fn client(timeouts: McpTimeouts, endpoint: &str) -> Result<reqwest::Client> {
     let endpoint = validate_remote_endpoint(endpoint)?;
     let redirect_origin = endpoint.clone();
-    reqwest::Client::builder()
-        // Manager deadlines bound initialization/calls; an SSE reader has no total lifetime timeout.
-        .connect_timeout(timeouts.connect.min(timeouts.request))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            let target = attempt.url().clone();
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                return attempt.error(std::io::Error::other(format!(
-                    "MCP redirect chain exceeded {MAX_REDIRECTS} redirects before {target}"
-                )));
-            }
-            if !same_origin(&redirect_origin, &target) {
-                return attempt.error(std::io::Error::other(format!(
-                    "refusing MCP redirect to different origin or scheme: {target}"
-                )));
-            }
-            attempt.follow()
-        }))
-        .build()
-        .context("building MCP HTTP client")
+    crate::http_client(|| {
+        let redirect_origin = redirect_origin.clone();
+        reqwest::Client::builder()
+            // Manager deadlines bound initialization/calls; an SSE reader has no total lifetime timeout.
+            .connect_timeout(timeouts.connect.min(timeouts.request))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                let target = attempt.url().clone();
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    return attempt.error(std::io::Error::other(format!(
+                        "MCP redirect chain exceeded {MAX_REDIRECTS} redirects before {target}"
+                    )));
+                }
+                if !same_origin(&redirect_origin, &target) {
+                    return attempt.error(std::io::Error::other(format!(
+                        "refusing MCP redirect to different origin or scheme: {target}"
+                    )));
+                }
+                attempt.follow()
+            }))
+    })
+    .context("building MCP HTTP client")
 }
 
 pub(crate) fn validate_remote_endpoint(endpoint: &str) -> Result<Url> {

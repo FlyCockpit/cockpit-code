@@ -7,6 +7,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 const ARGV_LIMIT: usize = 64 * 1024;
 const LINE_LIMIT: usize = 4 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
+/// All JSONL stdout of one invocation (text, reasoning, details, tool calls
+/// are retained in memory): twice the assistant-text cap.
+const JSONL_TOTAL_LIMIT: u64 = 2 * crate::spill::TEXT_CAP;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -103,8 +106,37 @@ fn argument(template: &str, vars: &BTreeMap<String, String>) -> Result<Option<St
 fn io_error(_: impl std::fmt::Display) -> EngineError {
     EngineError::bad("command provider I/O failed")
 }
+/// A text `outputFile` becomes the assistant message, which has to live in
+/// memory and in the session journal, so unlike generated media it cannot
+/// spill to a file: more than `cap` bytes is refused instead of read.
+async fn read_text_output(path: &std::path::Path, cap: u64) -> Result<String> {
+    // Nonblocking, so a FIFO left at the path cannot hang the turn.
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .await
+        .map_err(io_error)?;
+    if !file.metadata().await.map_err(io_error)?.is_file() {
+        return Err(EngineError::bad(
+            "command provider outputFile is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(io_error)?;
+    if bytes.len() as u64 > cap {
+        return Err(EngineError::bad(format!(
+            "command provider outputFile exceeds {} MiB of text",
+            cap >> 20
+        )));
+    }
+    String::from_utf8(bytes).map_err(io_error)
+}
 fn hash(value: &Value) -> String {
-    format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
+    crate::hex::hex(&Sha256::digest(value.to_string().as_bytes()))
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -125,6 +157,9 @@ struct Invocation {
     state_file: Option<PathBuf>,
 }
 fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
+    if request.conversation_id.trim().is_empty() {
+        return Err(EngineError::bad("conversation_id must be nonempty"));
+    }
     let config = model
         .provider
         .connection_command()
@@ -221,10 +256,10 @@ fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
     let state_file = if request.kind == "agent" {
         request.command_context.state_dir.as_ref().map(|root| {
             root.join(format!(
-                "{:x}.json",
-                Sha256::digest(
+                "{}.json",
+                crate::hex::hex(&Sha256::digest(
                     format!("{}:{}", request.conversation_identity(), model.id()).as_bytes()
-                )
+                ))
             ))
         })
     } else {
@@ -350,6 +385,10 @@ fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
 
 pub(crate) struct ProcessGroup(pub(crate) u32);
 impl ProcessGroup {
+    pub(crate) fn new(pgid: u32) -> Self {
+        crate::process_groups::track(pgid as i32);
+        Self(pgid)
+    }
     fn signal(&self, signal: i32) {
         #[cfg(unix)]
         unsafe {
@@ -378,12 +417,21 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.signal(libc::SIGKILL);
+        crate::process_groups::forget(self.0 as i32);
     }
 }
 
-fn text(state: &mut State, delta: &str, tx: &EventSender) {
+/// Assistant text from a command provider (stdout, JSONL `text` events or
+/// the outputFile) is held in memory, so it is capped like the outputFile.
+fn text(state: &mut State, delta: &str, tx: &EventSender) -> Result<()> {
     if delta.is_empty() {
-        return;
+        return Ok(());
+    }
+    if (state.text.len() + delta.len()) as u64 > crate::spill::TEXT_CAP {
+        return Err(EngineError::bad(format!(
+            "command provider text exceeds {} MiB",
+            crate::spill::TEXT_CAP >> 20
+        )));
     }
     state.semantic = true;
     state.activity += 1;
@@ -391,6 +439,7 @@ fn text(state: &mut State, delta: &str, tx: &EventSender) {
     let _ = tx.send(EngineEvent::Text {
         delta: delta.into(),
     });
+    Ok(())
 }
 
 fn event(
@@ -420,12 +469,19 @@ fn event(
                 conversation.provider_id = id.into();
             }
         }
-        "text" => text(state, string("delta")?, tx),
+        "text" => text(state, string("delta")?, tx)?,
         "reasoning" => {
             if let Some(details) = v.get("details") {
                 let details = details
                     .as_array()
                     .ok_or_else(|| EngineError::bad("reasoning details must be an array"))?;
+                state.details_cost += details.iter().map(crate::spill::value_cost).sum::<u64>();
+                if state.details_cost > crate::spill::TEXT_CAP {
+                    return Err(EngineError::bad(format!(
+                        "command provider reasoning details exceed {} MiB",
+                        crate::spill::TEXT_CAP >> 20
+                    )));
+                }
                 state.semantic |= !details.is_empty();
                 state
                     .reasoning
@@ -512,10 +568,19 @@ async fn read_stdout(
     let mut pending = Vec::new();
     let mut buf = vec![0; 8192];
     let mut warned = false;
+    let mut total = 0u64;
+    let mut scanned = 0;
     loop {
         let n = stdout.read(&mut buf).await.map_err(io_error)?;
         if n == 0 {
             break;
+        }
+        total += n as u64;
+        if !model.command_text() && total > JSONL_TOTAL_LIMIT {
+            return Err(EngineError::bad(format!(
+                "command provider JSONL output exceeds {} MiB",
+                JSONL_TOTAL_LIMIT >> 20
+            )));
         }
         pending.extend_from_slice(&buf[..n]);
         if model.command_text() {
@@ -524,16 +589,24 @@ async fn read_stdout(
                 Err(e) if e.error_len().is_none() => e.valid_up_to(),
                 Err(_) => return Err(EngineError::bad("command stdout is not UTF-8")),
             };
-            text(state, std::str::from_utf8(&pending[..valid]).unwrap(), tx);
+            text(state, std::str::from_utf8(&pending[..valid]).unwrap(), tx)?;
             pending.drain(..valid);
         } else {
-            while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+            // Only bytes not yet searched are scanned for the newline, so a
+            // long line costs linear time rather than a rescan per read.
+            while let Some(end) = pending[scanned..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|i| i + scanned)
+            {
                 if end > LINE_LIMIT {
                     return Err(EngineError::bad("command JSONL line exceeds 4 MiB"));
                 }
                 let line: Vec<_> = pending.drain(..=end).collect();
+                scanned = 0;
                 parse_line(&line, model, request, state, tx, conversation, &mut warned)?;
             }
+            scanned = pending.len();
             if pending.len() > LINE_LIMIT {
                 return Err(EngineError::bad("command JSONL line exceeds 4 MiB"));
             }
@@ -583,10 +656,35 @@ fn parse_line(
                     ),
                 });
             }
-            text(state, line, tx);
-            Ok(())
+            text(state, line, tx)
         }
     }
+}
+
+fn diagnostic_secrets(
+    configured: impl IntoIterator<Item = String>,
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> Vec<String> {
+    let mut secrets: Vec<_> =
+        configured
+            .into_iter()
+            .chain(inherited.into_iter().filter_map(|(name, value)| {
+                code_config::is_credential_name(&name).then_some(value)
+            }))
+            .filter(|value| value.len() >= 8)
+            .collect();
+    // Replace longer overlapping secrets first so a shorter value cannot expose
+    // the suffix of a longer one.
+    secrets.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    secrets.dedup();
+    secrets
+}
+
+fn redact_diagnostic(mut diagnostic: String, secrets: &[String]) -> String {
+    for secret in secrets {
+        diagnostic = diagnostic.replace(secret, "[redacted]");
+    }
+    diagnostic
 }
 
 pub(super) async fn attempt(
@@ -602,6 +700,19 @@ pub(super) async fn attempt(
         ));
     }
     let mut invocation = prepare(model, request)?;
+    let secrets = diagnostic_secrets(
+        model
+            .provider
+            .connection_command()
+            .unwrap()
+            .redaction_values
+            .iter()
+            .chain(invocation.env.values())
+            .cloned(),
+        std::env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        }),
+    );
     let mut cmd = tokio::process::Command::new(&invocation.argv[0]);
     cmd.args(&invocation.argv[1..])
         .current_dir(&invocation.cwd)
@@ -618,7 +729,7 @@ pub(super) async fn attempt(
     let mut child = cmd
         .spawn()
         .map_err(|_| EngineError::bad("could not spawn command provider (check argv/cwd)"))?;
-    let group = ProcessGroup(child.id().unwrap());
+    let group = ProcessGroup::new(child.id().unwrap());
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -707,11 +818,8 @@ pub(super) async fn attempt(
             }
         }
         if request.kind != "generate" && state.text.is_empty() && invocation.output.exists() {
-            let bytes = tokio::fs::read(&invocation.output)
-                .await
-                .map_err(io_error)?;
-            let content = std::str::from_utf8(&bytes).map_err(io_error)?;
-            text(state, content, tx);
+            let content = read_text_output(&invocation.output, crate::spill::TEXT_CAP).await?;
+            text(state, &content, tx)?;
         }
         state.done = true;
         state.stop_reason = "end_turn".into();
@@ -723,11 +831,8 @@ pub(super) async fn attempt(
         && state.calls.is_empty()
         && invocation.output.exists()
     {
-        let bytes = tokio::fs::read(&invocation.output)
-            .await
-            .map_err(io_error)?;
-        let content = std::str::from_utf8(&bytes).map_err(io_error)?;
-        text(state, content, tx);
+        let content = read_text_output(&invocation.output, crate::spill::TEXT_CAP).await?;
+        text(state, &content, tx)?;
     }
     if result.is_ok() && !state.done {
         result = Err(EngineError::bad(
@@ -738,11 +843,11 @@ pub(super) async fn attempt(
         && !cancel.is_cancelled()
         && !stderr_tail.is_empty()
     {
-        let mut diagnostic = String::from_utf8_lossy(&stderr_tail).into_owned();
-        for secret in invocation.env.values().filter(|s| s.len() >= 8) {
-            diagnostic = diagnostic.replace(secret, "[redacted]");
-        }
+        let diagnostic = String::from_utf8_lossy(&stderr_tail);
         error.message.push_str(&format!("\nstderr: {diagnostic}"));
+    }
+    if let Err(error) = &mut result {
+        error.message = redact_diagnostic(std::mem::take(&mut error.message), &secrets);
     }
     if result.is_ok()
         && let Some(path) = invocation.state_file
@@ -779,4 +884,273 @@ pub(super) async fn attempt(
         });
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulated_command_text_is_capped() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State::default();
+        let chunk = "x".repeat(1 << 20);
+        for _ in 0..crate::spill::TEXT_CAP >> 20 {
+            text(&mut state, &chunk, &tx).unwrap();
+        }
+        assert_eq!(
+            text(&mut state, "y", &tx).unwrap_err().message,
+            "command provider text exceeds 64 MiB"
+        );
+        assert_eq!(state.text.len() as u64, crate::spill::TEXT_CAP);
+    }
+
+    #[tokio::test]
+    async fn text_output_file_is_read_up_to_the_text_cap_and_refused_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.txt");
+        let cap = 1 << 20;
+        let text = "é".repeat(cap as usize / 2);
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(read_text_output(&path, cap).await.unwrap(), text);
+        std::fs::write(&path, format!("{text}x")).unwrap();
+        let error = read_text_output(&path, cap).await.unwrap_err();
+        assert_eq!(
+            error.message,
+            "command provider outputFile exceeds 1 MiB of text"
+        );
+        std::fs::write(&path, b"\xff").unwrap();
+        assert_eq!(
+            read_text_output(&path, cap).await.unwrap_err().message,
+            "command provider I/O failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_errors_preserve_noncredential_expansions_and_redact_explicit_env() {
+        let expanded = std::env::var("PATH").unwrap();
+        assert!(expanded.len() >= 8);
+        for (script, output) in [
+            (
+                r#"read -r input; printf '%s %s %s' "$1" "$input" "$EXPLICIT" >&2; exit 1"#,
+                "text",
+            ),
+            (
+                r#"printf '{"type":"error","message":"expanded=%s explicit=%s"}\n' "$1" "$EXPLICIT""#,
+                "jsonl",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("providers")).unwrap();
+            let provider = json!({"type":"command", "command":{
+                "argv":["sh", "-c", script, "adapter", "${PATH}"],
+                "stdin":"${PATH}\n", "output":output,
+                "env":{"EXPLICIT":"explicit-secret-value"}
+            }, "models":{"m":{}}});
+            std::fs::write(root.path().join("providers/p.json"), provider.to_string()).unwrap();
+            let store = code_config::ConfigStore::load(code_config::Directories {
+                config: root.path().into(),
+                data: root.path().into(),
+                cache: root.path().join("cache"),
+            })
+            .unwrap();
+            assert!(store.snapshot().errors.is_empty());
+            let model = Model {
+                client: crate::http_client(Client::builder).unwrap(),
+                provider: store.snapshot().providers["p"].clone(),
+                config: store.snapshot().providers["p"].models["m"].clone(),
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                effort: None,
+            };
+            let mut request: PreparedRequest =
+                serde_json::from_value(super::super::tests::request_value()).unwrap();
+            request.body = serde_json::to_vec(&json!({"messages":[]})).unwrap();
+            request.command_context.cwd = root.path().into();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let error = attempt(
+                &model,
+                &request,
+                &tx,
+                &CancellationToken::new(),
+                &mut State::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains(&expanded));
+            assert!(!error.message.contains("explicit-secret-value"));
+            assert!(error.message.contains("[redacted]"));
+            if output == "text" {
+                assert!(error.message.contains("stderr:"));
+            }
+        }
+    }
+
+    /// Runs a JSONL command provider whose stdout comes from `script`
+    /// (stdin is drained first) and returns its error.
+    async fn jsonl_script_error(script: impl FnOnce(&std::path::Path) -> String) -> EngineError {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("providers")).unwrap();
+        let script = format!("cat > /dev/null; {}", script(root.path()));
+        let provider = json!({"type":"command", "command":{
+            "argv":["sh", "-c", script], "output":"jsonl",
+        }, "models":{"m":{}}});
+        std::fs::write(root.path().join("providers/p.json"), provider.to_string()).unwrap();
+        let store = code_config::ConfigStore::load(code_config::Directories {
+            config: root.path().into(),
+            data: root.path().into(),
+            cache: root.path().join("cache"),
+        })
+        .unwrap();
+        let model = Model {
+            client: crate::http_client(Client::builder).unwrap(),
+            provider: store.snapshot().providers["p"].clone(),
+            config: store.snapshot().providers["p"].models["m"].clone(),
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            effort: None,
+        };
+        let mut request: PreparedRequest =
+            serde_json::from_value(super::super::tests::request_value()).unwrap();
+        request.body = serde_json::to_vec(&json!({"messages":[]})).unwrap();
+        request.command_context.cwd = root.path().into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        attempt(
+            &model,
+            &request,
+            &tx,
+            &CancellationToken::new(),
+            &mut State::default(),
+        )
+        .await
+        .unwrap_err()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_stdout_is_refused_past_the_total_limit() {
+        // Every JSONL byte counts; blank 1 MiB lines keep the test fast. They
+        // are written to a file by the shell, as argv is capped at 64 KiB.
+        let error = jsonl_script_error(|root| {
+            let line = root.join("line.jsonl");
+            format!(
+                r#"{{ head -c 1048575 /dev/zero | tr '\0' ' '; echo; }} > '{line}'; while cat '{line}'; do :; done | head -c {limit}"#,
+                line = line.display(),
+                limit = JSONL_TOTAL_LIMIT + (4 << 20)
+            )
+        })
+        .await;
+        assert!(
+            error
+                .message
+                .starts_with("command provider JSONL output exceeds 128 MiB"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_reasoning_details_are_budgeted() {
+        // ~2 MB lines of one million-node `details` arrays: far under the
+        // wire limits, but each retains ~64 MB of JSON values.
+        let error = jsonl_script_error(|root| {
+            let line = root.join("details.jsonl");
+            format!(
+                r#"{{ printf '{{"type":"reasoning","details":['; yes 0, | head -n 999999 | tr -d '\n'; printf '0]}}\n'; }} > '{line}'; cat '{line}' '{line}' '{line}'"#,
+                line = line.display(),
+            )
+        })
+        .await;
+        assert!(
+            error
+                .message
+                .starts_with("command provider reasoning details exceed 64 MiB"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn diagnostics_redact_expanded_values_and_inherited_credentials() {
+        let mut inherited = Vec::new();
+        for (index, name) in [
+            "OPENAI_API_KEY",
+            "token",
+            "client_SeCrEt",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "APIKEY",
+            "CREDENTIALS",
+            "AUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "GITHUB_TOKEN",
+        ]
+        .iter()
+        .enumerate()
+        {
+            inherited.push((name.to_string(), format!("inherited-secret-{index}")));
+        }
+        inherited.extend([
+            ("PATH".into(), "ordinary-value".into()),
+            ("SHORT_KEY".into(), "short".into()),
+            ("HOME".into(), "/home/alice".into()),
+            ("GIT_AUTHOR_NAME".into(), "Alice Example".into()),
+            ("SSH_AUTH_SOCK".into(), "/tmp/auth-socket".into()),
+            ("XAUTHORITY".into(), "/home/alice/.Xauthority".into()),
+            ("AUTHORIZATION".into(), "ordinary-header".into()),
+        ]);
+        let secrets = diagnostic_secrets(
+            [
+                "expanded-value".into(),
+                "explicit-env-value".into(),
+                "short".into(),
+            ],
+            inherited.clone(),
+        );
+        let diagnostic = format!(
+            "expanded-value explicit-env-value {}",
+            inherited
+                .iter()
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let redacted = redact_diagnostic(diagnostic, &secrets);
+        assert_eq!(redacted.matches("[redacted]").count(), 13);
+        assert!(redacted.ends_with(
+            "ordinary-value short /home/alice Alice Example /tmp/auth-socket /home/alice/.Xauthority ordinary-header"
+        ));
+        assert!(!redacted.contains("inherited-secret"));
+    }
+
+    #[test]
+    fn diagnostic_redaction_handles_overlapping_values() {
+        let secrets = diagnostic_secrets(["abcdefgh".into(), "abcdefgh-more".into()], []);
+        assert_eq!(
+            redact_diagnostic("abcdefgh-more abcdefgh".into(), &secrets),
+            "[redacted] [redacted]"
+        );
+    }
+
+    #[test]
+    fn empty_conversation_identity_is_rejected_before_command_preparation() {
+        let provider = serde_json::from_value(json!({"type":"command"})).unwrap();
+        let config = serde_json::from_value(json!({})).unwrap();
+        let model = Model {
+            client: crate::http_client(Client::builder).unwrap(),
+            provider,
+            config,
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            effort: None,
+        };
+        let mut request: PreparedRequest =
+            serde_json::from_value(super::super::tests::request_value()).unwrap();
+        request.conversation_id.clear();
+        let error = prepare(&model, &request).err().unwrap();
+        assert_eq!(error.message, "conversation_id must be nonempty");
+    }
 }

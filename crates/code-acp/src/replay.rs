@@ -18,7 +18,6 @@ pub fn replay(out: &Out, sid: &str, session: &Session) {
         return;
     };
     let mut calls: HashMap<String, (String, Vec<Value>)> = HashMap::new();
-    let mut todos = None;
     for envelopes in contexts.values() {
         let mut spoke = false;
         for e in envelopes {
@@ -65,10 +64,6 @@ pub fn replay(out: &Out, sid: &str, session: &Session) {
                         );
                     }
                     for c in tool_calls {
-                        if c.name == "todo" {
-                            todos = Some(c.arguments["items"].clone());
-                            continue;
-                        }
                         let base = mapping::start_content(&c.name, &c.arguments, &cwd, None);
                         out.update(
                             sid,
@@ -128,23 +123,6 @@ pub fn replay(out: &Out, sid: &str, session: &Session) {
                 _ => {}
             }
         }
-    }
-    if let Some(Value::Array(items)) = todos {
-        let entries: Vec<Value> = items
-            .iter()
-            .map(|i| {
-                json!({
-                    "content": i["content"].as_str().unwrap_or(""),
-                    "priority": "medium",
-                    "status": match i["status"].as_str() {
-                        Some("completed") => "completed",
-                        Some("in_progress") => "in_progress",
-                        _ => "pending",
-                    },
-                })
-            })
-            .collect();
-        out.update(sid, json!({"sessionUpdate": "plan", "entries": entries}));
     }
     let title = session.title();
     if !title.is_empty() {

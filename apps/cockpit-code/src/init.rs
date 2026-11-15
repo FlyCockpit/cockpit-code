@@ -16,7 +16,11 @@ pub struct InitArgs {
     /// Environment variable NAME; only a ${NAME} reference is written.
     #[arg(long, value_name = "NAME")]
     key_env: Option<String>,
-    #[arg(long, value_name = "PROVIDER/MODEL", help = "Default model as provider/model")]
+    #[arg(
+        long,
+        value_name = "PROVIDER/MODEL",
+        help = "Default model as provider/model"
+    )]
     default_model: Option<String>,
     /// Default permission mode written to config.json.
     #[arg(long, value_parser=["manual","auto","unattended","yolo"])]
@@ -62,7 +66,7 @@ fn write(
 }
 fn provider(template: &str, key: Option<&str>) -> Result<Value, Box<dyn Error>> {
     let (kind, url, env, auth) = match template {
-        "openrouter" | "openrouter-chat" => (
+        "openrouter" => (
             "openai-chat",
             "https://openrouter.ai/api/v1",
             "OPENROUTER_API_KEY",
@@ -74,7 +78,7 @@ fn provider(template: &str, key: Option<&str>) -> Result<Value, Box<dyn Error>> 
             "OPENROUTER_API_KEY",
             "x-api-key",
         ),
-        "openai" | "openai-responses" => (
+        "openai" => (
             "openai-responses",
             "https://api.openai.com/v1",
             "OPENAI_API_KEY",
@@ -252,4 +256,26 @@ pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn
         println!("Next: cockpit-code doctor");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn documented_templates_generate_current_provider_types() {
+        for (name, kind) in [
+            ("openrouter", "openai-chat"),
+            ("openrouter-anthropic", "anthropic"),
+            ("openai", "openai-responses"),
+            ("openai-chat", "openai-chat"),
+            ("anthropic", "anthropic"),
+            ("command", "command"),
+        ] {
+            assert_eq!(provider(name, None).unwrap()["type"], kind);
+        }
+        for name in ["openrouter-chat", "openai-responses", "unknown"] {
+            assert!(provider(name, None).is_err());
+        }
+    }
 }

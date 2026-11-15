@@ -64,7 +64,9 @@ impl ReadMemory {
         if old == &new {
             return String::new();
         }
-        let diff = similar::TextDiff::from_lines(old, &new)
+        let diff = similar::TextDiff::configure()
+            .algorithm(similar::Algorithm::RawMyers)
+            .diff_lines(old, &new)
             .unified_diff()
             .context_radius(2)
             .to_string();
@@ -73,5 +75,44 @@ impl ReadMemory {
         } else {
             format!("{} changed:\n{diff}", path.display())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadMemory;
+
+    #[test]
+    fn moved_blocks_keep_the_shortest_diff_and_original_tie_breaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let mut memory = ReadMemory::default();
+        memory.remember(&path, b"a\nb\nc\nd\n");
+        std::fs::write(&path, "c\nd\na\nb\n").unwrap();
+        assert_eq!(
+            memory.notice(&path),
+            format!(
+                "{} changed:\n@@ -1,4 +1,4 @@\n+c\n+d\n a\n b\n-c\n-d\n",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn changed_file_notice_keeps_expected_myers_unified_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let mut memory = ReadMemory::default();
+        memory.remember(&path, b"one\ntwo\nthree\n");
+        std::fs::write(&path, "one\nchanged\nthree\n").unwrap();
+        assert_eq!(
+            memory.notice(&path),
+            format!(
+                "{} changed:\n@@ -1,3 +1,3 @@\n one\n-two\n+changed\n three\n",
+                path.display()
+            )
+        );
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(memory.notice(&path), "");
     }
 }

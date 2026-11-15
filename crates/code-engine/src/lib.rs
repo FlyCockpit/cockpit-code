@@ -15,6 +15,9 @@ pub use exclusive::{Exclusive, ExclusiveSafety};
 mod guidance;
 pub mod guidance_library;
 pub mod guidance_selector;
+mod hex;
+mod http_client;
+pub(crate) use http_client::http_client;
 pub mod hidden_fork;
 mod idle;
 pub use guidance::ReviewerGuidanceRequest;
@@ -42,6 +45,7 @@ mod prune;
 mod pty;
 pub use prune::PruneReport;
 mod prior_thinking;
+pub mod process_groups;
 mod question_chat;
 mod questions;
 mod queue;
@@ -65,6 +69,7 @@ pub mod script;
 mod session_tools;
 pub mod sessions;
 mod skill_commands;
+mod spill;
 pub mod subscriptions;
 pub mod terminals;
 mod text_recovery;
@@ -606,7 +611,7 @@ pub struct Session {
     control: Arc<Control>,
     coordinator: Arc<Mutex<Coordinator>>,
     config: Arc<Mutex<Snapshot>>,
-    /// The session policy (shared grants), for work outside the root state lock (D64 fork chats).
+    /// The session policy (shared grants), for work outside the root state lock (fork chats).
     gate: Arc<dyn PermissionGate>,
     _lifetime: Arc<SessionLifetime>,
 }
@@ -669,24 +674,6 @@ impl Session {
         let journal = Journal::create(&store, cwd, settings)?;
         Self::from_journal(store, journal, None)
     }
-    /// Compatibility constructor. A custom gate deliberately overrides session policy.
-    pub fn new(
-        store: ConfigStore,
-        cwd: PathBuf,
-        options: SessionOptions,
-        gate: Arc<dyn PermissionGate>,
-    ) -> Result<Self, EngineError> {
-        let cwd = canonical_cwd(cwd)?;
-        let settings = SessionSettings {
-            model: options.model,
-            effort: options.effort,
-            safety_model: store.snapshot().config.permissions.auto_model.clone(),
-            subagents: store.snapshot().config.subagents.mode,
-            ..Default::default()
-        };
-        let journal = Journal::create(&store, cwd, settings)?;
-        Self::from_journal(store, journal, Some(gate))
-    }
     pub fn resume(
         store: ConfigStore,
         id: &str,
@@ -718,13 +705,6 @@ impl Session {
         session.apply_options(options)?;
         Ok(session)
     }
-    pub fn restore(
-        store: ConfigStore,
-        snapshot: sessions::SessionSnapshot,
-    ) -> Result<Self, EngineError> {
-        let journal = Journal::restore(&store, snapshot, None)?;
-        Self::from_journal(store, journal, None)
-    }
     fn from_journal(
         store: ConfigStore,
         mut journal: Journal,
@@ -742,19 +722,6 @@ impl Session {
             }
         }
         let lsp_servers = journal.settings.lsp_servers.clone().unwrap_or_default();
-        // Older sessions acquire their initial default once; descendants always read
-        // this single durable field rather than their independently reloaded config.
-        if journal.settings.exclusive.is_none()
-            && journal.settings.safety_model.is_none()
-            && let Some(id) = &store.snapshot().config.permissions.auto_model
-        {
-            permissions::validate_model(store.snapshot(), id)?;
-            if !journal.read_only {
-                journal.change_settings(vec![("safetyModel".into(), serde_json::json!(id))])?;
-            } else {
-                journal.settings.safety_model = Some(id.clone());
-            }
-        }
         if let Some(id) = &exclusive::safety(&journal.settings) {
             permissions::validate_model(store.snapshot(), id)?;
         }
@@ -1145,31 +1112,6 @@ impl Session {
             ("disabledProviders".into(), serde_json::json!(providers)),
         ])
     }
-    pub fn set_compact_at(&self, model: String, value: f64) -> Result<(), EngineError> {
-        if !(0.0..=1.0).contains(&value) {
-            return Err(EngineError::bad("compactAt must be 0..1"));
-        }
-        let mut overrides = self.settings().compact_at;
-        overrides.insert(model, value);
-        self.control
-            .setting("compactAt", serde_json::json!(overrides))
-    }
-    /// Registry seam for the subagent lane. Register a parent before any child.
-    pub fn register_agent(&self, mut agent: sessions::AgentRecord) -> Result<(), EngineError> {
-        agent.parent_id = agent
-            .parent_id
-            .as_deref()
-            .map(|id| self.resolve_agent_id(id))
-            .transpose()?;
-        self.control
-            .journal
-            .lock()
-            .unwrap()
-            .register(agent.clone())?;
-        self.control
-            .commit(&agent.agent_id.clone(), HistoryEvent::AgentState { agent })?;
-        Ok(())
-    }
     pub fn update_agent(&self, mut agent: sessions::AgentRecord) -> Result<(), EngineError> {
         agent.agent_id = self.resolve_agent_id(&agent.agent_id)?;
         agent.parent_id = agent
@@ -1184,29 +1126,6 @@ impl Session {
             .update_agent(agent.clone())?;
         self.control
             .commit(&agent.agent_id.clone(), HistoryEvent::AgentState { agent })?;
-        Ok(())
-    }
-    pub fn set_role(&self, role: String, stable_prompt: String) -> Result<(), EngineError> {
-        let lifecycle = self.coordinator.lock().unwrap();
-        if lifecycle.active.is_some() {
-            return Err(EngineError::bad("change role only while idle"));
-        }
-        let mut j = self.control.journal.lock().unwrap();
-        if j.histories.get("root").is_some_and(|h| {
-            h.iter()
-                .any(|e| matches!(e, HistoryEvent::PromptContext { .. }))
-        }) {
-            return Err(EngineError::bad(
-                "the session prompt is already frozen; start a new session to change its role",
-            ));
-        }
-        let mut agent = j.agents["root"].clone();
-        agent.agent = role;
-        agent.stable_prompt = stable_prompt;
-        j.update_agent(agent.clone())?;
-        drop(j);
-        self.control
-            .commit("root", HistoryEvent::AgentState { agent })?;
         Ok(())
     }
     pub fn respond_approval(
@@ -1242,14 +1161,9 @@ impl Session {
             .get(id)
             .cloned()
             .ok_or_else(|| EngineError::bad("question not found"))?;
-        if q.questions.is_empty() {
-            self.control.answer_question(id, text)?;
-            Ok(())
-        } else {
-            self.answer_questions(id, questions::text_answers(&q, &text))
-        }
+        self.answer_questions(id, questions::text_answers(&q, &text))
     }
-    /// Submit an entire D62 set by tool call ID (or legacy question ID).
+    /// Submit an entire question set by tool call ID or question ID.
     pub fn answer_questions(
         &self,
         call_id: &str,
@@ -1265,16 +1179,6 @@ impl Session {
     }
     pub fn escalate(&self, id: &str, note: Option<String>) -> Result<(), EngineError> {
         self.control.escalate_question(id, note)
-    }
-    pub fn enqueue_message(
-        &self,
-        from: String,
-        to: String,
-        text: String,
-    ) -> Result<(), EngineError> {
-        let from = self.resolve_agent_id(&from).unwrap_or(from);
-        self.control
-            .message(&from, &self.resolve_agent_id(&to)?, text)
     }
     pub fn question_answer(&self, id: &str) -> Option<String> {
         self.control
@@ -1776,14 +1680,8 @@ impl State {
                 .get(p)
                 .ok_or_else(|| EngineError::bad("child provider removed"))?
                 .clone();
-            provider.prompt_caching = profile
-                .primary_caching
-                .clone()
-                .unwrap_or_else(|| profile.caching.clone());
-            let mut config = profile
-                .primary_config
-                .clone()
-                .unwrap_or_else(|| profile.config.clone());
+            provider.prompt_caching = profile.primary_caching.clone();
+            let mut config = profile.primary_config.clone();
             config.strict_tools = self
                 .model_settings()
                 .strict_tools
@@ -1795,11 +1693,7 @@ impl State {
                 m.into(),
                 provider,
                 config,
-                if profile.primary_config.is_some() {
-                    profile.primary_effort.as_deref()
-                } else {
-                    profile.effort.as_deref()
-                },
+                profile.primary_effort.as_deref(),
             );
         }
         build_model(self.store.snapshot(), &self.model_settings())
@@ -1872,10 +1766,7 @@ impl State {
         request.assets_dir = Some(assets);
         request.agent_id = self.agent_id.clone();
         request.session_id = self.id();
-        // Reused legacy checkpoints keep the command identity they originally sent.
-        if !request.conversation_id.is_empty() {
-            request.conversation_id = format!("{}:{}", self.id(), self.agent_id);
-        }
+        request.conversation_id = format!("{}:{}", self.id(), self.agent_id);
         request.capability_catalog = Some(
             self.context_state
                 .frozen
@@ -1942,8 +1833,7 @@ impl State {
     }
     fn raw_definitions(&self) -> Vec<tools::ToolDefinition> {
         let mut definitions = ToolBox::definitions();
-        definitions
-            .retain(|d| d.name != "todo" && (d.name != "lsp" || self.control.lsp.available()));
+        definitions.retain(|d| d.name != "lsp" || self.control.lsp.available());
         definitions.retain(|d| d.name != "terminal" || self.control.user_terminal_allowed());
         definitions.push(script::definition());
         definitions.extend(session_tools::definitions());
@@ -1980,12 +1870,6 @@ impl State {
             let id = self.model().map(|m| m.id()).unwrap_or_default();
             if let Some(catalog) = context.model_catalogs.get(&id) {
                 return catalog.clone();
-            }
-            // Legacy sessions freeze their historical native surface as the catalog.
-            if context.model_catalogs.is_empty()
-                && let Some(native) = context.model_tools.get(&id)
-            {
-                return native.clone();
             }
         }
         if let Some(profile) = &self.child_profile {
@@ -2053,7 +1937,7 @@ impl State {
                     .stable_prompt
                     .clone()
             });
-        // D114: the agent knows its own model. Last in the prompt so a model switch
+        // The agent knows its own model. Last in the prompt so a model switch
         // (which starts a new cache anyway) only changes the tail; effort is left out
         // so effort changes keep the cache.
         match model {
@@ -2165,7 +2049,7 @@ impl State {
                     context
                         .offered_catalog
                         .clone()
-                        .unwrap_or_else(|| defs.clone()),
+                        .ok_or_else(|| EngineError::bad("frozen tool catalog missing"))?,
                 );
             }
             self.control.commit(
@@ -2174,11 +2058,6 @@ impl State {
                     context: Box::new(context.clone()),
                 },
             )?;
-        }
-        if context.model_catalogs.is_empty() {
-            // D61 migration: never reinterpret an already-sent profile on resume.
-            context.model_catalogs = context.model_tools.clone();
-            context.offered_catalog = context.offered_tools.clone();
         }
         for path in context.source_hashes.keys().filter(|p| p.is_file()) {
             if let Ok(bytes) = std::fs::read(path)
@@ -2295,68 +2174,11 @@ impl State {
                     }.into(),
                 })?;
             }
-            if !self.definitions().iter().any(|tool| {
-                self.tool_names().canonical(&tool.name) == "criteria"
-                    && tool.schema["properties"].get("unverified").is_some()
-            }) {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder {
-                    text: "Your native criteria schema is an older frozen definition. To use current findings fields, call the script tool with code: print(tools.describe(name='criteria')). Then use script code: print(criteria.finding(id='<id>', text='<problem>', evidence='<evidence>', severity='low', locations=['file:1'], fix='<fix>', verification='<how checked>', confidence=0.8)). Do not send these new fields to the old native criteria tool. Findings met also requires unverified=[] and notCovered=[], including checkedClean areas.".into(),
-                })?;
-            }
-            if self.agent_id != "root"
-                && !self.control.flat_mode()
-                && !self
-                    .definitions()
-                    .iter()
-                    .any(|tool| self.tool_names().canonical(&tool.name) == "report")
-            {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder {
-                    text: "Your native tools are an older frozen definition without report. Only long-running children should send partial progress. Use the script tool with code: print(report(partial=True, text='Progress and evidence so far')). report is a standalone child tool, not an action of task or agents. Continue work after reporting; write the final report as your final answer. The parent receives the latest partial and an idle root wakes.".into(),
-                })?;
-            }
             if !context.shared_prompt.contains(context::HEADROOM_GUIDANCE)
                 && !self.history().iter().any(|e| matches!(e, HistoryEvent::SystemReminder { text } if text.contains(context::HEADROOM_GUIDANCE))) {
                 self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text: context::HEADROOM_GUIDANCE.into() })?;
             }
             let offered = self.definitions();
-            if offered.iter().any(|tool| {
-                self.tool_names().canonical(&tool.name) == "task"
-                    && tool.schema["properties"].get("title").is_none()
-            }) {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder {
-                    text: "Your native task schema is an older frozen definition without title. For current task fields, use the script tool with code: print(tools.describe(name='task')); then print(task(title='Short title', prompt='Bounded brief', background=True)). Do not send title or other new fields to the old native task tool. Long-running tree-mode children have a standalone report(partial=True, text=...) tool for useful mid-run progress to their parent; final reports are final answers.".into(),
-                })?;
-            }
-            if !offered.iter().any(|tool| tool.name == "criteria")
-                || offered.iter().any(|tool| {
-                    tool.name == "task" && tool.schema["properties"].get("acceptance").is_none()
-                })
-            {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder {
-                    text: "Criteria contracts and task criteria/review are available through Monty for multi-step work or work needing proof; trivial tasks just do the work. Children may create criteria only if their parent passed them. Use tools.describe(name=\"criteria\") and tools.describe(name=\"task\"), then criteria.show(), criteria.add(...), criteria.met(...), criteria.propose(...) and task(..., acceptance=[...], review=True). The former goals functions are retired; steps belong to criteria. Your existing tools[] and system prompt remain fixed.".into(),
-                })?;
-            }
-            if !offered.iter().any(|tool| {
-                self.tool_names().canonical(&tool.name) == "scope"
-                    && tool.schema["properties"]["action"]["enum"]
-                        .as_array()
-                        .is_some_and(|actions| actions.iter().any(|a| a == "subscribe"))
-            }) || offered.iter().any(|tool| {
-                self.tool_names().canonical(&tool.name) == "task"
-                    && tool.schema["properties"].get("subscribe").is_none()
-            }) {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text: "Write scopes and subscriptions are available through Monty: scope.show(), scope.requests(), scope.resolve(requestId=..., decision=apply/reject/grant, reason=..., scope=[...]), scope.wait(requestId=...), scope.subscribe(subscribe=[dirs]). task accepts scope=[dirs] and subscribe=[dirs]; write/edit accept wait=True to wait explicitly. Bash is unrestricted by scopes. Existing tools[] stay fixed.".into() })?;
-            }
-            if !self.control.flat_mode()
-                && !offered.iter().any(|tool| {
-                    self.tool_names().canonical(&tool.name) == "agents"
-                        && tool.schema["properties"]["action"]["enum"]
-                            .as_array()
-                            .is_some_and(|a| a.iter().any(|a| a == "finalize"))
-                })
-            {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text: "Agent tree navigation is available through Monty: agents.list(state=...,context='earlier',subtree='mine',model=...,query=...,limit=...), agents.show(id=...), agents.ask(id=...,question=...), agents.stop(id=...,reason=...), agents.finalize(id=...). Finalize wraps up bottom-up after current calls finish; each node gets one final report turn with tools disabled. Read the whole tree; ask/stop/finalize target descendants only. message also accepts your direct parent (to=parent or its ID); more distant ancestors and other branches are refused. task now accepts a durable title (1–80 characters), maxDescendants and inherited models={allow:[patterns],deny:[patterns]}. Use tools.describe(name='agents') and tools.describe(name='task'). Existing tools[] remain fixed.".into() })?;
-            }
             if !offered
                 .iter()
                 .any(|tool| self.tool_names().canonical(&tool.name) == "decide")
@@ -2379,13 +2201,6 @@ impl State {
             if !missing.is_empty() {
                 self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text:format!("Code intelligence capabilities are now available through Monty: {}. Use tools.describe(name=...) to inspect schemas, then call them inside script. Your existing tools[] remains fixed. Relationships are heuristic; confirm behavior in source.", missing.join(", ")) })?;
             }
-            let outdated = self.definitions().iter().any(|tool| {
-                (tool.name == "question" && tool.schema["properties"].get("questions").is_none())
-                    || (tool.name == "answer" && tool.schema["properties"].get("answers").is_none())
-            });
-            if outdated {
-                self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text:"Structured question sets and answers are now available through Monty. Use tools.describe(name=\"question\") and tools.describe(name=\"answer\") for their current schemas, then call question(questions=[...], wait=...) or answer(questionId=..., answers=[...]) in script.".into() })?;
-            }
             self.context_state.announced_capabilities = true;
         }
         let date = chrono::Local::now().format("%Y-%m-%d %Z").to_string();
@@ -2401,19 +2216,7 @@ impl State {
             self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text:format!("Current date: {date}. cwd: {}. Permission mode: {:?}. Enabled MCP servers: {}. MCP tools are reachable through script; discover with tools.search(query=...).{}", self.cwd.display(), mode, serde_json::json!(self.control.mcp.statuses().into_iter().filter(|s|s.enabled).map(|s|s.name).collect::<Vec<_>>()), if self.agent_id != "root" { " You are a noninteractive subagent. Finish with a concise report for your parent; use question with wait=blocking when you cannot make progress without an answer. Your cwd is your inside-cwd permission boundary." } else { "" }) })?;
             self.context_state.date = date;
         }
-        let (todos, changed_files) = self.tools.context_observations();
-        let todos = todos.to_string();
-        if todos != self.context_state.todos
-            && (todos != "[]" || !self.context_state.todos.is_empty())
-        {
-            self.control.commit(
-                &self.agent_id,
-                HistoryEvent::SystemReminder {
-                    text: format!("Current todo state: {todos}"),
-                },
-            )?;
-        }
-        self.context_state.todos = todos;
+        let changed_files = self.tools.context_observations();
         let signature = serde_json::to_string(&changed_files).unwrap();
         if signature != self.context_state.external_files && !changed_files.is_empty() {
             self.control.commit(
@@ -2538,7 +2341,7 @@ impl State {
         };
         let prefix = serde_json::to_vec(&(self.prompt(), definitions))
             .map_err(|e| EngineError::bad(e.to_string()))?;
-        let hash = format!("{:x}", Sha256::digest(&prefix));
+        let hash = crate::hex::hex(&Sha256::digest(&prefix));
         Ok(format!(
             "{}:{role}:{}:{profile}:{}",
             self.id(),
@@ -2859,7 +2662,7 @@ async fn run(
     state.control.agent_status(&state.agent_id, "running")?;
     state.pair_interrupted_calls()?;
     state.deliver_queue(state.agent_id != "root")?;
-    // D122: a local command the user ran reads before their next prompt.
+    // A local command the user ran reads before their next prompt.
     state.drain_local_commands()?;
     if let Some((prompt, attachments)) = prompt {
         state.control.commit(
@@ -3114,9 +2917,9 @@ async fn run(
             let history = state.history();
             let checkpoint = model::ChildRequest {
                 provider_id: model.provider_id.clone(),
-                primary_config: Some(primary_model.config.clone()),
+                primary_config: primary_model.config.clone(),
                 primary_effort: primary_model.effort.clone(),
-                primary_caching: Some(primary_model.provider.prompt_caching.clone()),
+                primary_caching: primary_model.provider.prompt_caching.clone(),
                 request: request.clone(),
                 system: state.prompt(),
                 compacted_estimate: state.compacted_estimate,
@@ -3863,13 +3666,6 @@ fn execute_inner<'a>(
                 canonical_call: call,
             };
         }
-        if matches!(call.name.as_str(), "goals" | "todo") {
-            return ToolOutput { details: Default::default(),
-                output: "This tool is retired. Use criteria and steps through Monty: criteria.show(), criteria.add(kind='step', text=...), criteria.step(id=..., status='met').".into(),
-                is_error: true,
-                canonical_call: call,
-            };
-        }
         let drafting = state.agent_id == "root"
             && state
                 .control
@@ -3926,24 +3722,22 @@ fn execute_inner<'a>(
                 .map_err(|e| EngineError::bad(format!("{e:#}")));
         }
         if call.name == "generate" {
-            let (session_id, assets) = { let j = state.control.journal.lock().unwrap(); (j.header.id.clone(), j.dir.join("assets")) };
+            let (session_id, assets, temp) = { let j = state.control.journal.lock().unwrap(); (j.header.id.clone(), j.dir.join("assets"), j.dir.join("tmp")) };
             let snapshot = state.config.lock().unwrap().clone();
             let generated = tools::generate::execute(tools::generate::Context {
                 control: &state.control,
                 gate: state.gate.as_ref(),
+                barrier: &barrier,
                 op: state.metadata_operation(call.clone(), None),
                 snapshot,
                 session_id,
                 agent_id: state.agent_id.clone(),
                 assets,
+                temp,
                 cancel: &cancel,
             })
             .await
             .map_err(|e| EngineError::bad(format!("{e:#}")))?;
-            if let Some(usage) = generated.usage {
-                state.control.commit(&state.agent_id, HistoryEvent::Usage { usage: usage.clone() })?;
-                state.control.emit(EngineEvent::Usage { usage });
-            }
             return Ok(generated.output);
         }
         if call.name == "bash" && call.arguments["background"] == true {
@@ -4094,6 +3888,21 @@ fn external_metadata(
     }
     Ok(Some((target, scope)))
 }
+fn compaction_git_status(cwd: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            "--untracked-files=normal",
+        ])
+        .current_dir(cwd)
+        .kill_on_drop(true);
+    command
+}
+
 async fn compact(
     state: &mut State,
     focus: Option<String>,
@@ -4144,16 +3953,7 @@ async fn compact(
     )
     .await?;
     let facts = progress::facts(&state.control, &state.agent_id);
-    let git = tokio::process::Command::new("git")
-        .args([
-            "--no-optional-locks",
-            "status",
-            "--porcelain=v1",
-            "--branch",
-            "--untracked-files=normal",
-        ])
-        .current_dir(&state.cwd)
-        .output();
+    let git = compaction_git_status(&state.cwd).output();
     let git = tokio::select! {
         _ = cancel.cancelled() => return Err(EngineError::cancelled()),
         result = tokio::time::timeout(std::time::Duration::from_secs(3), git) => {
@@ -4205,12 +4005,6 @@ async fn compact(
             summary: summary.clone(),
         },
     ];
-    let (todos, _) = state.tools.context_observations();
-    if todos.as_array().is_some_and(|items| !items.is_empty()) {
-        events.push(HistoryEvent::SystemReminder {
-            text: format!("Current todo state: {todos}"),
-        });
-    }
     let contract = state.control.contract(&state.agent_id);
     events.push(HistoryEvent::Goal {
         contract: contract.clone(),
@@ -4273,4 +4067,185 @@ async fn compact(
     state.control.agent_status(&state.agent_id, "running")?;
     state.meter(&request, &active_model)?;
     Ok("compacted".into())
+}
+
+#[cfg(test)]
+mod test_support {
+    pub(crate) fn store(
+        config: serde_json::Value,
+    ) -> (tempfile::TempDir, code_config::ConfigStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let mut config = config;
+        config["skillsDirs"] = serde_json::json!([]);
+        std::fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let store = code_config::ConfigStore::load(code_config::Directories {
+            config: config_dir,
+            data: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        (temp, store)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compaction_git_status_is_killed_when_output_is_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let git = temp.path().join("git");
+        let pid_file = temp.path().join("pid");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$COCKPIT_TEST_PID\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = compaction_git_status(temp.path());
+        command
+            .env("PATH", temp.path())
+            .env("COCKPIT_TEST_PID", &pid_file);
+        let task = tokio::spawn(command.output());
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = raw.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("git stub did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let exited = tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if exited.is_err() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        exited.expect("dropping git output left the child running");
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_an_explicitly_absent_safety_model() {
+        let (temp, store) = crate::test_support::store(
+            serde_json::json!({"permissions":{"autoModel":"unused/model"}}),
+        );
+        let journal =
+            Journal::create(&store, temp.path().to_owned(), SessionSettings::default()).unwrap();
+        let session = Session::from_journal(store, journal, None).unwrap();
+        assert!(session.settings().safety_model.is_none());
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_question_sets_and_frozen_catalogs_are_used() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let session =
+            Session::create(store, temp.path().to_owned(), SessionOptions::default()).unwrap();
+        let id = session
+            .control
+            .ask_question("root", "Where?".into(), false)
+            .unwrap();
+        assert_eq!(session.pending_questions()[0].questions[0].id, "q1");
+        session.answer(&id, "Here").unwrap();
+        {
+            let j = session.control.journal.lock().unwrap();
+            assert_eq!(
+                j.questions[&id].answers.as_ref().unwrap()[0]
+                    .text
+                    .as_deref(),
+                Some("Here")
+            );
+            assert!(
+                j.histories["root"]
+                    .iter()
+                    .any(|e| matches!(e, HistoryEvent::QuestionsAnswered { .. }))
+            );
+        }
+        {
+            let mut state = session.state.lock().await;
+            // No configured model gives the empty model key; catalog contents are still frozen.
+            let mut context: context::FrozenContext = serde_json::from_value(serde_json::json!({
+                "cwd":temp.path(), "sharedPrompt":"", "rolePrompt":"", "skills":[], "sourceHashes":{},
+                "modelCatalogs":{"":crate::intel::definitions()}, "modelTools":{"":[]}
+            })).unwrap();
+            state.context_state.frozen = Some(context.clone());
+            assert_eq!(
+                state.available_definitions().len(),
+                crate::intel::NAMES.len()
+            );
+            context.model_catalogs.insert(String::new(), vec![]);
+            context
+                .model_tools
+                .insert(String::new(), crate::intel::definitions());
+            state.context_state.frozen = Some(context);
+            assert!(state.available_definitions().is_empty());
+        }
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_profiles_do_not_receive_old_schema_migration_notices() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({"defaultModel":"p/m"}));
+        std::fs::create_dir_all(store.directories.config.join("providers")).unwrap();
+        std::fs::write(
+            store.directories.config.join("providers/p.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "type":"command", "command":{"argv":["unused-provider"]},
+                "models":{"m":{"capabilities":{"input":["text"],"output":["text"],"tools":true}}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = ConfigStore::load(store.directories).unwrap();
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        {
+            let mut state = session.state.lock().await;
+            state.boundary_notices().unwrap();
+            let history = state.history();
+            let reminders = history
+                .iter()
+                .filter_map(|event| match event {
+                    HistoryEvent::SystemReminder { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                reminders
+                    .iter()
+                    .all(|text| !text.contains("older frozen") && !text.contains("retired"))
+            );
+            assert!(
+                reminders
+                    .iter()
+                    .any(|text| text.contains("Code intelligence capabilities"))
+            );
+            let catalog = state.available_definitions();
+            let task = catalog.iter().find(|d| d.name == "task").unwrap();
+            assert!(task.schema["properties"].get("title").is_some());
+            assert!(task.schema["properties"].get("acceptance").is_some());
+            let questions = catalog.iter().find(|d| d.name == "question").unwrap();
+            assert!(questions.schema["properties"].get("questions").is_some());
+        }
+        session.shutdown().await.unwrap();
+    }
 }

@@ -36,7 +36,7 @@ pub struct ScopeRequest {
     pub job_id: Option<String>,
     pub parent_call_id: Option<String>,
     pub status: String,
-    /// Agent id, or "user" for a frontend decision. Older records omit this.
+    /// Agent id, or "user" for a frontend decision.
     #[serde(default)]
     pub resolved_by: Option<String>,
     /// Only an owner escalation requests a frontend decision.
@@ -1035,9 +1035,7 @@ impl Control {
         for (id, status) in ended {
             self.scope_owner_ended(&id, &status)?;
         }
-        // Backfill owner rows for sessions written before owner journaling, or
-        // interrupted between the requester and owner appends. No new decision
-        // is inferred for legacy records without resolved_by.
+        // Repair a crash between the requester and owner appends.
         let envelopes = {
             let mut j = self.journal.lock().unwrap();
             let missing = j
@@ -1126,5 +1124,92 @@ impl Control {
             .collect::<Vec<_>>();
         self.scope_serviced.lock().unwrap().extend(ids);
         self.scheduler.release_owner(agent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restore_repairs_current_requester_owner_append_gap_once() {
+        let (temp, store) = crate::test_support::store(json!({}));
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        let request = ScopeRequest {
+            id: "request".into(),
+            requester: "child".into(),
+            owner: "root".into(),
+            path: temp.path().join("file"),
+            cwd: temp.path().to_owned(),
+            call: ToolCall {
+                id: "call".into(),
+                name: "write".into(),
+                arguments: json!({}),
+                complete: true,
+            },
+            expected_hash: None,
+            job_id: None,
+            parent_call_id: None,
+            status: "pending".into(),
+            resolved_by: None,
+            escalation: None,
+            wait: false,
+            reason: None,
+            output: None,
+            created: sessions::now(),
+            updated: sessions::now(),
+        };
+        {
+            let mut journal = session.control.journal.lock().unwrap();
+            let mut child = journal.agents["root"].clone();
+            child.agent_id = "child".into();
+            child.parent_id = Some("root".into());
+            journal.agents.insert("child".into(), child);
+            journal.contexts.insert("child".into(), 1);
+        }
+        session
+            .control
+            .commit("child", HistoryEvent::ScopeRequest { request })
+            .unwrap();
+        assert!(
+            !session
+                .control
+                .journal
+                .lock()
+                .unwrap()
+                .scope_owner_records
+                .contains_key("request")
+        );
+        session.control.restore_scopes().unwrap();
+        let sequence = session
+            .control
+            .journal
+            .lock()
+            .unwrap()
+            .histories
+            .get("root")
+            .map_or(0, Vec::len);
+        assert!(
+            session
+                .control
+                .journal
+                .lock()
+                .unwrap()
+                .scope_owner_records
+                .contains_key("request")
+        );
+        session.control.restore_scopes().unwrap();
+        assert_eq!(
+            session
+                .control
+                .journal
+                .lock()
+                .unwrap()
+                .histories
+                .get("root")
+                .map_or(0, Vec::len),
+            sequence
+        );
+        session.shutdown().await.unwrap();
     }
 }

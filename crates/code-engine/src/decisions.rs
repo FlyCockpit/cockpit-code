@@ -70,7 +70,7 @@ pub(crate) fn definitions(root: bool) -> Vec<ToolDefinition> {
     }
     defs
 }
-/// Source events also reconstruct missing records when resuming an older/crash-interrupted journal.
+/// Source events reconstruct missing decision records after an interrupted append.
 pub(crate) fn automatic(e: &EventEnvelope) -> Option<DecisionRecord> {
     let mut r = match &e.event {
         HistoryEvent::ModelSwitch { from, to, reason } => DecisionRecord::new(
@@ -399,5 +399,38 @@ impl Session {
             HistoryEvent::DecisionReviewed { record },
         )?;
         Ok(fork)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_source_event_recovers_a_missing_decision_after_crash() {
+        let (temp, store) = crate::test_support::store(json!({}));
+        let mut journal =
+            sessions::Journal::create(&store, temp.path().to_owned(), Default::default()).unwrap();
+        // A crash can happen after this append and before Control writes DecisionRecorded.
+        let event = journal
+            .append(
+                "root",
+                HistoryEvent::ModelSwitch {
+                    from: "a".into(),
+                    to: "b".into(),
+                    reason: "failed".into(),
+                },
+            )
+            .unwrap();
+        let first = automatic(&event).unwrap();
+        let second = automatic(&event).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.source_event_id.as_deref(), Some(event.id.as_str()));
+        let id = journal.header.id.clone();
+        journal.close().unwrap();
+        let mut restored = sessions::Journal::load(&store, &id, false).unwrap();
+        assert_eq!(restored.decisions[&first.id].choice, "b");
+        assert_eq!(restored.decisions.len(), 1);
+        restored.close().unwrap();
     }
 }

@@ -1,5 +1,5 @@
-//! `/usage` (D85): every provider's limit bars, reset times, credits and
-//! soft budget (D87) in one scrolling dialog. It reads in the background at
+//! `/usage`: every provider's limit bars, reset times, credits and
+//! soft budget in one scrolling dialog. It reads in the background at
 //! startup; `r` refreshes. Provider headers are clickable and fold their
 //! details.
 use crate::theme::theme;
@@ -33,7 +33,7 @@ pub(super) struct UsageView {
     headers: Vec<(usize, String)>,
 }
 
-/// The color of a share: red at 100%, yellow from 80% (D87's warnings).
+/// The color of a share: red at 100%, yellow from 80% (budget warnings).
 fn share_style(p: f64) -> Style {
     let t = theme();
     if p >= 100.0 {

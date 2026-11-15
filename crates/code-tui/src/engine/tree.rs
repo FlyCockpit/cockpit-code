@@ -1,6 +1,6 @@
-//! tui-v13 adapter seams: agent tree rows and control (D131), subtree
-//! reporting and wrap-up rows (D132), the decisions ledger (D128), the
-//! subagent mode (D133) and the idle-root mailbox (D134).
+//! Adapter seams: agent tree rows and control, subtree
+//! reporting and wrap-up rows, the decisions ledger, the
+//! subagent mode and the idle-root mailbox.
 use super::{Engine, err};
 use code_engine::schema::HistoryEvent;
 use code_engine::{DecisionRecord, DecisionReview, SubagentMode};
@@ -12,25 +12,25 @@ use std::sync::mpsc as std_mpsc;
 /// journal holds it travels beside it ([`super::UiEvent::Tree`]).
 #[derive(Debug, Clone)]
 pub enum TreeRow {
-    /// D132: a child's mid-run report to its parent (replaces the previous
+    /// A child's mid-run report to its parent (replaces the previous
     /// one in place).
     Partial { child: String, text: String },
-    /// D132: new descendants, one `- title [id] model=… startedBy=… depth=…`
+    /// New descendants, one `- title [id] model=… startedBy=… depth=…`
     /// line each.
     Growth(Vec<String>),
-    /// D132: this agent asked `target`'s subtree to wrap up, deepest first.
+    /// This agent asked `target`'s subtree to wrap up, deepest first.
     FinalizeRequested { target: String, agents: Vec<String> },
-    /// D132: this agent is taking its one last turn (tools disabled).
+    /// This agent is taking its one last turn (tools disabled).
     FinalTurn,
-    /// D132: this agent's final report went to its parent.
+    /// This agent's final report went to its parent.
     Finalized,
-    /// D131: this agent stopped `target`'s subtree.
+    /// This agent stopped `target`'s subtree.
     Stopped {
         target: String,
         reason: String,
         report: String,
     },
-    /// D131: a status question to `target`, answered by a hidden fork.
+    /// A status question to `target`, answered by a hidden fork.
     Asked {
         target: String,
         question: String,
@@ -86,7 +86,7 @@ pub(super) fn tree_row(event: &HistoryEvent) -> Option<TreeRow> {
     })
 }
 
-/// The D125 suggestion's durable root reminder: (percent, used, window).
+/// The compaction suggestion's durable root reminder: (percent, used, window).
 pub(super) fn compact_suggestion(event: &HistoryEvent) -> Option<(u64, u64, u64)> {
     let HistoryEvent::SystemReminder { text } = event else {
         return None;
@@ -99,7 +99,7 @@ pub(super) fn compact_suggestion(event: &HistoryEvent) -> Option<(u64, u64, u64)
     Some((pct.parse().ok()?, used.parse().ok()?, window.parse().ok()?))
 }
 
-/// One D128 ledger record, in plain frontend types.
+/// One ledger record, in plain frontend types.
 #[derive(Debug, Clone)]
 pub struct DecisionView {
     pub id: String,
@@ -142,7 +142,7 @@ fn decision_view(r: DecisionRecord) -> DecisionView {
     }
 }
 
-/// How the user reviews a decision (D128).
+/// How the user reviews a decision.
 pub enum Review {
     Keep,
     Change(String),
@@ -163,8 +163,6 @@ pub enum AgentDone {
 }
 
 impl Engine {
-    // ---- D131 ----------------------------------------------------------
-
     /// `agents list` rows for the `/agents` view (root's perspective).
     pub fn agent_rows(&self, filters: Value) -> Result<Vec<Value>, String> {
         let v = self.session.agent_rows(filters).map_err(err)?;
@@ -203,7 +201,7 @@ impl Engine {
             let _ = done.send(AgentDone::Stopped { id, result });
         });
     }
-    /// Graceful bottom-up wrap-up of a descendant's subtree (D132): the
+    /// Graceful bottom-up wrap-up of a descendant's subtree: the
     /// agents that will finalize, deepest first.
     pub fn finalize_agent(&self, id: &str) -> Result<Vec<String>, String> {
         let v = self.session.finalize_agent(id).map_err(err)?;
@@ -216,8 +214,6 @@ impl Engine {
             })
             .unwrap_or_default())
     }
-
-    // ---- D128 ----------------------------------------------------------
 
     /// Every ledger record, newest first.
     pub fn decisions(&self) -> Vec<DecisionView> {
@@ -244,8 +240,6 @@ impl Engine {
         self.session.review_decision(id, review).map_err(err)
     }
 
-    // ---- D133 ----------------------------------------------------------
-
     /// The session's subagent mode: (flat, locked).
     pub fn subagents(&self) -> (bool, bool) {
         (
@@ -266,8 +260,6 @@ impl Engine {
             })
             .map_err(err)
     }
-
-    // ---- D134 ----------------------------------------------------------
 
     /// Root mail is waiting and a user cancel holds it until the next
     /// message.

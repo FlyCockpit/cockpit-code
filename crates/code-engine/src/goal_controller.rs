@@ -44,14 +44,27 @@ pub struct GoalRun {
     pub history: Vec<GoalLifecycle>,
     pub baseline_tokens: u64,
     pub baseline_usd: f64,
-    #[serde(default)]
     pub unknown_cost_calls: u64,
-    #[serde(default)]
     pub baseline_unknown_cost_calls: u64,
-    #[serde(default)]
     pub caching: code_config::PromptCaching,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    AwaitingApproval,
+    Other,
+}
 impl GoalRun {
+    /// A draft waits for owner approval while it is paused; whatever paused it
+    /// again (a cancel, `/goal pause`) does not change that. A cleared draft is
+    /// no longer approvable.
+    fn lifecycle(&self) -> Lifecycle {
+        if self.phase == "draft" && self.disposition == "paused" {
+            Lifecycle::AwaitingApproval
+        } else {
+            Lifecycle::Other
+        }
+    }
+
     pub(crate) fn transition(&mut self, disposition: &str, reason: Option<String>) {
         self.disposition = disposition.into();
         self.pause_reason = reason.clone();
@@ -139,6 +152,8 @@ impl Control {
     pub(crate) fn pause_goal(&self, reason: &str) -> Result<(), EngineError> {
         if let Some(mut run) = self.goal_state()
             && matches!(run.disposition.as_str(), "running" | "paused")
+            // Re-pausing a draft would replace its "approval" reason.
+            && run.lifecycle() != Lifecycle::AwaitingApproval
         {
             run.transition("paused", Some(reason.into()));
             self.save_goal(run)?;
@@ -370,7 +385,7 @@ impl Session {
         let mut run = self
             .goal_status()
             .ok_or_else(|| EngineError::bad("no goal draft"))?;
-        if run.phase != "draft" {
+        if run.lifecycle() != Lifecycle::AwaitingApproval {
             return Err(EngineError::bad("goal is not awaiting draft approval"));
         }
         if (contract.acceptance.is_empty() && contract.findings.is_empty())
@@ -398,6 +413,12 @@ impl Session {
         Ok(self.launch(Action::GoalContinue))
     }
     pub fn goal_cancel_draft(&self) -> Result<(), EngineError> {
+        let run = self
+            .goal_status()
+            .ok_or_else(|| EngineError::bad("no goal draft"))?;
+        if run.lifecycle() != Lifecycle::AwaitingApproval {
+            return Err(EngineError::bad("goal is not awaiting draft approval"));
+        }
         self.goal_clear()
     }
     pub fn goal_pause(&self) -> Result<(), EngineError> {
@@ -819,10 +840,8 @@ pub(crate) async fn drive(
                 .collect::<Vec<_>>();
             normalized.sort();
             normalized.dedup();
-            let fingerprint = format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&normalized).unwrap())
-            );
+            let fingerprint =
+                crate::hex::hex(&Sha256::digest(serde_json::to_vec(&normalized).unwrap()));
             g.repeated_gap_rounds = if g.gap_fingerprint.as_deref() == Some(&fingerprint) {
                 g.repeated_gap_rounds + 1
             } else {
@@ -948,4 +967,113 @@ async fn usage_backoff(control: &Control, cancel: &CancellationToken) -> Result<
     g.phase = phase;
     control.save_goal(g)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft() -> GoalRun {
+        GoalRun {
+            id: "goal-1".into(),
+            contract: GoalContract {
+                objective: "Implement the change".into(),
+                acceptance: vec![crate::goal::Criterion {
+                    text: "Tests pass".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            disposition: "paused".into(),
+            phase: "draft".into(),
+            pause_reason: Some("approval".into()),
+            policy: Default::default(),
+            model: "missing/model".into(),
+            effort: None,
+            model_config: serde_json::from_value(json!({})).unwrap(),
+            turns: 0,
+            tokens: 0,
+            cost_usd: 0.0,
+            active_seconds: 0.0,
+            no_progress_turns: 0,
+            review_rounds: 0,
+            gap_fingerprint: None,
+            repeated_gap_rounds: 0,
+            usage_resumes: 0,
+            gaps: vec![],
+            next_step: None,
+            history: vec![],
+            baseline_tokens: 0,
+            baseline_usd: 0.0,
+            unknown_cost_calls: 0,
+            baseline_unknown_cost_calls: 0,
+            caching: Default::default(),
+        }
+    }
+
+    #[test]
+    fn stored_goal_runs_require_cost_tracking_and_caching() {
+        let saved = serde_json::to_value(draft()).unwrap();
+        let restored: GoalRun = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), saved);
+        for field in ["unknownCostCalls", "baselineUnknownCostCalls", "caching"] {
+            let mut missing = saved.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<GoalRun>(missing).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleared_draft_rejects_stale_approval_and_cancellation() {
+        let (temp, store) = crate::test_support::store(json!({}));
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        let run = draft();
+        session
+            .control
+            .save_contract("root", run.contract.clone())
+            .unwrap();
+        session.control.save_goal(run.clone()).unwrap();
+        session.goal_clear().unwrap();
+        let error = session.goal_approve(run.contract).unwrap_err();
+        assert_eq!(error.message, "goal is not awaiting draft approval");
+        assert!(session.goal_cancel_draft().is_err());
+        assert_eq!(session.goal_status().unwrap().disposition, "cleared");
+        assert!(session.contract("root").acceptance.is_empty());
+        assert!(!session.is_active());
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn awaiting_approval_draft_can_be_approved_or_cancelled() {
+        for approve in [false, true] {
+            let (temp, store) = crate::test_support::store(json!({}));
+            let session =
+                Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+            let run = draft();
+            session
+                .control
+                .save_contract("root", run.contract.clone())
+                .unwrap();
+            session.control.save_goal(run.clone()).unwrap();
+            // A cancel or `/goal pause` while the draft waits must keep it approvable.
+            session.control.pause_goal("user").unwrap();
+            assert_eq!(
+                session.goal_status().unwrap().pause_reason.as_deref(),
+                Some("approval")
+            );
+            if approve {
+                let _events = session.goal_approve(session.contract("root")).unwrap();
+                let run = session.goal_status().unwrap();
+                assert_eq!(run.phase, "executing");
+                assert_eq!(run.disposition, "running");
+                assert_eq!(session.contract("root").acceptance[0].owner, "user");
+                assert!(session.goal_cancel_draft().is_err());
+            } else {
+                session.goal_cancel_draft().unwrap();
+                assert_eq!(session.goal_status().unwrap().disposition, "cleared");
+            }
+            session.shutdown().await.unwrap();
+        }
+    }
 }

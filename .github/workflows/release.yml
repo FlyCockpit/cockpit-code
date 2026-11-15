@@ -1,0 +1,185 @@
+# Builds release binaries for a `v*` tag and publishes them as a GitHub Release
+# with SHA256SUMS and third-party license notices.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Manual runs build and check the artifacts without publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check version and extract release notes
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          if os.environ['EVENT_NAME'] == 'push' and os.environ['RELEASE_TAG'] != f'v{version}':
+              raise SystemExit('Release tag must equal v + workspace version')
+          changelog = Path('CHANGELOG.md').read_text()
+          section = re.search(r'^## ' + re.escape(version) + r' - [^\n]+\n(.*?)(?=^## |\Z)', changelog, re.M | re.S)
+          if not section or not section.group(1).strip():
+              raise SystemExit('Missing changelog entry for workspace version')
+          Path('dist').mkdir()
+          Path('dist/release-notes.md').write_text(section.group(1).strip() + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Generate third-party notices
+        run: |
+          cargo install --locked --features cli cargo-about@0.9.3
+          cargo about generate --locked --fail about.hbs -o dist/THIRD_PARTY_LICENSES.html
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-metadata
+          path: dist/
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux releases are static musl binaries, so they don't depend on the
+          # runner's glibc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            # GitHub has no ubuntu-latest label for Arm runners, so an explicit
+            # release is required. Bump it with ubuntu-latest; the output is a
+            # static musl binary, so the release doesn't affect users.
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-metadata
+          path: metadata
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # musl-gcc compiles the C dependencies (tree-sitter grammars,
+            # aws-lc-sys) and links the static binary.
+            export "CC_${TARGET//-/_}=musl-gcc"
+            linker_target=${TARGET//-/_}
+            export "CARGO_TARGET_${linker_target^^}_LINKER=musl-gcc"
+          fi
+          nice -n 10 cargo build --release --locked --target "$TARGET" -p cockpit-code
+          binary="target/$TARGET/release/cockpit-code"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # The distributed Linux binary must be statically linked. Capture
+            # readelf's output first so a readelf failure fails the build.
+            headers=$(readelf -l "$binary")
+            if grep -q INTERP <<<"$headers"; then
+              echo "Expected a static musl binary: $binary" >&2
+              exit 1
+            fi
+          fi
+          # Smoke-test binaries the runner can execute (macos-latest is Arm, so
+          # x86_64-apple-darwin is skipped).
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [[ "$RUNNER_OS" == Linux || "$TARGET" == "$host" ]]; then
+            "$binary" --version
+          fi
+          name="cockpit-code-$VERSION-$TARGET"
+          mkdir -p "staging/$name" dist
+          cp "$binary" "staging/$name/"
+          cp LICENSE README.md CHANGELOG.md metadata/THIRD_PARTY_LICENSES.html "staging/$name/"
+          tar -C staging -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Check assets and write checksums
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
+            test -s "cockpit-code-$VERSION-$target.tar.gz"
+          done
+          test -s THIRD_PARTY_LICENSES.html
+          mv release-notes.md "$RUNNER_TEMP/release-notes.md"
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "Cockpit Code $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            dist/*

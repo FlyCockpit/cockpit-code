@@ -390,7 +390,7 @@ impl Picker {
         }
     }
 
-    /// The wheel scrolls the rows; the selection stays (D130).
+    /// The wheel scrolls the rows; the selection stays.
     pub fn wheel(&mut self, delta: isize) {
         self.set_offset((self.scroll as isize + delta).max(0) as usize);
     }

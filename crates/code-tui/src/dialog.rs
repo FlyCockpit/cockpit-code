@@ -1,4 +1,4 @@
-//! Reusable modal dialog: title, a markdown or diff body, a list of options
+//! Reusable modal dialog: title, a markdown or file diff body, a list of options
 //! and an optional free-text field. Adapted from FlyCockpit's Cockpit dialog state
 //! machine reduced to one page; approvals, questions and the session-lock
 //! dialog will reuse it.
@@ -48,10 +48,6 @@ impl DialogOption {
 pub enum Body {
     None,
     Markdown(String),
-    Diff {
-        old: String,
-        new: String,
-    },
     FileDiff {
         path: String,
         old: String,
@@ -69,7 +65,6 @@ impl Body {
                 .into_iter()
                 .map(|line| line.style(theme().text()))
                 .collect(),
-            Self::Diff { old, new } => diff::render(old, new).lines,
             Self::FileDiff {
                 path,
                 old,

@@ -1,4 +1,4 @@
-//! Plain views of criteria contracts and the `/goal` run (D88–D97, D110),
+//! Plain views of criteria contracts and the `/goal` run,
 //! and the editable draft that round-trips through the engine contract.
 //! Part of the engine adapter: the rest of the TUI never sees engine types.
 use code_engine::{Criterion, CriterionCheck, GoalContract, GoalRun, Proposal, Roadblock};
@@ -61,7 +61,7 @@ pub struct CriterionView {
     pub evidence: String,
     pub findings: Vec<FindingView>,
     pub checked_clean: bool,
-    /// D132: what the area's review did not verify / did not cover (None:
+    /// What the area's review did not verify / did not cover (None:
     /// not stated yet, required before completion).
     pub unverified: Option<Vec<String>>,
     pub not_covered: Option<Vec<String>>,
@@ -72,13 +72,13 @@ pub struct CriterionView {
     pub override_note: Option<String>,
 }
 
-/// One structured finding (D126/D132).
+/// One structured finding.
 #[derive(Clone, Debug, Default)]
 pub struct FindingView {
     /// What is wrong.
     pub text: String,
     pub evidence: String,
-    /// critical, high, medium, low or info (empty on legacy rows).
+    /// critical, high, medium, low or info.
     pub severity: String,
     /// `file:line` references.
     pub locations: Vec<String>,
@@ -93,7 +93,7 @@ pub struct ProposalView {
     pub id: String,
     pub criterion_id: String,
     pub change: String,
-    /// The replacement check command (engine-o); None removes the old check.
+    /// The replacement check command; None removes the old check.
     pub check: Option<String>,
     pub reason: String,
     /// open, accept, edit or reject.
@@ -322,12 +322,23 @@ pub(super) fn goal(g: &GoalRun) -> GoalView {
     }
 }
 
+/// Reads a YAML null (a blank value such as `findings:`) as the type's
+/// default, so an emptied field in the `$EDITOR` document stays valid.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// One editable item: an existing criterion keeps its id (and with it its
 /// evidence while text and check are unchanged).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DraftItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(deserialize_with = "null_as_default")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
@@ -338,18 +349,19 @@ pub struct DraftItem {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContractDraft {
+    #[serde(deserialize_with = "null_as_default")]
     pub objective: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub acceptance: Vec<DraftItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub findings: Vec<DraftItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub rejection: Vec<DraftItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub non_goals: Vec<DraftItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub assumed_scope: Vec<DraftItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub steps: Vec<DraftItem>,
 }
 
@@ -398,7 +410,7 @@ impl ContractDraft {
     }
     /// The YAML document for `$EDITOR`, with a short header.
     pub fn to_yaml(&self) -> String {
-        let body = serde_yaml_ng::to_string(self).unwrap_or_default();
+        let body = serde_saphyr::to_string(self).unwrap_or_default();
         format!(
             "# Goal contract. Edit and save; an empty file or a non-zero editor exit cancels.\n\
              # Keep `id` on items you only reword lightly; a changed text or check reopens the item.\n\
@@ -408,8 +420,19 @@ impl ContractDraft {
         )
     }
     pub fn from_yaml(text: &str) -> Result<Self, String> {
-        let mut d: Self =
-            serde_yaml_ng::from_str(text).map_err(|e| format!("contract YAML: {e}"))?;
+        let mut d: Self = serde_saphyr::from_str_with_options(
+            text,
+            serde_saphyr::options! {
+                ignore_binary_tag_for_string: true,
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                duplicate_keys: serde_saphyr::DuplicateKeyPolicy::PassThrough,
+                strict_booleans: true,
+                leading_zero_numbers_as_strings: true,
+                underscored_numbers_as_strings: true,
+                non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+            },
+        )
+        .map_err(|e| format!("contract YAML: {e}"))?;
         for s in Section::ALL {
             let list = d.list_mut(s);
             list.retain(|i| !i.text.trim().is_empty());
@@ -473,5 +496,111 @@ impl ContractDraft {
         out.assumed_scope = build(&self.assumed_scope, &all);
         out.steps = build(&self.steps, &all);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn goal_binary_tags_keep_literal_string_text() {
+        let draft = super::ContractDraft::from_yaml(
+            "objective: !!binary SGVsbG8=\nacceptance:\n- text: !!binary V29ybGQ=\n",
+        )
+        .unwrap();
+        assert_eq!(draft.objective, "SGVsbG8=");
+        assert_eq!(draft.acceptance[0].text, "V29ybGQ=");
+    }
+
+    use super::{ContractDraft, DraftItem};
+
+    #[test]
+    fn goal_yaml_round_trips_all_sections_and_quoted_block_strings() {
+        let item = DraftItem {
+            id: Some("id: one".into()),
+            text: "first\nsecond\n".into(),
+            check: Some("printf 'yes: true'".into()),
+        };
+        let draft = ContractDraft {
+            objective: "null".into(),
+            acceptance: vec![item.clone()],
+            findings: vec![item.clone()],
+            rejection: vec![item.clone()],
+            non_goals: vec![item.clone()],
+            assumed_scope: vec![item.clone()],
+            steps: vec![item],
+        };
+        let parsed = ContractDraft::from_yaml(&draft.to_yaml()).unwrap();
+        let mut expected = draft;
+        for section in super::Section::ALL {
+            for item in expected.list_mut(section) {
+                item.text = item.text.trim().into();
+            }
+        }
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn goal_yaml_preserves_nested_items_aliases_and_optional_nulls() {
+        let draft = ContractDraft::from_yaml("objective: 'quoted: objective'\nacceptance:\n  - &item\n    id: null\n    text: |\n      first\n      second\n    check: ~\nfindings:\n  - *item\nextra: {list: [1, true, null]}\n").unwrap();
+        assert_eq!(draft.objective, "quoted: objective");
+        assert_eq!(draft.acceptance[0].text, "first\nsecond");
+        assert_eq!(draft.acceptance[0].id, None);
+        assert_eq!(draft.acceptance[0].check, None);
+        assert_eq!(draft.findings, draft.acceptance);
+    }
+
+    #[test]
+    fn goal_yaml_keeps_typed_scalar_strings_and_literal_merge_keys() {
+        let draft = ContractDraft::from_yaml("objective: 42\nacceptance:\n- text: true\n  check: 'null'\nextra: .inf\ndefaults: &defaults {findings: [{text: merged}]}\n<<: *defaults\n").unwrap();
+        assert_eq!(draft.objective, "42");
+        assert_eq!(draft.acceptance[0].text, "true");
+        assert_eq!(draft.acceptance[0].check.as_deref(), Some("null"));
+        assert!(draft.findings.is_empty());
+    }
+
+    #[test]
+    fn goal_yaml_reads_blank_values_as_empty() {
+        // Blank values (YAML null) behave as they did with serde_yaml_ng:
+        // an empty objective, an empty section, and dropped blank items.
+        for input in ["objective:", "objective: ~", "objective: null"] {
+            assert_eq!(ContractDraft::from_yaml(input).unwrap().objective, "");
+        }
+        let draft = ContractDraft::from_yaml(
+            "objective: x\nacceptance:\nfindings: ~\nsteps:\n- text:\n- text: kept\n  check:\n",
+        )
+        .unwrap();
+        assert!(draft.acceptance.is_empty());
+        assert!(draft.findings.is_empty());
+        assert_eq!(draft.steps.len(), 1);
+        assert_eq!(draft.steps[0].text, "kept");
+        assert_eq!(draft.steps[0].check, None);
+        for value in ["null", "~", ""] {
+            assert_eq!(
+                ContractDraft::from_yaml(&format!("objective: '{value}'"))
+                    .unwrap()
+                    .objective,
+                value
+            );
+        }
+        assert!(ContractDraft::from_yaml("objective: x\nacceptance:\n- check: c\n").is_err());
+    }
+
+    #[test]
+    fn goal_yaml_rejects_empty_invalid_and_multiple_documents() {
+        for input in [
+            "",
+            "---\n",
+            "objective: [",
+            "objective: *missing",
+            "objective: x\nobjective: y",
+            "objective: x\n---\nobjective: y",
+        ] {
+            assert!(
+                ContractDraft::from_yaml(input)
+                    .unwrap_err()
+                    .starts_with("contract YAML:"),
+                "{input}"
+            );
+        }
     }
 }

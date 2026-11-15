@@ -1,4 +1,4 @@
-//! The terminal sidebar (D144 private user terminals, D140 tty jobs).
+//! The terminal sidebar (private user terminals, tty jobs).
 //!
 //! Layout: at 100+ columns a resizable right-hand column beside the chat
 //! (drag its left edge, or `<` / `>` with the panel focused); narrower, the
@@ -9,7 +9,7 @@
 //! PTY) → ctrl+] → panel keys (tabs, share, close…) → ctrl+]/esc → composer.
 //! A click on the screen types there; a click elsewhere leaves it.
 //!
-//! Privacy (D144): terminal bytes arrive on their own channel
+//! Privacy: terminal bytes arrive on their own channel
 //! ([`TermMsg`]), feed only the view's own `vt100` screen, and are purged
 //! when the terminal closes. They never become a UiEvent, transcript row,
 //! search hit, export, pager text, copy/OSC 52 payload or log line.

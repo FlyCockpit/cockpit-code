@@ -775,7 +775,7 @@ async fn start_child(
         max_descendants,
         model_policy: policy,
         launch_id: Uuid::new_v4().to_string(),
-        original_task: Some(prompt.clone()),
+        original_task: prompt.clone(),
         agent_id: id.clone(),
         cwd: cwd.clone(),
         remaining_depth: remaining,
@@ -1070,9 +1070,6 @@ async fn continue_child(
             ));
         }
         execution.remaining_depth = remaining_depth;
-        if execution.original_task.is_none() {
-            execution.original_task = Some(execution.task.clone());
-        }
         execution.task = prompt.clone();
         execution.background = args["background"] == true;
         let idle = j
@@ -1210,10 +1207,7 @@ fn seed_cold_context(
             .unwrap_or_else(|| "No final report was recorded.".into());
         let summary = format!(
             "Cold follow-up.\nOriginal task: {}\nFinal report: {}\n{}",
-            execution
-                .original_task
-                .as_deref()
-                .unwrap_or(&execution.task),
+            execution.original_task,
             report,
             names.rewrite(&crate::session_tools::earlier_context_footer(&j, id))
         );
@@ -1344,26 +1338,6 @@ async fn launch_child(
         done: tokio::sync::Notify::new(),
         task: tokio::sync::Mutex::new(None),
     });
-    let job = if background {
-        Some(state.control.start_job(
-            &state.agent_id,
-            "task",
-            prompt.clone(),
-            Some(id.clone()),
-            token.clone(),
-            barrier.clone(),
-        )?)
-    } else {
-        None
-    };
-    state
-        .control
-        .runtime
-        .agents
-        .lock()
-        .unwrap()
-        .insert(id.clone(), child.clone());
-    let job_id = job.as_ref().map(|j| j.id.clone());
     let control = state.control.clone();
     let fresh = context_decision
         .as_ref()
@@ -1401,7 +1375,7 @@ async fn launch_child(
         model_override: Some(model_id),
         effort_override: effort,
         compact_request: Arc::new(Mutex::new(None)),
-        job_id: job_id.clone(),
+        job_id: None,
         script_depth: 0,
         parent_call_id: None,
         warned_context: checkpoint.as_ref().is_some_and(|p| p.warned_context),
@@ -1417,6 +1391,29 @@ async fn launch_child(
         context_state: context::BoundaryState::default(),
         active_model: None,
     };
+    // Finish fallible setup before publishing a job or an unfinished runtime child.
+    let target = scheduler::Target::model(&child_state.model()?);
+    let job = if background {
+        Some(state.control.start_job(
+            &state.agent_id,
+            "task",
+            prompt.clone(),
+            Some(id.clone()),
+            token.clone(),
+            barrier.clone(),
+        )?)
+    } else {
+        None
+    };
+    state
+        .control
+        .runtime
+        .agents
+        .lock()
+        .unwrap()
+        .insert(id.clone(), child.clone());
+    let job_id = job.as_ref().map(|j| j.id.clone());
+    child_state.job_id = job_id.clone();
     let turn = Uuid::new_v4().to_string();
     control
         .journal
@@ -1427,12 +1424,9 @@ async fn launch_child(
     let result_context = context_decision.clone();
     let run_handle = child.clone();
     let run_id = id.clone();
-    let slot = control.scheduler.register(
-        id.clone(),
-        id.clone(),
-        scheduler::Target::model(&child_state.model()?),
-        Some(&state.agent_id),
-    );
+    let slot = control
+        .scheduler
+        .register(id.clone(), id.clone(), target, Some(&state.agent_id));
     let task = tokio::spawn(async move {
         let _slot = slot;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1940,32 +1934,15 @@ impl Control {
             .is_some_and(|q| !q.is_empty())
     }
     pub(crate) fn answer_question(&self, id: &str, text: String) -> Result<(), EngineError> {
-        let question = self.journal.lock().unwrap().questions.get(id).cloned();
-        if let Some(q) = question.filter(|q| !q.questions.is_empty()) {
-            return self.answer_set(id, crate::questions::text_answers(&q, &text));
-        }
-        let result = {
-            let mut j = self.journal.lock().unwrap();
-            let q = j
-                .questions
-                .get(id)
-                .ok_or_else(|| EngineError::bad("question not found"))?;
-            if q.answer.is_some() {
-                return Err(EngineError::bad("question already answered"));
-            }
-            let asker = q.asker.clone();
-            j.append(
-                &asker,
-                HistoryEvent::Answer {
-                    id: id.into(),
-                    text,
-                },
-            )
-        };
-        let envelope = result.inspect_err(|e| self.claimed(e))?;
-        self.emit(EngineEvent::Committed { envelope });
-        self.changed.notify_waiters();
-        Ok(())
+        let q = self
+            .journal
+            .lock()
+            .unwrap()
+            .questions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| EngineError::bad("question not found"))?;
+        self.answer_set(id, crate::questions::text_answers(&q, &text))
     }
     pub(crate) fn escalate_question(
         &self,
@@ -2139,5 +2116,107 @@ impl Control {
             self.release_question_wait(&id)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_child_preparation_publishes_no_pending_run_or_job() {
+        for bad_guidance in [false, true] {
+            for background in [false, true] {
+                let (temp, store) = crate::test_support::store(json!({}));
+                let session =
+                    Session::create(store.clone(), temp.path().to_owned(), Default::default())
+                        .unwrap();
+                let cwd = temp.path().join("child");
+                std::fs::create_dir(&cwd).unwrap();
+                if bad_guidance {
+                    std::fs::create_dir_all(cwd.join(".cockpit-code/reviewer-guidance.md"))
+                        .unwrap();
+                }
+                let mut agent = session.control.journal.lock().unwrap().agents["root"].clone();
+                agent.agent_id = "build-child".into();
+                agent.parent_id = Some("root".into());
+                agent.model = Some("missing/model".into());
+                agent.status = "running".into();
+                session
+                    .control
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .register(agent.clone())
+                    .unwrap();
+                let execution: AgentExecution = serde_json::from_value(json!({
+                    "launchId":"launch-1", "agentId":agent.agent_id, "cwd":cwd,
+                    "title":"", "modelPolicy":[],
+                    "remainingDepth":null, "originalTask":"task", "task":"task", "background":background
+                })).unwrap();
+                let result = launch_child(
+                    &*session.state.lock().await,
+                    ChildLaunch {
+                        steering: false,
+                        prompt: "task".into(),
+                        agent,
+                        execution,
+                        checkpoint: None,
+                        store,
+                        idle_seconds: None,
+                        context_decision: None,
+                    },
+                    &CancellationToken::new(),
+                )
+                .await;
+                assert!(result.is_err());
+                assert!(!session.control.runtime.has_unfinished());
+                assert!(!session.control.runtime.children_pending("root"));
+                assert!(session.control.runtime.agents.lock().unwrap().is_empty());
+                assert!(session.control.runtime.jobs.lock().unwrap().is_empty());
+                {
+                    let journal = session.control.journal.lock().unwrap();
+                    assert_eq!(journal.agents["build-child"].status, "failed");
+                    assert!(journal.jobs.is_empty());
+                }
+                tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_answer_uses_the_structured_answer_journal() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        let id = session
+            .control
+            .ask_question("root", "Proceed?".into(), false)
+            .unwrap();
+        session.control.answer_question(&id, "yes".into()).unwrap();
+        assert!(
+            session
+                .control
+                .answer_question(&id, "again".into())
+                .is_err()
+        );
+        assert!(
+            session
+                .control
+                .answer_question("unknown", "yes".into())
+                .is_err()
+        );
+        assert_eq!(
+            session.control.journal.lock().unwrap().questions[&id]
+                .answers
+                .as_ref()
+                .unwrap()[0]
+                .text
+                .as_deref(),
+            Some("yes")
+        );
+        session.shutdown().await.unwrap();
     }
 }

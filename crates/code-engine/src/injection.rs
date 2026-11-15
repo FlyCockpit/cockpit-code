@@ -22,50 +22,8 @@ pub(crate) fn canonicalize_fresh(event: &mut HistoryEvent, event_id: &str) {
                 .to_string();
             *text = with_id(text, &id);
         }
-        // History replacement copies come from the existing canonical journal,
-        // and must retain the ids/bytes of the original injected notices.
-        _ => canonicalize(event, event_id),
-    }
-}
-/// Trusted storage replay keeps recorded notice ids, upgrading legacy raw text.
-pub(crate) fn canonicalize(event: &mut HistoryEvent, event_id: &str) {
-    match event {
-        HistoryEvent::SystemReminder { text } | HistoryEvent::Compaction { summary: text } => {
-            if body(text).is_none() {
-                let id = Uuid::parse_str(event_id)
-                    .unwrap_or_else(|_| Uuid::new_v4())
-                    .simple()
-                    .to_string();
-                *text = with_id(text, &id);
-            }
-        }
-        HistoryEvent::HistoryReplace { history, .. } => {
-            for (index, event) in history.iter_mut().enumerate() {
-                // Canonical replacement copies retain their existing ids. Legacy
-                // nested entries get separate ids once when the envelope is read.
-                let id = format!("{}{:08x}", event_id.replace('-', ""), index);
-                canonicalize_legacy(event, &id);
-            }
-        }
+        // Replacement copies already carry their original notice provenance.
         _ => {}
-    }
-}
-fn canonicalize_legacy(event: &mut HistoryEvent, seed: &str) {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(seed.as_bytes());
-    // The seed includes the durable random event id; derive stable distinct ids
-    // for old replacement entries without changing them on each replay.
-    let id = hash[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    match event {
-        HistoryEvent::SystemReminder { text } | HistoryEvent::Compaction { summary: text }
-            if body(text).is_none() =>
-        {
-            *text = with_id(text, &id)
-        }
-        _ => canonicalize(event, &id),
     }
 }
 /// Recognize the entire canonical wrapper, including matching random ids.
@@ -76,4 +34,42 @@ pub(crate) fn body(text: &str) -> Option<&str> {
         return None;
     }
     rest.strip_suffix(&format!("\n</system-message id=\"{id}\">"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_notices_receive_event_provenance() {
+        let event_id = "00000000-0000-4000-8000-000000000001";
+        let mut event = HistoryEvent::SystemReminder {
+            text: "hello".into(),
+        };
+        canonicalize_fresh(&mut event, event_id);
+        let HistoryEvent::SystemReminder { text } = event else {
+            panic!()
+        };
+        assert_eq!(body(&text), Some("hello"));
+        assert!(text.contains("00000000000040008000000000000001"));
+        assert_eq!(body(&text.replace("</system-message", "</other")), None);
+    }
+
+    #[test]
+    fn replacement_history_keeps_recorded_notice_bytes() {
+        let mut event = HistoryEvent::HistoryReplace {
+            history: vec![
+                HistoryEvent::Compaction {
+                    summary: notice("summary"),
+                },
+                HistoryEvent::SystemReminder {
+                    text: "raw stored text".into(),
+                },
+            ],
+            reason: "replace".into(),
+        };
+        let before = serde_json::to_value(&event).unwrap();
+        canonicalize_fresh(&mut event, &Uuid::new_v4().to_string());
+        assert_eq!(serde_json::to_value(event).unwrap(), before);
+    }
 }

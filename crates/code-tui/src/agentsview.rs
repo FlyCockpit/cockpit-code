@@ -1,4 +1,4 @@
-//! `/agents` (D131): the whole session tree as a filterable tree view with
+//! `/agents`: the whole session tree as a filterable tree view with
 //! live rows, and actions on a selected descendant (open its transcript,
 //! ask its status through a hidden fork, finalize, stop). The filters are
 //! the `agents list` filters: state, context, subtree, model and a text
@@ -84,7 +84,7 @@ pub struct AgentsView {
     model: Option<usize>,
     pub query: String,
     query_focus: bool,
-    /// Flat mode: no finalize (D133).
+    /// Flat mode: no finalize.
     pub flat: bool,
     selected: Option<String>,
     top: usize,

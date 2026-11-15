@@ -1,5 +1,5 @@
-//! engine-o rows and dialogs: D120 scope requests and subscription notices,
-//! D121 guidance (rows and `/guidance`), `/prune`, and the D122 `!cmd`
+//! Rows and dialogs for scope requests and subscription notices,
+//! guidance (rows and `/guidance`), `/prune`, and the `!cmd`
 //! notice row.
 use super::{App, DialogPurpose, Overlay, Prompt};
 use crate::agents::Tree;
@@ -98,7 +98,10 @@ pub(super) fn scope_card(tree: &Tree, v: &ScopeView) -> Card {
     if let Some(o) = v.output.as_deref().filter(|o| !o.trim().is_empty()) {
         md.push_str(&format!("\n\nresult: {}", truncate(o.trim(), 600)));
     }
-    md.push_str(&format!("\n\nrequest `{}`", &v.id[..v.id.len().min(8)]));
+    md.push_str(&format!(
+        "\n\nrequest `{}`",
+        v.id.chars().take(8).collect::<String>()
+    ));
     let mut body = vec![CardPart::Md(md)];
     body.extend(scope_diff(v));
     Card {
@@ -110,7 +113,7 @@ pub(super) fn scope_card(tree: &Tree, v: &ScopeView) -> Card {
     }
 }
 
-/// Batched changes to subscribed paths (D120): who changed what, and the
+/// Batched changes to subscribed paths: who changed what, and the
 /// bounded diffs on expand.
 pub(super) fn subscription_card(tree: &Tree, changes: &[ChangeView], overflow: bool) -> Card {
     let who = |c: &ChangeView| match &c.source {
@@ -175,7 +178,7 @@ fn trigger_text(s: &GuidanceSel) -> String {
     )
 }
 
-/// A guidance injection (D121) as a distinct, collapsible row.
+/// A guidance injection as a distinct, collapsible row.
 pub(super) fn guidance_card(s: &GuidanceSel) -> Card {
     let (tone, head) = if let Some(e) = &s.error {
         (Tone::Warn, format!("guidance failed · {}", truncate(e, 80)))
@@ -323,10 +326,10 @@ impl App {
         }
     }
 
-    /// The owner dialog for a scope request root owns (D120).
+    /// The owner dialog for a scope request root owns.
     pub(super) fn scope_dialog(&mut self, v: &ScopeView) {
         let path = rel(&v.path);
-        // D124: the owner's reason comes first; it is why this is here.
+        // The owner's reason comes first; it is why this is here.
         let mut body = vec![];
         if let Some(why) = &v.escalation {
             body.push(Body::Markdown(format!(
@@ -454,7 +457,7 @@ impl App {
         }
     }
 
-    /// `/guidance`: what was injected, per agent, and why (D121).
+    /// `/guidance`: what was injected, per agent, and why.
     pub(super) fn open_guidance(&mut self) {
         let (enabled, model, max) = self.engine.guidance_config();
         let all = self.engine.guidance_selections(None);
@@ -576,7 +579,7 @@ impl App {
         self.hint("pruning…");
     }
 
-    /// D122: a finished `!cmd` tells the viewed agent what ran (not the output).
+    /// A finished `!cmd` tells the viewed agent what ran (not the output).
     pub(super) fn post_local_run(&mut self, agent: &str, run: LocalRun) {
         if self.read_only.is_some() {
             return;

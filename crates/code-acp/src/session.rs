@@ -7,8 +7,7 @@ use crate::rpc::{Out, RpcError, conforms};
 use code_config::{ConfigStore, Modality, PermissionMode};
 use code_engine::Session;
 use code_engine::schema::{
-    ApprovalDecision, ApprovalRequest, EngineEvent, HistoryEvent, QuestionKind, QuestionRecord,
-    QuestionSpec,
+    ApprovalDecision, ApprovalRequest, EngineEvent, HistoryEvent, QuestionRecord, QuestionSpec,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,7 +33,7 @@ pub enum Action {
 }
 
 /// Settings chosen before the first prompt. Applying them would create the
-/// session on disk (D44), so they wait for the first prompt.
+/// session on disk, so they wait for the first prompt.
 #[derive(Default)]
 struct Pending {
     mode: Option<PermissionMode>,
@@ -47,7 +46,7 @@ struct Pending {
 struct State {
     inflight: Option<Value>,
     queue: VecDeque<(Value, Action)>,
-    /// Mid-turn prompts held by the engine queue (D73): (queue id, request).
+    /// Mid-turn prompts held by the engine queue: (queue id, request).
     engine_queued: Vec<(u64, Value)>,
     /// Prompts the engine delivered into the running turn (steer,
     /// interrupt): answered when that turn ends.
@@ -57,6 +56,13 @@ struct State {
     materialized: bool,
     pending: Pending,
     asked: HashSet<String>,
+    /// Real tool calls whose ACP permission request is still unresolved.
+    approving: HashSet<String>,
+    /// Calls from `approving` that reached a terminal status before their
+    /// approval callback ran. Both sets are updated, and terminal updates are
+    /// published, under this lock, so an approval never overwrites a terminal
+    /// status; entries are removed when the approval resolves.
+    terminal_calls: HashSet<String>,
 }
 
 pub struct AcpSession {
@@ -198,7 +204,7 @@ impl AcpSession {
     // ---- prompts ---------------------------------------------------------
 
     /// Start a prompt. A prompt that arrives mid-turn goes to the engine
-    /// queue with config `queueDefault` (D73): next turn, steer or interrupt.
+    /// queue with config `queueDefault`: next turn, steer or interrupt.
     /// It is answered when the turn that consumed it ends. Compactions,
     /// prompts behind other local ones and prompts after a cancel wait
     /// locally for the turn to end.
@@ -389,7 +395,7 @@ impl AcpSession {
         }
     }
 
-    /// The engine delivered queued input (D73): a mid-turn prompt now
+    /// The engine delivered queued input: a mid-turn prompt now
     /// belongs to the running turn, or starts the engine's next turn.
     fn delivered(&self, queue_id: u64) {
         let mut st = self.state.lock().unwrap();
@@ -555,7 +561,7 @@ impl AcpSession {
     }
 
     /// ACP session config options: mode, model, reasoning effort and the
-    /// session's safety model (D45).
+    /// session's safety model.
     pub fn config_options(&self) -> Value {
         let models = self.models();
         let model = self.model();
@@ -797,6 +803,11 @@ impl AcpSession {
         let content = mapping::approval_content(&req, &cwd);
         let synthetic = call.is_none();
         let call_id = call.unwrap_or_else(|| req.call_id.clone());
+        if !synthetic {
+            let mut state = self.state.lock().unwrap();
+            state.terminal_calls.remove(&call_id);
+            state.approving.insert(call_id.clone());
+        }
         if synthetic {
             self.out.update(
                 &self.acp_id,
@@ -827,20 +838,47 @@ impl AcpSession {
                     feedback: format!("user unavailable: {}", e.message),
                 },
             };
-            let allowed = !matches!(decision, ApprovalDecision::Deny { .. });
-            if let Err(e) = this.session.respond_approval(&req.id, decision) {
-                eprintln!("acp: approval {}: {}", req.id, e.message);
-            }
-            let status = match (allowed, synthetic) {
-                (false, _) => "failed",
-                (true, true) => "completed",
-                (true, false) => "in_progress",
-            };
-            this.out.update(
-                &this.acp_id,
-                json!({"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": status}),
-            );
+            this.resolve_approval(&req, decision, synthetic, &call_id);
         });
+    }
+
+    fn resolve_approval(
+        &self,
+        req: &ApprovalRequest,
+        decision: ApprovalDecision,
+        synthetic: bool,
+        call_id: &str,
+    ) {
+        let allowed = !matches!(decision, ApprovalDecision::Deny { .. });
+        if let Err(e) = self.session.respond_approval(&req.id, decision) {
+            eprintln!("acp: approval {}: {}", req.id, e.message);
+            if synthetic {
+                self.approval_status(call_id, true, false);
+            } else {
+                let mut state = self.state.lock().unwrap();
+                state.approving.remove(call_id);
+                state.terminal_calls.remove(call_id);
+            }
+            return;
+        }
+        self.approval_status(call_id, synthetic, allowed);
+    }
+
+    fn approval_status(&self, call_id: &str, synthetic: bool, allowed: bool) {
+        let mut state = self.state.lock().unwrap();
+        // Hold the same lock as ToolEnd through publication: an approval must
+        // never overwrite a terminal update from a fast tool.
+        let ended = !synthetic && state.terminal_calls.remove(call_id);
+        if !synthetic {
+            state.approving.remove(call_id);
+        }
+        if synthetic || (allowed && !ended) {
+            self.out.update(
+                &self.acp_id,
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                    "status": if !allowed { "failed" } else if synthetic { "completed" } else { "in_progress" }}),
+            );
+        }
     }
 
     fn ask(self: &Arc<Self>, q: QuestionRecord, call: Option<String>) {
@@ -856,19 +894,7 @@ impl AcpSession {
     }
 
     async fn ask_now(&self, q: QuestionRecord, call: Option<String>) {
-        let legacy = q.questions.is_empty();
-        let specs = if legacy {
-            vec![QuestionSpec {
-                id: String::new(),
-                text: q.text.clone(),
-                kind: QuestionKind::Text,
-                options: vec![],
-                multi_select: false,
-                allow_other: true,
-            }]
-        } else {
-            q.questions.clone()
-        };
+        let specs = &q.questions;
         let mut header = format!("{} asks", q.breadcrumb);
         if let Some(note) = &q.note {
             header.push_str(&format!(" (escalated: {note})"));
@@ -878,7 +904,7 @@ impl AcpSession {
             let mut params = json!({
                 "mode": "form", "sessionId": self.acp_id,
                 "message": format!("{header}:\n{}", specs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n")),
-                "requestedSchema": mapping::elicitation_schema(&specs),
+                "requestedSchema": mapping::elicitation_schema(specs),
             });
             if let Some(call) = &call {
                 params["toolCallId"] = json!(call);
@@ -890,10 +916,10 @@ impl AcpSession {
             match self.out.request("elicitation/create", params).await {
                 Ok(r) => match r["action"].as_str() {
                     Some("accept") => {
-                        answers = Some(mapping::elicitation_answers(&specs, &r["content"]))
+                        answers = Some(mapping::elicitation_answers(specs, &r["content"]))
                     }
                     Some("decline") => {
-                        answers = Some(mapping::elicitation_answers(&specs, &json!({})))
+                        answers = Some(mapping::elicitation_answers(specs, &json!({})))
                     }
                     // Cancelled: the question stays pending in the engine.
                     _ => return,
@@ -915,19 +941,7 @@ impl AcpSession {
                 out
             }
         };
-        let result = if legacy {
-            let a = &answers[0];
-            self.session.answer(
-                &q.id,
-                if a.skipped {
-                    "skipped".to_string()
-                } else {
-                    mapping::answer_summary(a)
-                },
-            )
-        } else {
-            self.session.answer_questions(&q.id, answers)
-        };
+        let result = self.session.answer_questions(&q.id, answers);
         if let Err(e) = result {
             eprintln!("acp: question {}: {}", q.id, e.message);
         }
@@ -1168,9 +1182,6 @@ impl AcpSession {
                 json!({"sessionUpdate": "agent_thought_chunk", "content": text_block(&delta)}),
             ),
             EngineEvent::ToolStart { call } => {
-                if call.name == "todo" {
-                    return;
-                }
                 let old = (call.name == "write")
                     .then(|| {
                         call.arguments["path"]
@@ -1219,8 +1230,9 @@ impl AcpSession {
                 is_error,
                 details,
             } => {
-                if name == "todo" {
-                    return;
+                let mut state = self.state.lock().unwrap();
+                if state.approving.contains(&id) {
+                    state.terminal_calls.insert(id.clone());
                 }
                 v.inflight.retain(|c| *c != id);
                 let Some(call) = v.calls.get_mut(&id) else {
@@ -1285,6 +1297,12 @@ impl AcpSession {
                 ..
             } if agent_id == "root" => {
                 if let Some(result) = result {
+                    // Same ordering rule as ToolEnd: a script sub-call can carry
+                    // its own approval.
+                    let mut state = self.state.lock().unwrap();
+                    if state.approving.contains(&call.id) {
+                        state.terminal_calls.insert(call.id.clone());
+                    }
                     v.inflight.retain(|id| id != &call.id);
                     if let Some(view) = v.calls.get_mut(&call.id) {
                         view.output =
@@ -1325,10 +1343,6 @@ impl AcpSession {
                         },
                     );
                 }
-            }
-            EngineEvent::Todo { items } => {
-                v.todos = items;
-                self.plan(v);
             }
             EngineEvent::Committed { envelope } => match envelope.event {
                 HistoryEvent::Goal { .. } if envelope.agent_id == "root" => self.plan(v),
@@ -1465,6 +1479,7 @@ impl AcpSession {
     }
     fn goal_elicit(self: &Arc<Self>, kind: &str, data: Value, record_id: Option<String>) {
         let kind = kind.to_owned();
+        let goal_id = self.session.goal_status().map(|goal| goal.id);
         let options = match kind.as_str() {
             "draft" => {
                 json!([{"optionId":"approve","name":"Approve this contract and run","kind":"allow_once"},{"optionId":"cancel","name":"Cancel draft","kind":"reject_once"}])
@@ -1502,6 +1517,11 @@ impl AcpSession {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
+            if kind == "draft"
+                && !matches_goal_draft(goal_id.as_deref(), this.session.goal_status().as_ref())
+            {
+                return;
+            }
             let result = match kind.as_str() {
                 "draft" if selected == "approve" => this
                     .session
@@ -1534,6 +1554,13 @@ impl AcpSession {
             }
         });
     }
+}
+
+/// A dialog may outlive /goal clear, approval, or a replacement goal.
+fn matches_goal_draft(goal_id: Option<&str>, current: Option<&code_engine::GoalRun>) -> bool {
+    current.is_some_and(|goal| {
+        Some(goal.id.as_str()) == goal_id && goal.phase == "draft" && goal.disposition == "paused"
+    })
 }
 
 struct CallView {
@@ -1570,7 +1597,6 @@ struct View {
     /// Every subagent to the root `task` call that (transitively) spawned it.
     child_task: HashMap<String, String>,
     status: HashMap<String, String>,
-    todos: Value,
     /// Review notes for calls whose ToolStart has not arrived yet.
     early_notes: HashMap<String, Vec<String>>,
     /// Root approvals waiting for their ToolStart, with a deadline.
@@ -1685,9 +1711,6 @@ impl View {
             }
             EngineEvent::ToolStart { call } if agent.is_some() => {
                 let (id, crumb) = agent.unwrap();
-                if call.name == "todo" {
-                    return;
-                }
                 if let Some(task) = task_of(self, id) {
                     let line = format!(
                         "{crumb} › {}",
@@ -1739,5 +1762,240 @@ impl View {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn goal_draft() -> code_engine::GoalRun {
+        serde_json::from_value(json!({
+            "id":"original", "contract":code_engine::goal::GoalContract::default(),
+            "disposition":"paused", "phase":"draft", "pauseReason":"approval",
+            "policy":code_config::GoalConfig::default(), "model":"test/model", "effort":null,
+            "modelConfig":{}, "turns":0, "tokens":0,
+            "costUsd":0.0, "activeSeconds":0.0, "noProgressTurns":0, "reviewRounds":0,
+            "gapFingerprint":null, "repeatedGapRounds":0, "usageResumes":0,
+            "gaps":[], "nextStep":null, "history":[], "baselineTokens":0, "baselineUsd":0.0,
+            "unknownCostCalls":0, "baselineUnknownCostCalls":0,
+            "caching":code_config::PromptCaching::default()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn goal_dialog_only_resolves_the_same_pending_draft() {
+        let mut goal = goal_draft();
+        assert!(matches_goal_draft(Some("original"), Some(&goal)));
+        assert!(!matches_goal_draft(None, Some(&goal)));
+        assert!(!matches_goal_draft(Some("original"), None));
+        goal.id = "replacement".into();
+        assert!(!matches_goal_draft(Some("original"), Some(&goal)));
+        goal.id = "original".into();
+        goal.disposition = "cleared".into();
+        assert!(!matches_goal_draft(Some("original"), Some(&goal)));
+        goal.disposition = "running".into();
+        goal.phase = "executing".into();
+        assert!(!matches_goal_draft(Some("original"), Some(&goal)));
+        goal.disposition = "paused".into();
+        assert!(!matches_goal_draft(Some("original"), Some(&goal)));
+    }
+
+    struct TestDir(PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn approval_session(
+        command: bool,
+    ) -> (TestDir, Arc<AcpSession>, mpsc::UnboundedReceiver<String>) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = TestDir(std::env::temp_dir().join(format!(
+            "code-acp-approval-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        let config = root.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.json"), r#"{"skillsDirs":[]}"#).unwrap();
+        if command {
+            std::fs::create_dir(config.join("providers")).unwrap();
+            std::fs::write(config.join("providers/p.json"), json!({
+                "type":"command", "command":{
+                    "argv":["sh", "-c", r#"printf '%s\n' '{"type":"tool_call","id":"call","name":"bash","arguments":{"command":"true"}}' '{"type":"done","stopReason":"tool_use"}'"#],
+                    "output":"jsonl",
+                },
+                "models":{"m":{"capabilities":{"output":["text"],"tools":true}}},
+            }).to_string()).unwrap();
+        }
+        let store = ConfigStore::load(code_config::Directories {
+            config,
+            data: root.0.join("data"),
+            cache: root.0.join("cache"),
+        })
+        .unwrap();
+        let session = Session::create(
+            store.clone(),
+            root.0.clone(),
+            code_engine::SessionOptions {
+                model: command.then(|| "p/m".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        session.set_mode(PermissionMode::Manual).unwrap();
+        let (tx, frames) = mpsc::unbounded_channel();
+        let acp = Arc::new(AcpSession {
+            acp_id: session.id(),
+            session,
+            store,
+            out: Arc::new(Out::new(tx)),
+            caps: ClientCaps::default(),
+            state: Mutex::new(State::default()),
+            stop: tokio::sync::Notify::new(),
+        });
+        (root, acp, frames)
+    }
+
+    fn start_call(acp: &Arc<AcpSession>, view: &mut View, cwd: &Path) {
+        acp.event(
+            view,
+            cwd,
+            EngineEvent::ToolStart {
+                call: serde_json::from_value(
+                    json!({"id":"call","name":"bash","arguments":{},"complete":true}),
+                )
+                .unwrap(),
+            },
+        );
+    }
+
+    fn end_call(acp: &Arc<AcpSession>, view: &mut View, cwd: &Path, is_error: bool) {
+        acp.event(
+            view,
+            cwd,
+            EngineEvent::ToolEnd {
+                id: "call".into(),
+                name: "bash".into(),
+                output: "done".into(),
+                is_error,
+                details: Default::default(),
+            },
+        );
+    }
+
+    fn next_status(frames: &mut mpsc::UnboundedReceiver<String>) -> String {
+        let frame: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        frame["params"]["update"]["status"].as_str().unwrap().into()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_approval_resumes_only_before_tool_end() {
+        for end_first in [false, true] {
+            for is_error in [false, true] {
+                let (root, acp, mut frames) = approval_session(true);
+                let mut events = acp.session.send("run true");
+                let req = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while let Some(event) = events.recv().await {
+                        if let EngineEvent::ApprovalRequest { request } = event {
+                            return request;
+                        }
+                    }
+                    panic!("turn ended without an approval");
+                })
+                .await
+                .expect("approval was not requested");
+                let mut view = View::default();
+                start_call(&acp, &mut view, &root.0);
+                assert_eq!(next_status(&mut frames), "in_progress");
+                // What `approve` records when it sends the permission request.
+                acp.state.lock().unwrap().approving.insert("call".into());
+                if end_first {
+                    end_call(&acp, &mut view, &root.0, is_error);
+                }
+                acp.resolve_approval(&req, ApprovalDecision::Once, false, "call");
+                {
+                    // Resolution forgets the call, so the sets stay bounded.
+                    let state = acp.state.lock().unwrap();
+                    assert!(state.approving.is_empty() && state.terminal_calls.is_empty());
+                }
+                assert!(
+                    acp.session
+                        .respond_approval(&req.id, ApprovalDecision::Once)
+                        .is_err()
+                );
+                if !end_first {
+                    assert_eq!(next_status(&mut frames), "in_progress");
+                    end_call(&acp, &mut view, &root.0, is_error);
+                }
+                assert_eq!(
+                    next_status(&mut frames),
+                    if is_error { "failed" } else { "completed" }
+                );
+                assert!(frames.try_recv().is_err());
+                // Calls without a pending approval are never recorded.
+                assert!(acp.state.lock().unwrap().terminal_calls.is_empty());
+                // Backends may reuse ids in a later turn.
+                start_call(&acp, &mut view, &root.0);
+                assert_eq!(next_status(&mut frames), "in_progress");
+                acp.approval_status("call", false, true);
+                assert_eq!(next_status(&mut frames), "in_progress");
+                acp.session.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_approval_fails_only_synthetic_cards() {
+        let (_root, acp, mut frames) = approval_session(false);
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "id":"retired", "callId":"call", "agentId":"root", "breadcrumb":"root",
+            "tool":"bash", "requested":{}, "resolved":{}, "reason":"approval"
+        }))
+        .unwrap();
+        for synthetic in [false, true] {
+            for decision in [
+                ApprovalDecision::Once,
+                ApprovalDecision::Deny {
+                    feedback: "no".into(),
+                },
+            ] {
+                if !synthetic {
+                    acp.state.lock().unwrap().approving.insert("call".into());
+                }
+                acp.resolve_approval(&req, decision, synthetic, "call");
+                if synthetic {
+                    assert_eq!(next_status(&mut frames), "failed");
+                }
+                assert!(frames.try_recv().is_err());
+                assert!(acp.state.lock().unwrap().approving.is_empty());
+            }
+        }
+        acp.session.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn question_forms_keep_structured_ids_and_answer_types() {
+        let q: QuestionRecord = serde_json::from_value(json!({
+            "id":"set", "asker":"root", "recipient":null, "breadcrumb":"root", "text":"summary", "answer":null, "note":null,
+            "questions":[{"id":"where", "text":"Where?", "kind":"text"},
+                {"id":"proceed", "text":"Proceed?", "kind":"boolean"}]
+        })).unwrap();
+        let schema = mapping::elicitation_schema(&q.questions);
+        assert_eq!(schema["properties"]["where"]["type"], "string");
+        let answers =
+            mapping::elicitation_answers(&q.questions, &json!({"where":"Here", "proceed":true}));
+        assert_eq!(answers[0].id, "where");
+        assert_eq!(answers[0].text.as_deref(), Some("Here"));
+        assert_eq!(answers[1].boolean, Some(true));
+        assert!(
+            mapping::elicitation_answers(&q.questions, &json!({}))
+                .iter()
+                .all(|a| a.skipped)
+        );
     }
 }

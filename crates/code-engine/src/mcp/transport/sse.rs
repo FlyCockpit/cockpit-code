@@ -121,7 +121,7 @@ impl SseClient {
         .await?;
         let rx = self.rx.as_mut().context("MCP SSE receiver missing")?;
         while let Some(value) = rx.recv().await {
-            if value["id"].as_u64() == Some(id) {
+            if response_id(&value) == Some(id) {
                 return serde_json::from_value::<JsonRpcResponse>(value)?.into_result();
             }
         }
@@ -170,5 +170,57 @@ impl McpClient for SseClient {
     async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
         self.request("tools/call", Some(json!({"name":name,"arguments":args})))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn pending_id_only_matches_responses_from_event_queue() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            let mut request = Vec::new();
+            loop {
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buf[..count]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let mut client = SseClient::new(
+            endpoint.clone(),
+            BTreeMap::new(),
+            McpTimeouts::from_secs(5, 5),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        client.post_url = Some(endpoint);
+        client.rx = Some(rx);
+        for value in [
+            json!({"id":1,"method":"sampling/createMessage"}),
+            json!({"id":1}),
+            json!({"id":1,"result":{"ok":true}}),
+        ] {
+            tx.send(value).await.unwrap();
+        }
+        assert_eq!(
+            client.request("tools/list", None).await.unwrap(),
+            json!({"ok":true})
+        );
+        server.await.unwrap();
     }
 }

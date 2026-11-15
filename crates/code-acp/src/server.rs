@@ -29,7 +29,7 @@ pub struct Options {
 const PAGE: usize = 100;
 
 /// Serve ACP on stdin/stdout until the client disconnects or a signal
-/// arrives, then shut every session down (D38) before returning.
+/// arrives, then shut every session down before returning.
 pub async fn run(options: Options) -> Result<(), String> {
     let directories = Directories::resolve().map_err(|e| e.to_string())?;
     let usage_store = ConfigStore::load(directories.clone()).map_err(|e| e.to_string())?;
@@ -270,14 +270,15 @@ impl Server {
 
     fn new_session(&mut self, id: &Value, params: &Value) -> Option<rpc::Reply> {
         let result = (|| {
-            let req = decode::<v1::NewSessionRequest>(params)?;
+            let client_mcp_count = params["mcpServers"].as_array().map_or(0, Vec::len);
+            let req = decode::<v1::NewSessionRequest>(&normalize_session_params(params))?;
             if !req.cwd.is_absolute() {
                 return Err(RpcError::params("cwd must be an absolute path"));
             }
-            if !req.mcp_servers.is_empty() {
+            if client_mcp_count != 0 {
                 eprintln!(
                     "acp: ignoring {} client MCP server(s); cockpit-code uses its own mcps/ config",
-                    req.mcp_servers.len()
+                    client_mcp_count
                 );
             }
             let store = self.store()?;
@@ -334,9 +335,9 @@ impl Server {
             .map(String::from);
         let result = (|| {
             if replay {
-                decode::<v1::LoadSessionRequest>(params)?;
+                decode::<v1::LoadSessionRequest>(&normalize_session_params(params))?;
             } else {
-                decode::<v1::ResumeSessionRequest>(params)?;
+                decode::<v1::ResumeSessionRequest>(&normalize_session_params(params))?;
             }
             if let Some(s) = self.sessions.get(&acp_id) {
                 return Ok(s.clone());
@@ -644,4 +645,137 @@ fn prompt_content(
         }
     }
     Ok((text, attachments))
+}
+
+/// Client MCP servers and extra directories are ignored by this server. Clear
+/// present values before schema decoding, including entries the schema cannot
+/// represent, while preserving required-field checks for absent keys.
+fn normalize_session_params(params: &Value) -> Value {
+    let mut params = params.clone();
+    if let Some(object) = params.as_object_mut() {
+        for key in ["mcpServers", "additionalDirectories"] {
+            if let Some(value) = object.get_mut(key) {
+                *value = json!([]);
+            }
+        }
+    }
+    params
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol_schema::v1;
+    use serde_json::json;
+
+    macro_rules! accepts {
+        ($ty:ty, $value:expr) => {
+            let _ = serde_json::from_value::<$ty>($value).unwrap();
+        };
+    }
+
+    #[test]
+    fn schema_ignores_unsupported_client_mcp_entries() {
+        let params = json!({
+            "sessionId": "s", "cwd": "/workspace",
+            "mcpServers": [
+                {"type": "http", "name": "http", "url": "https://example.com"},
+                {"type": "sse", "name": "sse", "url": "https://example.com"},
+                {"name": "stdio", "command": "server", "args": [], "env": []},
+                {"type": "acp", "name": "acp"}
+            ],
+            "additionalDirectories": ["/extra", {"invalid": true}]
+        });
+        // The strict schema rejects these entries; the server owns ignoring them.
+        assert!(super::decode::<v1::NewSessionRequest>(&params).is_err());
+        let normalized = super::normalize_session_params(&params);
+        let request = super::decode::<v1::NewSessionRequest>(&normalized).unwrap();
+        assert!(request.mcp_servers.is_empty());
+        accepts!(v1::LoadSessionRequest, normalized.clone());
+        accepts!(v1::ResumeSessionRequest, normalized.clone());
+        assert_eq!(normalized["additionalDirectories"], json!([]));
+        assert_eq!(params["mcpServers"].as_array().unwrap().len(), 4);
+        assert_eq!(params["additionalDirectories"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn session_normalization_preserves_required_fields_and_other_validation() {
+        let params = json!({"sessionId": "s", "cwd": "/workspace"});
+        let normalized = super::normalize_session_params(&params);
+        assert_eq!(normalized, params);
+        assert!(super::decode::<v1::NewSessionRequest>(&normalized).is_err());
+        assert!(super::decode::<v1::LoadSessionRequest>(&normalized).is_err());
+        accepts!(v1::ResumeSessionRequest, normalized);
+        for ignored in [json!(null), json!({"invalid": true}), json!(42)] {
+            let normalized = super::normalize_session_params(&json!({
+                "cwd": "/workspace", "mcpServers": ignored,
+                "additionalDirectories": ignored
+            }));
+            accepts!(v1::NewSessionRequest, normalized);
+        }
+        let normalized = super::normalize_session_params(&json!({"mcpServers": []}));
+        assert!(super::decode::<v1::NewSessionRequest>(&normalized).is_err());
+        assert_eq!(super::normalize_session_params(&json!(null)), json!(null));
+    }
+
+    #[test]
+    fn schema_accepts_existing_v1_requests_without_new_optional_fields() {
+        accepts!(
+            v1::InitializeRequest,
+            json!({"protocolVersion": 1, "clientCapabilities": {}})
+        );
+        accepts!(
+            v1::NewSessionRequest,
+            json!({"cwd": "/workspace", "mcpServers": []})
+        );
+        accepts!(
+            v1::LoadSessionRequest,
+            json!({"sessionId": "s", "cwd": "/workspace", "mcpServers": []})
+        );
+        accepts!(
+            v1::ResumeSessionRequest,
+            json!({"sessionId": "s", "cwd": "/workspace"})
+        );
+        accepts!(
+            v1::ListSessionsRequest,
+            json!({"cursor": "", "cwd": "/workspace"})
+        );
+        accepts!(
+            v1::PromptRequest,
+            json!({"sessionId": "s", "prompt": [{"type": "text", "text": "hello"}]})
+        );
+        accepts!(
+            v1::SetSessionModeRequest,
+            json!({"sessionId": "s", "modeId": "manual"})
+        );
+        accepts!(
+            v1::SetSessionConfigOptionRequest,
+            json!({"sessionId": "s", "configId": "model", "value": "test"})
+        );
+        accepts!(v1::CancelNotification, json!({"sessionId": "s"}));
+    }
+
+    #[test]
+    fn schema_accepts_existing_v1_responses_notifications_and_permission_forms() {
+        accepts!(
+            v1::InitializeResponse,
+            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}, "authMethods": []})
+        );
+        accepts!(v1::NewSessionResponse, json!({"sessionId": "s"}));
+        accepts!(
+            v1::ListSessionsResponse,
+            json!({"sessions": [{"sessionId": "s", "cwd": "/workspace", "title": "test"}], "nextCursor": "100"})
+        );
+        accepts!(
+            v1::SessionNotification,
+            json!({"sessionId": "s", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hello"}}})
+        );
+        accepts!(
+            v1::RequestPermissionRequest,
+            json!({"sessionId": "s", "toolCall": {"toolCallId": "t", "status": "pending", "content": []}, "options": [{"optionId": "once", "name": "Allow once", "kind": "allow_once"}]})
+        );
+        accepts!(
+            v1::CreateElicitationRequest,
+            json!({"mode": "form", "sessionId": "s", "message": "question", "requestedSchema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}})
+        );
+    }
 }

@@ -145,7 +145,8 @@ pub enum SubagentMode {
     Tree,
     Flat,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Subagents {
     pub mode: SubagentMode,
     pub max_depth: Option<usize>,
@@ -159,60 +160,6 @@ impl Default for Subagents {
             max_depth: None,
             max_concurrent_children: four(),
             max_total_agents: None,
-        }
-    }
-}
-impl<'de> Deserialize<'de> for Subagents {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Input {
-            Mode(SubagentMode),
-            Limits {
-                #[serde(default)]
-                mode: SubagentMode,
-                #[serde(default, rename = "maxDepth")]
-                max_depth: Option<usize>,
-                #[serde(default = "four", rename = "maxConcurrentChildren")]
-                max_concurrent_children: usize,
-                #[serde(default, rename = "maxTotalAgents")]
-                max_total_agents: Option<usize>,
-            },
-        }
-        Ok(match Input::deserialize(deserializer)? {
-            Input::Mode(mode) => Self {
-                mode,
-                ..Self::default()
-            },
-            Input::Limits {
-                mode,
-                max_depth,
-                max_concurrent_children,
-                max_total_agents,
-            } => Self {
-                mode,
-                max_depth,
-                max_concurrent_children,
-                max_total_agents,
-            },
-        })
-    }
-}
-impl Serialize for Subagents {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        if self.max_depth.is_none()
-            && self.max_total_agents.is_none()
-            && self.max_concurrent_children == four()
-        {
-            self.mode.serialize(serializer)
-        } else {
-            serde_json::json!({"mode":self.mode,"maxDepth":self.max_depth,
-                "maxConcurrentChildren":self.max_concurrent_children,"maxTotalAgents":self.max_total_agents}).serialize(serializer)
         }
     }
 }
@@ -236,6 +183,8 @@ pub struct Config {
     pub permissions: Permissions,
     pub subagents: Subagents,
     pub script: ScriptConfig,
+    /// Limits for the `generate` tool's provider output.
+    pub generate: GenerateConfig,
     pub lsp: lsp::LspConfig,
     pub benchmarks: BTreeMap<String, Benchmark>,
     pub system_prompt: Option<PathBuf>,
@@ -252,19 +201,19 @@ pub struct Config {
     /// Warn before switching the root model when the last message is younger
     /// than this many minutes (its prompt cache is probably warm). 0 is off.
     pub model_switch_warn_minutes: u64,
-    /// TUI composer vim mode (D54; `/vim` toggles it for the session).
+    /// TUI composer vim mode (`/vim` toggles it for the session).
     pub vim: bool,
     /// TUI: a paste of at least this many lines (or over 800 characters)
-    /// collapses into a paste chip (D53).
+    /// collapses into a paste chip.
     pub paste_collapse_lines: usize,
     /// TUI: the class a message typed while the agent works is queued
-    /// with (D73): `next-turn` (default), `steer` or `interrupt`.
+    /// with: `next-turn` (default), `steer` or `interrupt`.
     pub queue_default: QueueClass,
-    /// Minimum foreground runtime before a pending steer backgrounds it (D72).
+    /// Minimum foreground runtime before a pending steer backgrounds it.
     pub steer_background_secs: u64,
-    /// Minimum time a steer waits before backgrounding a foreground call (D72).
+    /// Minimum time a steer waits before backgrounding a foreground call.
     pub steer_min_wait_secs: u64,
-    /// Web tool provider (D65). `apiKey` is expanded (`${VAR}`) at call time only.
+    /// Web tool provider. `apiKey` is expanded (`${VAR}`) at call time only.
     pub web: WebConfig,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -283,7 +232,7 @@ impl Default for GuidanceConfig {
         }
     }
 }
-/// D65: `web_search` needs a provider; `web_fetch` falls back to a built-in GET.
+/// `web_search` needs a provider; `web_fetch` falls back to a built-in GET.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WebConfig {
@@ -300,16 +249,16 @@ pub enum WebProvider {
     Firecrawl,
     Tinyfish,
 }
-/// How a queued user message is delivered (D73, D74).
+/// How a queued user message is delivered.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum QueueClass {
     /// Held until the agent's turn ends (root) or its next task (child).
     #[default]
     NextTurn,
-    /// Delivered at the next model boundary (D72 backgrounds a blocking call).
+    /// Delivered at the next model boundary; a blocking call moves to the background.
     Steer,
-    /// Stops the in-flight generation, then is delivered at once (D74).
+    /// Stops the in-flight generation, then is delivered at once.
     Interrupt,
 }
 impl Default for Config {
@@ -343,6 +292,7 @@ impl Default for Config {
             permissions: Permissions::default(),
             subagents: Subagents::default(),
             script: ScriptConfig::default(),
+            generate: GenerateConfig::default(),
             lsp: lsp::LspConfig::default(),
             benchmarks: BTreeMap::new(),
             system_prompt: None,
@@ -584,7 +534,7 @@ impl ReportedCost {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
-    /// D119: ordered backup refs, tried for the current turn only.
+    /// Ordered backup refs, tried for the current turn only.
     #[serde(default)]
     pub fallback: Vec<String>,
     pub lsp: Option<lsp::LspOverrides>,
@@ -697,6 +647,8 @@ pub struct ResolvedCommand {
     pub history: Option<String>,
     pub timeout_secs: Option<u64>,
     pub discover_argv: Option<Vec<String>>,
+    /// Credential values substituted from environment references, for diagnostic redaction.
+    pub redaction_values: Vec<String>,
 }
 #[derive(Clone)]
 pub struct ResolvedMcp {
@@ -835,11 +787,21 @@ impl Provider {
             .command
             .as_ref()
             .map(|c| -> Result<_> {
+                let mut redaction_values = Vec::new();
+                let mut expand = |s: &str| {
+                    expand_command_with(s, &mut redaction_values, |name| {
+                        env::var(name).map_err(|_| ConfigError::MissingVariable(name.into()))
+                    })
+                };
                 Ok(ResolvedCommand {
                     argv: c.argv.iter().map(|s| expand(s)).collect::<Result<_>>()?,
-                    stdin: c.stdin.as_deref().map(expand).transpose()?,
-                    cwd: c.cwd.as_deref().map(expand).transpose()?,
-                    env: expand_map(&c.env)?,
+                    stdin: c.stdin.as_deref().map(&mut expand).transpose()?,
+                    cwd: c.cwd.as_deref().map(&mut expand).transpose()?,
+                    env: c
+                        .env
+                        .iter()
+                        .map(|(name, value)| Ok((name.clone(), expand(value)?)))
+                        .collect::<Result<_>>()?,
                     output: c.output.clone(),
                     history: c.history.clone(),
                     timeout_secs: c.timeout_secs,
@@ -848,6 +810,7 @@ impl Provider {
                         .as_ref()
                         .map(|d| d.argv.iter().map(|s| expand(s)).collect::<Result<Vec<_>>>())
                         .transpose()?,
+                    redaction_values,
                 })
             })
             .transpose()?;
@@ -1060,6 +1023,60 @@ impl Mcp {
 }
 
 pub fn expand(s: &str) -> Result<String> {
+    expand_with(s, |name| {
+        env::var(name).map_err(|_| ConfigError::MissingVariable(name.into()))
+    })
+}
+
+/// Environment names whose values should be hidden in command diagnostics:
+/// an exact `_`-separated token (or the whole name) such as `KEY`, `TOKEN` or
+/// `PAT`, or a name ending in `TOKEN`, `SECRET`, `PASSWORD` or `PASSWD`
+/// (`GITHUBTOKEN`, `DBPASSWORD`). Socket paths and the working-directory
+/// variables are excluded.
+pub fn is_credential_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    if matches!(name.as_str(), "SSH_AUTH_SOCK" | "PWD" | "OLDPWD") {
+        return false;
+    }
+    ["TOKEN", "SECRET", "PASSWORD", "PASSWD"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        || std::iter::once(name.as_str())
+            .chain(name.split('_'))
+            .any(|token| {
+                matches!(
+                    token,
+                    "KEY"
+                        | "APIKEY"
+                        | "TOKEN"
+                        | "SECRET"
+                        | "PASSWORD"
+                        | "PASSWD"
+                        | "PASS"
+                        | "PWD"
+                        | "PAT"
+                        | "CREDENTIAL"
+                        | "CREDENTIALS"
+                        | "AUTH"
+                )
+            })
+}
+
+fn expand_command_with(
+    s: &str,
+    redaction_values: &mut Vec<String>,
+    mut lookup: impl FnMut(&str) -> Result<String>,
+) -> Result<String> {
+    expand_with(s, |name| {
+        let value = lookup(name)?;
+        if is_credential_name(name) && value.len() >= 8 {
+            redaction_values.push(value.clone());
+        }
+        Ok(value)
+    })
+}
+
+fn expand_with(s: &str, mut lookup: impl FnMut(&str) -> Result<String>) -> Result<String> {
     let mut result = String::new();
     let mut rest = s;
     while let Some(start) = rest.find("${") {
@@ -1071,7 +1088,7 @@ pub fn expand(s: &str) -> Result<String> {
             ));
         };
         let name = &rest[..end];
-        result.push_str(&env::var(name).map_err(|_| ConfigError::MissingVariable(name.into()))?);
+        result.push_str(&lookup(name)?);
         rest = &rest[end + 1..];
     }
     result.push_str(rest);
@@ -1265,6 +1282,9 @@ fn load(root: &Path) -> Result<(Snapshot, Stamp)> {
                 return Err(file_error(path, "guidance.maxItems must be 1–5"));
             }
             validate_web(&snapshot.config.web).map_err(|e| file_error(path, e))?;
+            if snapshot.config.generate.max_output_bytes == 0 {
+                return Err(file_error(path, "generate.maxOutputBytes must be positive"));
+            }
             continue;
         }
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -1364,6 +1384,22 @@ impl Default for ScriptConfig {
     }
 }
 
+/// `generate` keeps provider output in memory up to fixed caps and spills the
+/// rest to a private temp file; `maxOutputBytes` is the absolute per-output
+/// ceiling (raw response, decoded media or command outputFile).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GenerateConfig {
+    pub max_output_bytes: u64,
+}
+impl Default for GenerateConfig {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 4 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 fn load_mcp(path: &Path) -> Result<Mcp> {
     let mut m: Mcp = parse(path)?;
     m.resolved = Some(ResolvedMcp {
@@ -1398,5 +1434,150 @@ fn validate_web(web: &WebConfig) -> Result<()> {
         Err(ConfigError::Invalid(
             "web.apiKey must be an environment reference such as \"${FIRECRAWL_API_KEY}\", not a literal key".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_resolution_keeps_noncredential_expansions_visible() {
+        // Read an existing variable rather than mutating the process environment
+        // while tests and provider processes may run concurrently.
+        let value = env::var("PATH").unwrap();
+        assert!(value.len() >= 8);
+        let mut provider: Provider = serde_json::from_value(serde_json::json!({
+            "type":"command",
+            "command":{
+                "argv":["adapter", "prefix-${PATH}-suffix"],
+                "stdin":"input:${PATH}",
+                "cwd":"${PATH}",
+                "env":{"CUSTOM":"nested:${PATH}"},
+                "discover":{"argv":["adapter", "${PATH}"]}
+            }
+        }))
+        .unwrap();
+        provider.resolve().unwrap();
+        let resolved = provider.connection_command().unwrap();
+        assert!(resolved.redaction_values.is_empty());
+        assert_eq!(resolved.argv[1], format!("prefix-{value}-suffix"));
+        assert_eq!(
+            resolved.stdin.as_deref(),
+            Some(format!("input:{value}").as_str())
+        );
+        assert_eq!(resolved.env["CUSTOM"], format!("nested:{value}"));
+        // Expanded credentials stay out of serialized provider configuration.
+        assert!(!serde_json::to_string(&provider).unwrap().contains(&value));
+    }
+
+    #[test]
+    fn credential_names_match_whole_tokens_and_exclude_auth_socket() {
+        for name in [
+            "KEY",
+            "APIKEY",
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "CREDENTIALS",
+            "AUTH",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "AUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "client_SeCrEt",
+            "service_credentials_path",
+            "GITHUBTOKEN",
+            "ACCESSTOKEN",
+            "DBPASSWORD",
+            "PGPASSWORD",
+            "GH_PAT",
+            "DB_PASS",
+            "MYSQL_PWD",
+        ] {
+            assert!(is_credential_name(name), "{name}");
+        }
+        for name in [
+            "HOME",
+            "PATH",
+            "GIT_AUTHOR_NAME",
+            "SSH_AUTH_SOCK",
+            "ssh_auth_sock",
+            "XAUTHORITY",
+            "AUTHORIZATION",
+            "MONKEY",
+            "TOKENIZER",
+            "SECRETARY",
+            "PWD",
+            "OLDPWD",
+            "PATH_INFO",
+        ] {
+            assert!(!is_credential_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn command_expansions_collect_only_credential_values_of_at_least_eight_bytes() {
+        let mut secrets = Vec::new();
+        let expanded = expand_command_with(
+            "${HOME}/bin/adapter ${OPENAI_API_KEY} ${APIKEY} ${SHORT_TOKEN} ${SSH_AUTH_SOCK} ${GIT_AUTHOR_NAME} ${XAUTHORITY}",
+            &mut secrets,
+            |name| Ok(match name {
+                "HOME" => "/home/alice",
+                "OPENAI_API_KEY" => "expanded-secret",
+                "APIKEY" => "12345678",
+                "SHORT_TOKEN" => "1234567",
+                "SSH_AUTH_SOCK" => "/tmp/auth-socket",
+                "GIT_AUTHOR_NAME" => "Alice Example",
+                "XAUTHORITY" => "/home/alice/.Xauthority",
+                _ => panic!("unexpected variable"),
+            }.into()),
+        ).unwrap();
+        assert!(expanded.starts_with("/home/alice/bin/adapter expanded-secret"));
+        assert_eq!(secrets, ["expanded-secret", "12345678"]);
+    }
+
+    #[test]
+    fn environment_expansion_keeps_substituted_values_opaque() {
+        let result = expand_with("prefix-${VALUE}-${SHORT}", |name| {
+            Ok(match name {
+                "VALUE" => "secret-${NESTED}",
+                "SHORT" => "tiny",
+                _ => panic!("expanded a substituted value"),
+            }
+            .into())
+        })
+        .unwrap();
+        assert_eq!(result, "prefix-secret-${NESTED}-tiny");
+        assert!(expand_with("${OPEN", |_| panic!("unexpected lookup")).is_err());
+    }
+
+    #[test]
+    fn subagents_round_trip_as_an_object_with_default_limits() {
+        let value = serde_json::to_value(Subagents::default()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"mode":"tree", "maxDepth":null,
+            "maxConcurrentChildren":4, "maxTotalAgents":null})
+        );
+        let parsed: Subagents = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.mode, SubagentMode::Tree);
+        assert_eq!(parsed.max_concurrent_children, 4);
+        assert!(serde_json::from_str::<Subagents>(r#""tree""#).is_err());
+        assert!(serde_json::from_str::<Subagents>(r#""flat""#).is_err());
+    }
+
+    #[test]
+    fn subagents_object_preserves_explicit_limits() {
+        let parsed: Subagents = serde_json::from_value(serde_json::json!({
+            "mode":"flat", "maxDepth":1, "maxConcurrentChildren":2, "maxTotalAgents":5
+        }))
+        .unwrap();
+        assert_eq!(parsed.mode, SubagentMode::Flat);
+        assert_eq!(parsed.max_depth, Some(1));
+        assert_eq!(parsed.max_concurrent_children, 2);
+        assert_eq!(parsed.max_total_agents, Some(5));
     }
 }

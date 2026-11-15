@@ -22,13 +22,7 @@ impl Journal {
             .agents
             .keys()
             .filter(|id| {
-                (uuid::Uuid::parse_str(id).is_ok()
-                    && self
-                        .agents
-                        .get(*id)
-                        .is_some_and(|agent| format!("{}-{}", agent.agent, &id[..8]) == input))
-                    || short(id) == input
-                    || id.split_once('-').is_some_and(|(_, uuid)| uuid == input)
+                short(id) == input || id.split_once('-').is_some_and(|(_, uuid)| uuid == input)
             })
             .collect::<Vec<_>>();
         match ids.as_slice() {
@@ -107,5 +101,30 @@ impl Session {
     }
     pub fn resolve_job_id(&self, id: &str) -> Result<String, EngineError> {
         self.control.journal.lock().unwrap().resolve_job_id(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn current_agent_ids_resolve_by_full_id_short_id_and_uuid() {
+        let (temp, store) = crate::test_support::store(serde_json::json!({}));
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        {
+            let mut j = session.control.journal.lock().unwrap();
+            let mut agent = j.agents["root"].clone();
+            let uuid = "12345678-1234-4234-8234-123456789abc";
+            let id = format!("build-{uuid}");
+            agent.agent_id = id.clone();
+            agent.parent_id = Some("root".into());
+            j.register(agent).unwrap();
+            for input in [id.as_str(), "build-12345678", uuid] {
+                assert_eq!(j.resolve_agent_id(input).unwrap(), id);
+            }
+            assert_eq!(j.resolve_agent_id("root").unwrap(), "root");
+        }
+        session.shutdown().await.unwrap();
     }
 }
