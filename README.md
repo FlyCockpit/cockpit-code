@@ -74,6 +74,12 @@ mkdir -p ~/.local/bin
 install -m 0755 "cockpit-code-$VERSION-$TARGET/cockpit-code" ~/.local/bin/
 ```
 
+Every release asset, including `SHA256SUMS`, carries a signed GitHub build provenance attestation. With the [GitHub CLI](https://cli.github.com/) you can check that a file was built by this repository's release workflow:
+
+```sh
+gh attestation verify "cockpit-code-$VERSION-$TARGET.tar.gz" --repo FlyCockpit/cockpit-code
+```
+
 The crates are not published to crates.io.
 
 ### Build from source
