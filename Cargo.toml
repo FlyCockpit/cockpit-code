@@ -9,7 +9,6 @@ rust-version = "1.99"
 license = "MIT"
 authors = ["FlyCockpit LLC"]
 repository = "https://github.com/FlyCockpit/cockpit-code"
-homepage = "https://github.com/FlyCockpit/cockpit-code"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

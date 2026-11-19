@@ -580,15 +580,11 @@ impl Control {
 /// Explicit file mutations need approval. Shells/scripts use the post-call hash check.
 pub(crate) fn protected_write(op: &PreparedOperation) -> bool {
     let project = op.cwd.join(".cockpit-code/reviewer-guidance.md");
-    if matches!(op.call.name.as_str(), "write" | "edit" | "generate")
+    matches!(op.call.name.as_str(), "write" | "edit" | "generate")
         && op.target.as_ref().is_some_and(|p| {
             p.ends_with(".cockpit-code/reviewer-guidance.md")
                 || std::fs::canonicalize(&project).is_ok_and(|t| t == *p)
         })
-    {
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]

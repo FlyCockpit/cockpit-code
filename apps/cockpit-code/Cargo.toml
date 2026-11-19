@@ -7,7 +7,6 @@ license.workspace = true
 description = "A terminal coding agent with headless runs and an ACP server"
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ai", "agent", "coding-agent", "tui", "acp"]
 categories = ["command-line-utilities", "development-tools"]

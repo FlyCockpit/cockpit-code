@@ -7,7 +7,6 @@ license.workspace = true
 description = "In-process coding-agent engine powering cockpit-code"
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 publish = false
 
 [dependencies]
