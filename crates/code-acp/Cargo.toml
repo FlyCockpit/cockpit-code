@@ -13,7 +13,7 @@ publish = false
 code-config = { path = "../code-config" }
 code-engine = { path = "../code-engine" }
 # Exact pin: ACP protocol v1; 1.15.1 meets the seven-day release-age policy.
-agent-client-protocol-schema = { version = "=1.15.1", default-features = false }
+agent-client-protocol-schema = { version = "=1.18.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
