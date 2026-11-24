@@ -293,7 +293,7 @@ impl Session {
                     .unwrap_or_else(|| j.header.cwd.clone()),
             )
         };
-        let model = chat_model(self, &checkpoint)?;
+        let model = chat_model(&self.config, || self.settings(), &checkpoint)?;
         let id = format!("question-fork-{}", uuid::Uuid::new_v4());
         let fork = HiddenFork {
             model,
@@ -365,7 +365,7 @@ impl Session {
                     .unwrap_or_else(|| j.header.cwd.clone()),
             )
         };
-        let model = chat_model(self, &checkpoint)?;
+        let model = chat_model(&self.config, || self.settings(), &checkpoint)?;
         let id = format!("side-chat-{}", uuid::Uuid::new_v4());
         let fork = HiddenFork {
             model,
@@ -437,7 +437,7 @@ impl Session {
                 "question fork is closed; its record can still be reopened",
             ));
         }
-        let model = chat_model(self, &record.checkpoint)?;
+        let model = chat_model(&self.config, || self.settings(), &record.checkpoint)?;
         record.request = record.request.with_user_tail(&text)?;
         if !self.control.fork_busy.lock().unwrap().insert(id.into()) {
             return Err(EngineError::bad("question fork is already responding"));
@@ -492,13 +492,16 @@ impl Session {
         Ok(())
     }
 }
+/// Builds the fork's model from its checkpoint. The config lock is taken after the body parses and held
+/// through the exclusive-model check, and `settings` (which locks the journal) runs only at that check.
 fn chat_model(
-    session: &Session,
+    config: &Mutex<code_config::Snapshot>,
+    settings: impl FnOnce() -> crate::sessions::SessionSettings,
     checkpoint: &ChildRequest,
 ) -> Result<crate::model::Model, EngineError> {
     let body: Value = serde_json::from_slice(&checkpoint.request.body)
         .map_err(|e| EngineError::bad(e.to_string()))?;
-    let snapshot = session.config.lock().unwrap();
+    let snapshot = config.lock().unwrap();
     let provider = snapshot
         .providers
         .get(&checkpoint.provider_id)
@@ -518,7 +521,7 @@ fn chat_model(
     if model.command_latest() {
         return Err(EngineError::bad("history: latest disables hidden forks"));
     }
-    crate::exclusive::check_model(&session.settings(), &model)?;
+    crate::exclusive::check_model(&settings(), &model)?;
     Ok(model)
 }
 async fn converse(

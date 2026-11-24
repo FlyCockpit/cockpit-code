@@ -48,12 +48,7 @@ impl Control {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            ids.sort_by_key(|id| {
-                std::cmp::Reverse((
-                    crate::subtree::depth(&j, id),
-                    j.agents[id].created_at.clone(),
-                ))
-            });
+            ids.sort_by_key(|id| std::cmp::Reverse((j.depth(id), j.agents[id].created_at.clone())));
             let envelope = j.append(
                 caller,
                 HistoryEvent::AgentFinalizeRequested {

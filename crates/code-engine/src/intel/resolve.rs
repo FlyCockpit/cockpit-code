@@ -11,7 +11,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::intel::lang::Language;
+use super::js::Aliases;
+use super::lang::Language;
+use super::path::{join, normalize, parent_dir};
 
 /// Resolve `raw` (the verbatim import target) imported from the file at
 /// relative `importer` path. `existing` is the set of relative paths in
@@ -23,7 +25,7 @@ pub fn resolve(
     raw: &str,
     existing: &HashSet<String>,
     module_prefix: &str,
-    aliases: &super::js::Aliases,
+    aliases: &Aliases,
 ) -> Option<String> {
     match lang {
         Language::Rust => resolve_rust(importer, raw, existing),
@@ -47,41 +49,6 @@ pub fn resolve(
         | Language::Dotenv
         | Language::Text
         | Language::Unknown => None,
-    }
-}
-
-/// Normalize a path made of `a/b/../c` components to a clean relative
-/// forward-slash path, without touching the filesystem.
-fn normalize(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if matches!(parts.last(), Some(&"..") | None) {
-                    parts.push("..");
-                } else {
-                    parts.pop();
-                }
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
-}
-
-pub(super) fn parent_dir(importer: &str) -> &str {
-    match importer.rfind('/') {
-        Some(i) => &importer[..i],
-        None => "",
-    }
-}
-
-pub(super) fn join(dir: &str, rel: &str) -> String {
-    if dir.is_empty() {
-        normalize(rel)
-    } else {
-        normalize(&format!("{dir}/{rel}"))
     }
 }
 
@@ -160,55 +127,6 @@ fn rust_candidates(base: &str, mod_path: &str) -> Vec<String> {
         join(base, &format!("{mod_path}.rs")),
         join(base, &format!("{mod_path}/mod.rs")),
     ]
-}
-
-// ---- JS / TS ---------------------------------------------------------------
-
-const JS_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
-
-pub(super) fn resolve_js(importer: &str, raw: &str, existing: &HashSet<String>) -> Option<String> {
-    // Only relative imports resolve; bare specifiers are packages.
-    if !(raw.starts_with("./") || raw.starts_with("../") || raw.starts_with('/')) {
-        return None;
-    }
-    let dir = parent_dir(importer);
-    let base = if let Some(stripped) = raw.strip_prefix('/') {
-        normalize(stripped)
-    } else {
-        join(dir, raw)
-    };
-    // Exact (with extension) first.
-    if existing.contains(&base) {
-        return Some(base);
-    }
-    // Runtime .js specifiers commonly refer to TypeScript source.
-    for (runtime, sources) in [
-        (".js", &["ts", "tsx"][..]),
-        (".mjs", &["mts"][..]),
-        (".cjs", &["cts"][..]),
-    ] {
-        if let Some(stem) = base.strip_suffix(runtime) {
-            for ext in sources {
-                let path = format!("{stem}.{ext}");
-                if existing.contains(&path) {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    for ext in JS_EXTS {
-        let cand = format!("{base}.{ext}");
-        if existing.contains(&cand) {
-            return Some(cand);
-        }
-    }
-    for ext in JS_EXTS {
-        let cand = format!("{base}/index.{ext}");
-        if existing.contains(&cand) {
-            return Some(cand);
-        }
-    }
-    None
 }
 
 // ---- Python ----------------------------------------------------------------

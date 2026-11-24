@@ -1,5 +1,5 @@
 //! Indexed tsconfig/jsconfig paths plus conservative common source aliases.
-use super::resolve::{join, parent_dir, resolve_js};
+use super::path::{join, normalize, parent_dir};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
@@ -13,6 +13,7 @@ pub(super) struct Aliases {
     configs: Vec<(String, Options)>,
     packages: Vec<String>,
 }
+
 impl Aliases {
     pub fn new<'a>(sources: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
         let sources = sources.collect::<BTreeMap<_, _>>();
@@ -117,6 +118,55 @@ impl Aliases {
             .unwrap_or(package);
         candidate(&join(dir, &format!("src/{tail}"))).or_else(|| candidate(&join(dir, tail)))
     }
+}
+const JS_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
+/// Resolve a relative (or root-anchored `/`) JS/TS specifier to an indexed
+/// file, trying TypeScript sources for runtime extensions, then extension
+/// and `index` probing. Bare specifiers (packages) are unresolved.
+fn resolve_js(importer: &str, raw: &str, existing: &HashSet<String>) -> Option<String> {
+    // Only relative imports resolve; bare specifiers are packages.
+    if !(raw.starts_with("./") || raw.starts_with("../") || raw.starts_with('/')) {
+        return None;
+    }
+    let dir = parent_dir(importer);
+    let base = if let Some(stripped) = raw.strip_prefix('/') {
+        normalize(stripped)
+    } else {
+        join(dir, raw)
+    };
+    // Exact (with extension) first.
+    if existing.contains(&base) {
+        return Some(base);
+    }
+    // Runtime .js specifiers commonly refer to TypeScript source.
+    for (runtime, sources) in [
+        (".js", &["ts", "tsx"][..]),
+        (".mjs", &["mts"][..]),
+        (".cjs", &["cts"][..]),
+    ] {
+        if let Some(stem) = base.strip_suffix(runtime) {
+            for ext in sources {
+                let path = format!("{stem}.{ext}");
+                if existing.contains(&path) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    for ext in JS_EXTS {
+        let cand = format!("{base}.{ext}");
+        if existing.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    for ext in JS_EXTS {
+        let cand = format!("{base}/index.{ext}");
+        if existing.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
 }
 fn load(
     path: &str,

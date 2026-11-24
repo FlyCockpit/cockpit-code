@@ -559,6 +559,17 @@ pub(crate) struct Journal {
     message_sequences: BTreeMap<(String, String), u64>,
 }
 impl Journal {
+    /// The recorded parent chain above `id`, nearest first (excluding `id`).
+    pub(crate) fn ancestors<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a str> {
+        std::iter::successors(Some(id), |id| {
+            self.agents.get(*id).and_then(|a| a.parent_id.as_deref())
+        })
+        .skip(1)
+    }
+    /// How many recorded ancestors `id` has (the root is depth 0).
+    pub(crate) fn depth(&self, id: &str) -> usize {
+        self.ancestors(id).count()
+    }
     pub(crate) fn is_persisted(&self) -> bool {
         self.persisted
     }
@@ -1300,7 +1311,7 @@ impl Journal {
                         title: execution.title.clone(),
                         model: agent.model.clone(),
                         started_by: agent.parent_id.clone().unwrap_or_default(),
-                        depth: crate::subtree::depth(self, &agent.agent_id),
+                        depth: self.depth(&agent.agent_id),
                     };
                     let mut next = agent.parent_id.clone();
                     while let Some(parent) = next {

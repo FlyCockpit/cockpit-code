@@ -25,24 +25,13 @@ impl ModelPolicy {
 pub(crate) fn permits(layers: &[ModelPolicy], id: &str) -> bool {
     layers.iter().all(|p| p.permits(id))
 }
-pub(crate) fn depth(j: &Journal, id: &str) -> usize {
-    let mut next = j.agents.get(id).and_then(|a| a.parent_id.as_deref());
-    let mut depth = 0;
-    while let Some(id) = next {
-        depth += 1;
-        next = j.agents.get(id).and_then(|a| a.parent_id.as_deref());
-    }
-    depth
-}
 pub(crate) fn remaining(j: &Journal, id: &str) -> Option<u64> {
-    let mut next = Some(id);
     let mut budget: Option<u64> = None;
-    while let Some(id) = next {
+    for id in std::iter::once(id).chain(j.ancestors(id)) {
         if let Some(cap) = j.executions.get(id).and_then(|e| e.max_descendants) {
             let left = cap.saturating_sub(j.descendant_launches.get(id).copied().unwrap_or(0));
             budget = Some(budget.map_or(left, |n| n.min(left)));
         }
-        next = j.agents.get(id).and_then(|a| a.parent_id.as_deref());
     }
     budget
 }
