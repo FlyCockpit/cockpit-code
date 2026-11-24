@@ -495,7 +495,7 @@ impl Session {
 /// Builds the fork's model from its checkpoint. The config lock is taken after the body parses and held
 /// through the exclusive-model check, and `settings` (which locks the journal) runs only at that check.
 fn chat_model(
-    config: &Mutex<code_config::Snapshot>,
+    config: &Mutex<code_config::ConfigStore>,
     settings: impl FnOnce() -> crate::sessions::SessionSettings,
     checkpoint: &ChildRequest,
 ) -> Result<crate::model::Model, EngineError> {
@@ -503,11 +503,9 @@ fn chat_model(
         .map_err(|e| EngineError::bad(e.to_string()))?;
     let snapshot = config.lock().unwrap();
     let provider = snapshot
-        .providers
-        .get(&checkpoint.provider_id)
-        .ok_or_else(|| EngineError::bad("fork provider unavailable"))?;
-    let mut provider = provider.clone();
-    provider.prompt_caching = checkpoint.caching.clone();
+        .provider(&checkpoint.provider_id)
+        .ok_or_else(|| EngineError::bad("fork provider unavailable"))?
+        .with_caching(checkpoint.caching.clone());
     let model = crate::model::Model::new(
         checkpoint.provider_id.clone(),
         body["model"]
@@ -526,7 +524,7 @@ fn chat_model(
 }
 async fn converse(
     control: &Arc<Control>,
-    config: &Arc<Mutex<code_config::Snapshot>>,
+    config: &Arc<Mutex<code_config::ConfigStore>>,
     gate: &Arc<dyn crate::tools::PermissionGate>,
     model: &crate::model::Model,
     record: &mut Record,

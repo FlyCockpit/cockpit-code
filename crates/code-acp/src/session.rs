@@ -280,7 +280,7 @@ impl AcpSession {
                 && !st.cancel_requested
                 && st.materialized
             {
-                let class = self.store.snapshot().config.queue_default;
+                let class = self.store.config().queue_default;
                 if let Ok(qid) = self.session.queue_message_with_attachments(
                     "root",
                     text.clone(),
@@ -526,7 +526,7 @@ impl AcpSession {
         st.pending
             .mode
             .or(self.session.settings().mode)
-            .unwrap_or(self.store.snapshot().config.permissions.mode)
+            .unwrap_or(self.store.config().permissions.mode)
     }
 
     pub fn set_mode(&self, mode: PermissionMode) -> Result<(), RpcError> {
@@ -557,7 +557,7 @@ impl AcpSession {
             .model
             .clone()
             .or(self.session.settings().model)
-            .or_else(|| self.store.snapshot().config.default_model.clone())
+            .or_else(|| self.store.config().default_model.clone())
     }
 
     fn effort(&self) -> Option<String> {
@@ -580,38 +580,30 @@ impl AcpSession {
     fn models(&self) -> Vec<(String, String)> {
         let exclusive = self.session.exclusive().map(|e| e.model);
         let mut out = vec![];
-        for (pid, provider) in &self.session.configuration().providers {
+        for (pid, provider, mid, m) in self.session.configuration().models() {
             if !provider.enabled {
                 continue;
             }
-            for (mid, m) in &provider.models {
-                let id = format!("{pid}/{mid}");
-                let text = m.capabilities.output.is_empty()
-                    || m.capabilities.output.contains(&Modality::Text);
-                if !text || exclusive.as_ref().is_some_and(|e| e != &id) {
-                    continue;
-                }
-                let label = format!(
-                    "{} · {}",
-                    provider.label.clone().unwrap_or_else(|| pid.clone()),
-                    m.label.clone().unwrap_or_else(|| mid.clone())
-                );
-                out.push((id, label));
+            let id = format!("{pid}/{mid}");
+            let text =
+                m.capabilities.output.is_empty() || m.capabilities.output.contains(&Modality::Text);
+            if !text || exclusive.as_ref().is_some_and(|e| e != &id) {
+                continue;
             }
+            let label = format!(
+                "{} · {}",
+                provider.label.clone().unwrap_or_else(|| pid.clone()),
+                m.label.clone().unwrap_or_else(|| mid.clone())
+            );
+            out.push((id, label));
         }
         out
     }
 
     fn efforts(&self, model: Option<&str>) -> Vec<String> {
-        let Some((pid, mid)) = model.and_then(|m| m.split_once('/')) else {
-            return vec![];
-        };
-        self.store
-            .snapshot()
-            .providers
-            .get(pid)
-            .and_then(|p| p.models.get(mid))
-            .map(|m| m.reasoning.efforts.clone())
+        model
+            .and_then(|id| self.store.model(id))
+            .map(|(_, m)| m.reasoning.efforts.clone())
             .unwrap_or_default()
     }
 

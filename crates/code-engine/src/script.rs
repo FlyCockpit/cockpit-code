@@ -504,7 +504,7 @@ pub(crate) async fn execute(
     if code.len() > 1024 * 1024 {
         return Err(EngineError::bad("script source exceeds 1 MiB"));
     }
-    let config = state.config.lock().unwrap().config.script.clone();
+    let config = state.config.lock().unwrap().config().script.clone();
     let limits = ScriptLimits {
         cpu_secs: args["cpuSecs"].as_u64().unwrap_or(config.cpu_secs),
         max_calls: args["maxCalls"]

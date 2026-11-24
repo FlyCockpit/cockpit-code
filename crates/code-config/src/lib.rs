@@ -315,6 +315,95 @@ impl Config {
     pub fn higher_is_better(&self, key: &str) -> bool {
         self.benchmarks.get(key).is_none_or(|b| b.higher_is_better)
     }
+    /// The configured prompt for reviewing a write/edit (`writes`) or another
+    /// tool call, read from its file at load.
+    pub fn review_prompt(&self, writes: bool) -> Option<&str> {
+        let prompts = &self.permissions.prompts;
+        if writes {
+            prompts.resolved_write_edit.as_deref()
+        } else {
+            prompts.resolved_tool_call.as_deref()
+        }
+    }
+    /// The global reviewer guidance text, inline or read from its file at load.
+    pub fn reviewer_guidance(&self) -> Option<&str> {
+        self.permissions.resolved_reviewer_guidance.as_deref()
+    }
+    /// The limits `config.json` must respect beyond its schema.
+    fn validate(&self) -> Result<()> {
+        if self.lsp.after_write_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "lsp.afterWriteMs must be positive".into(),
+            ));
+        }
+        if !(1..=5).contains(&self.guidance.max_items) {
+            return Err(ConfigError::Invalid("guidance.maxItems must be 1–5".into()));
+        }
+        validate_web(&self.web)?;
+        if self.generate.max_output_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "generate.maxOutputBytes must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// The prompt files this configuration reads, resolved against `root`.
+    /// Reviewer guidance counts only when it names an existing file.
+    fn prompt_files(&self, root: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = [
+            self.system_prompt.as_ref(),
+            self.permissions.prompts.tool_call.as_ref(),
+            self.permissions.prompts.write_edit.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|path| prompt_path(root, path))
+        .collect();
+        if let Some(raw) = &self.permissions.reviewer_guidance {
+            let path = prompt_path(root, Path::new(raw));
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+    /// Read the prompt files into their resolved texts; `system.md` is the
+    /// default system prompt.
+    fn resolve_prompts(&mut self, root: &Path) -> Result<()> {
+        if self.system_prompt.is_none() && root.join("system.md").exists() {
+            self.system_prompt = Some(PathBuf::from("system.md"));
+        }
+        if let Some(path) = &self.system_prompt {
+            let (path, text) = read_prompt(root, path)?;
+            self.system_prompt = Some(path);
+            self.resolved_system_prompt = Some(text);
+        }
+        if let Some(raw) = &self.permissions.reviewer_guidance {
+            let path = prompt_path(root, Path::new(raw));
+            self.permissions.resolved_reviewer_guidance = Some(
+                if path.is_file()
+                    || (!raw.contains('\n')
+                        && (raw.ends_with(".md") || raw.starts_with("./") || raw.starts_with('/')))
+                {
+                    read_prompt(root, Path::new(raw))?.1
+                } else {
+                    raw.clone()
+                },
+            );
+        }
+        let prompts = &mut self.permissions.prompts;
+        if let Some(path) = &prompts.tool_call {
+            let (path, text) = read_prompt(root, path)?;
+            prompts.tool_call = Some(path);
+            prompts.resolved_tool_call = Some(text);
+        }
+        if let Some(path) = &prompts.write_edit {
+            let (path, text) = read_prompt(root, path)?;
+            prompts.write_edit = Some(path);
+            prompts.resolved_write_edit = Some(text);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,6 +813,97 @@ impl Provider {
             .or(self.strict_tools)
             .unwrap_or(model.kind.unwrap_or(self.kind) == ProviderType::OpenaiResponses)
     }
+    /// Overlay the provider's tool overrides, then those of its model `model`, onto `out`.
+    fn overlay_tool_overrides(&self, model: &str, out: &mut BTreeMap<String, tools::ToolOverride>) {
+        for layer in [
+            Some(&self.tools.overrides),
+            self.models.get(model).map(|c| &c.tools.overrides),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (name, config) in layer {
+                out.entry(name.clone()).or_default().overlay(config);
+            }
+        }
+    }
+    /// The tool profile of `model`, else of this provider, else `global`.
+    fn tool_profile(&self, model: Option<&ModelConfig>, global: tools::Profile) -> tools::Profile {
+        let inherited = self.tools.profile.unwrap_or(global);
+        model.map_or(inherited, |m| m.tools.profile.unwrap_or(inherited))
+    }
+    /// Where `model`'s responses report their cost: its own locator, else the provider's.
+    pub fn reported_cost<'a>(&'a self, model: &'a ModelConfig) -> Option<&'a ReportedCost> {
+        model.reported_cost.as_ref().or(self.reported_cost.as_ref())
+    }
+    fn model(&self, id: &str) -> Option<&ModelConfig> {
+        self.models.get(id)
+    }
+    /// The configured and discovered models, by ID.
+    fn models(&self) -> impl Iterator<Item = (&String, &ModelConfig)> {
+        self.models.iter()
+    }
+    /// Every model is billed by subscription (and there is at least one).
+    pub fn is_subscription(&self) -> bool {
+        !self.models.is_empty()
+            && self
+                .models
+                .values()
+                .all(|m| matches!(m.billing, Billing::Subscription))
+    }
+    /// The command that lists this provider's models, if it discovers them.
+    pub fn discovery(&self) -> Option<&Discovery> {
+        self.command.as_ref().and_then(|c| c.discover.as_ref())
+    }
+    /// Whether the provider has a command block (it runs or discovers through an adapter).
+    pub fn has_command(&self) -> bool {
+        self.command.is_some()
+    }
+    /// Whether `model` runs as a command that is only given the latest turn
+    /// (`history: latest`), so the harness cannot know its context use.
+    pub fn latest_history_only(&self, model: &ModelConfig) -> bool {
+        model.kind.unwrap_or(self.kind) == ProviderType::Command
+            && self
+                .command
+                .as_ref()
+                .is_some_and(|c| c.history.as_deref() == Some("latest"))
+    }
+    /// Whether `model` runs as a command that answers in plain text (the default output).
+    pub fn text_command(&self, model: &ModelConfig) -> bool {
+        model.kind.unwrap_or(self.kind) == ProviderType::Command
+            && self
+                .command
+                .as_ref()
+                .is_some_and(|c| c.output.as_deref().unwrap_or("text") == "text")
+    }
+    /// The resolved environment of the provider's command, shared by its usage command.
+    pub fn command_env(&self) -> Option<&BTreeMap<String, String>> {
+        self.resolved_command.as_ref().map(|c| &c.env)
+    }
+    /// This provider as `model` runs it: the model's dialect wins, and a
+    /// command without an explicit limit runs one context at a time.
+    pub fn for_model(mut self, model: &ModelConfig) -> Self {
+        self.kind = model.kind.unwrap_or(self.kind);
+        if self.kind == ProviderType::Command && self.max_concurrent_contexts.is_none() {
+            self.max_concurrent_contexts = Some(1);
+        }
+        self
+    }
+    /// A copy that caches prompts as a frozen model did when it was chosen.
+    pub fn with_caching(&self, caching: PromptCaching) -> Self {
+        let mut provider = self.clone();
+        provider.prompt_caching = caching;
+        provider
+    }
+    /// How long a usage reading stays fresh (`usage.ttlSecs`, 300 by
+    /// default); `None` when no usage command reports this provider's quota.
+    pub fn usage_ttl_secs(&self) -> Option<u64> {
+        self.usage.as_ref().map(|u| u.ttl_secs.unwrap_or(300))
+    }
+    /// The soft spending budget, if one is set.
+    pub fn budget(&self) -> Option<Budget> {
+        self.budget.clone()
+    }
     fn resolve(&mut self) -> Result<()> {
         if self
             .budget
@@ -1100,22 +1280,25 @@ fn expand_map(map: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>
         .collect()
 }
 
+/// One consistent version of the loaded configuration.
 #[derive(Clone, Default)]
-pub struct Snapshot {
-    pub tools: BTreeMap<String, tools::ToolOverride>,
-    pub config: Config,
-    pub providers: BTreeMap<String, Provider>,
-    pub mcps: BTreeMap<String, Mcp>,
+struct Snapshot {
+    tools: BTreeMap<String, tools::ToolOverride>,
+    config: Config,
+    providers: BTreeMap<String, Provider>,
+    mcps: BTreeMap<String, Mcp>,
     /// Discovery failures keyed by provider ID. Static models remain available.
-    pub discovery_errors: BTreeMap<String, discovery::DiscoveryError>,
+    discovery_errors: BTreeMap<String, discovery::DiscoveryError>,
     /// Provider and MCP files that failed to parse or resolve; they are skipped
     /// so one bad file does not hide the others. `config.json` errors stay fatal.
-    pub errors: Vec<String>,
+    errors: Vec<String>,
 }
 type Stamp = BTreeMap<PathBuf, (SystemTime, u64)>;
+/// The loaded configuration and the directories it comes from. Reloads are
+/// transactional: readers always see one consistent version.
 #[derive(Clone)]
 pub struct ConfigStore {
-    pub directories: Directories,
+    directories: Directories,
     snapshot: Snapshot,
     stamp: Stamp,
 }
@@ -1149,7 +1332,7 @@ impl ConfigStore {
         Ok(())
     }
     /// Reload once and force each selected provider at most once. Failures are
-    /// available in `Snapshot::discovery_errors`; config.json errors stay fatal.
+    /// available through [`Self::discovery_error`]; config.json errors stay fatal.
     pub fn refresh_discovery_many<I, S>(&mut self, providers: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -1165,19 +1348,30 @@ impl ConfigStore {
         self.stamp = stamp;
         Ok(())
     }
-    pub fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+    /// Take `provider` and its discovery outcome from `newer`, a store that
+    /// just refreshed it; everything else stays as it is.
+    pub fn adopt_discovery(&mut self, newer: &ConfigStore, provider: &str) {
+        if let Some(next) = newer.snapshot.providers.get(provider) {
+            self.snapshot
+                .providers
+                .insert(provider.to_owned(), next.clone());
+        }
+        self.snapshot.discovery_errors.remove(provider);
+        if let Some(error) = newer.snapshot.discovery_errors.get(provider) {
+            self.snapshot
+                .discovery_errors
+                .insert(provider.to_owned(), error.clone());
+        }
     }
     /// Transactional: a failed reload preserves the last valid snapshot. Call at turn boundaries.
     pub fn reload_if_changed(&mut self) -> Result<bool> {
         let unchanged = stamps(&self.directories.config)? == self.stamp;
         if unchanged
-            && !self.snapshot.providers.values().any(|p| {
-                p.command
-                    .as_ref()
-                    .and_then(|c| c.discover.as_ref())
-                    .is_some()
-            })
+            && !self
+                .snapshot
+                .providers
+                .values()
+                .any(|p| p.discovery().is_some())
         {
             return Ok(false);
         }
@@ -1186,6 +1380,86 @@ impl ConfigStore {
         self.snapshot = snapshot;
         self.stamp = stamp;
         Ok(true)
+    }
+    /// The directories this store loads from (config, data and cache), also
+    /// to open another store later.
+    pub fn directories(&self) -> Directories {
+        self.directories.clone()
+    }
+    /// The effective `config.json`, with its prompt files resolved.
+    pub fn config(&self) -> &Config {
+        &self.snapshot.config
+    }
+    /// The system prompt file: the configured one, else `system.md` in the
+    /// config directory (which need not exist).
+    pub fn system_prompt_path(&self) -> PathBuf {
+        self.snapshot
+            .config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| self.directories.config.join("system.md"))
+    }
+    pub fn provider(&self, id: &str) -> Option<&Provider> {
+        self.snapshot.providers.get(id)
+    }
+    /// Every loaded provider, enabled or not, by ID.
+    pub fn providers(&self) -> impl Iterator<Item = (&String, &Provider)> {
+        self.snapshot.providers.iter()
+    }
+    /// A model by its `provider/model` reference, with its provider.
+    pub fn model(&self, id: &str) -> Option<(&Provider, &ModelConfig)> {
+        let (provider, model) = id.split_once('/')?;
+        let provider = self.provider(provider)?;
+        Some((provider, provider.model(model)?))
+    }
+    /// Every model of every provider: (provider ID, provider, model ID, model).
+    pub fn models(&self) -> impl Iterator<Item = (&String, &Provider, &String, &ModelConfig)> {
+        self.providers().flat_map(|(provider_id, provider)| {
+            provider
+                .models()
+                .map(move |(model_id, model)| (provider_id, provider, model_id, model))
+        })
+    }
+    pub fn mcp(&self, name: &str) -> Option<&Mcp> {
+        self.snapshot.mcps.get(name)
+    }
+    pub fn mcps(&self) -> impl Iterator<Item = (&String, &Mcp)> {
+        self.snapshot.mcps.iter()
+    }
+    /// The effective tool profile of every model (`provider/model`), of every
+    /// provider's other models (`provider/`) and the global one (empty key).
+    pub fn tool_profiles(&self) -> BTreeMap<String, tools::Profile> {
+        let global = self.snapshot.config.tools.profile;
+        let mut profiles = BTreeMap::from([(String::new(), global)]);
+        for (pid, provider) in self.providers() {
+            profiles.insert(format!("{pid}/"), provider.tool_profile(None, global));
+        }
+        for (pid, provider, mid, model) in self.models() {
+            profiles.insert(
+                format!("{pid}/{mid}"),
+                provider.tool_profile(Some(model), global),
+            );
+        }
+        profiles
+    }
+    /// The effective tool overrides for `model` (`provider/model`, `provider/`
+    /// or empty): `tools.json`, overlaid by the provider's, then the model's.
+    pub fn tool_overrides(&self, model: &str) -> BTreeMap<String, tools::ToolOverride> {
+        let mut out = self.snapshot.tools.clone();
+        if let Some((p, m)) = model.split_once('/')
+            && let Some(provider) = self.provider(p)
+        {
+            provider.overlay_tool_overrides(m, &mut out);
+        }
+        out
+    }
+    /// Skipped provider/MCP files and discovery warnings, for display.
+    pub fn errors(&self) -> &[String] {
+        &self.snapshot.errors
+    }
+    /// Why the last discovery of `provider` failed, if it did.
+    pub fn discovery_error(&self, provider: &str) -> Option<&discovery::DiscoveryError> {
+        self.snapshot.discovery_errors.get(provider)
     }
 }
 fn file_error(path: &Path, e: impl std::fmt::Display) -> ConfigError {
@@ -1198,25 +1472,7 @@ fn stamps(root: &Path) -> Result<Stamp> {
     let mut paths = vec![root.join("config.json")];
     if root.join("config.json").exists() {
         let config: Config = parse(&root.join("config.json"))?;
-        paths.extend(
-            [
-                config.system_prompt.as_ref(),
-                config.permissions.prompts.tool_call.as_ref(),
-                config.permissions.prompts.write_edit.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|path| prompt_path(root, path)),
-        );
-    }
-    if let Some(raw) = parse::<Config>(&root.join("config.json"))
-        .ok()
-        .and_then(|c| c.permissions.reviewer_guidance)
-    {
-        let path = prompt_path(root, Path::new(&raw));
-        if path.is_file() {
-            paths.push(path);
-        }
+        paths.extend(config.prompt_files(root));
     }
     paths.push(root.join("tools.json"));
     paths.push(root.join("system.md"));
@@ -1274,17 +1530,9 @@ fn load(root: &Path) -> Result<(Snapshot, Stamp)> {
             continue;
         }
         if path == &root.join("config.json") {
-            snapshot.config = parse(path)?;
-            if snapshot.config.lsp.after_write_ms == 0 {
-                return Err(file_error(path, "lsp.afterWriteMs must be positive"));
-            }
-            if !(1..=5).contains(&snapshot.config.guidance.max_items) {
-                return Err(file_error(path, "guidance.maxItems must be 1–5"));
-            }
-            validate_web(&snapshot.config.web).map_err(|e| file_error(path, e))?;
-            if snapshot.config.generate.max_output_bytes == 0 {
-                return Err(file_error(path, "generate.maxOutputBytes must be positive"));
-            }
+            let config: Config = parse(path)?;
+            config.validate().map_err(|e| file_error(path, e))?;
+            snapshot.config = config;
             continue;
         }
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -1315,7 +1563,7 @@ fn load(root: &Path) -> Result<(Snapshot, Stamp)> {
             }
         }
     }
-    resolve_prompts(root, &mut snapshot.config)?;
+    snapshot.config.resolve_prompts(root)?;
     Ok((snapshot, stamp))
 }
 fn prompt_path(root: &Path, path: &Path) -> PathBuf {
@@ -1333,42 +1581,6 @@ fn read_prompt(root: &Path, path: &Path) -> Result<(PathBuf, String)> {
     }
     Ok((path, text))
 }
-fn resolve_prompts(root: &Path, config: &mut Config) -> Result<()> {
-    if config.system_prompt.is_none() && root.join("system.md").exists() {
-        config.system_prompt = Some(PathBuf::from("system.md"));
-    }
-    if let Some(path) = &config.system_prompt {
-        let (path, text) = read_prompt(root, path)?;
-        config.system_prompt = Some(path);
-        config.resolved_system_prompt = Some(text);
-    }
-    if let Some(raw) = &config.permissions.reviewer_guidance {
-        let path = prompt_path(root, Path::new(raw));
-        config.permissions.resolved_reviewer_guidance = Some(
-            if path.is_file()
-                || (!raw.contains('\n')
-                    && (raw.ends_with(".md") || raw.starts_with("./") || raw.starts_with('/')))
-            {
-                read_prompt(root, Path::new(raw))?.1
-            } else {
-                raw.clone()
-            },
-        );
-    }
-    let prompts = &mut config.permissions.prompts;
-    if let Some(path) = &prompts.tool_call {
-        let (path, text) = read_prompt(root, path)?;
-        prompts.tool_call = Some(path);
-        prompts.resolved_tool_call = Some(text);
-    }
-    if let Some(path) = &prompts.write_edit {
-        let (path, text) = read_prompt(root, path)?;
-        prompts.write_edit = Some(path);
-        prompts.resolved_write_edit = Some(text);
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ScriptConfig {

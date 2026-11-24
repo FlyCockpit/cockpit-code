@@ -150,7 +150,7 @@ async fn after_write_for(
     cancel: &CancellationToken,
     scheduling_owner: Option<&str>,
 ) {
-    let config = state.config.lock().unwrap().config.guidance.clone();
+    let config = state.config.lock().unwrap().config().guidance.clone();
     if !config.enabled || result.is_error || result.details.edits.is_empty() {
         return;
     }
@@ -246,7 +246,7 @@ async fn select(
     let library = Arc::new(
         state
             .control
-            .load_guidance_library(&state.store.directories.config, &state.cwd, cancel)
+            .load_guidance_library(&state.store.directories().config, &state.cwd, cancel)
             .await?,
     );
     if library.items.is_empty() {
@@ -273,7 +273,7 @@ async fn select(
         let mut settings = state.model_settings();
         settings.model = Some(id.clone());
         settings.effort = None;
-        crate::build_model(state.store.snapshot(), &settings)?
+        crate::build_model(&state.store, &settings)?
     } else {
         author_model.clone()
     };
@@ -489,7 +489,7 @@ pub(crate) async fn after_scope_apply(
     result: &mut ToolOutput,
     cancel: &CancellationToken,
 ) {
-    if !control.config.lock().unwrap().config.guidance.enabled {
+    if !control.config.lock().unwrap().config().guidance.enabled {
         return;
     }
     let setup = (|| -> Result<State, EngineError> {
@@ -508,13 +508,10 @@ pub(crate) async fn after_scope_apply(
         let model_id = body["model"]
             .as_str()
             .ok_or_else(|| EngineError::bad("scope requester model unavailable"))?;
-        let mut provider = store
-            .snapshot()
-            .providers
-            .get(&checkpoint.provider_id)
-            .cloned()
-            .ok_or_else(|| EngineError::bad("scope requester provider unavailable"))?;
-        provider.prompt_caching = checkpoint.caching.clone();
+        let provider = store
+            .provider(&checkpoint.provider_id)
+            .ok_or_else(|| EngineError::bad("scope requester provider unavailable"))?
+            .with_caching(checkpoint.caching.clone());
         let model = crate::model::Model::new(
             checkpoint.provider_id.clone(),
             model_id.into(),

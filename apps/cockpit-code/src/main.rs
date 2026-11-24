@@ -203,7 +203,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
     // Session ids may be given as a unique prefix (the TUI shows 8 chars).
-    let data = store.directories.data.clone();
+    let data = store.directories().data;
     args.resume = args
         .resume
         .map(|id| resolve_session(&data, &id))
@@ -224,7 +224,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _usage = code_engine::usage::Cache::start(&store);
     let cwd = args.cwd.clone().unwrap_or(std::env::current_dir()?);
     if let Some(Commands::Doctor { probe }) = &args.command {
-        let detection = code_engine::lsp_defaults::resolve(&store.snapshot().config.lsp, &cwd);
+        let detection = code_engine::lsp_defaults::resolve(&store.config().lsp, &cwd);
         for (id, server) in &detection.servers {
             println!("lsp {id}: detected {}", server.command);
         }
@@ -236,17 +236,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "CONFIG={}\nDATA={}\nCACHE={}",
-            store.directories.config.display(),
-            store.directories.data.display(),
-            store.directories.cache.display()
+            store.directories().config.display(),
+            store.directories().data.display(),
+            store.directories().cache.display()
         );
-        for (id, p) in &store.snapshot().providers {
+        for (id, p) in store.providers() {
             println!("provider {id} type={:?} enabled={}", p.kind, p.enabled);
-            for (model, c) in &p.models {
+            for (_, _, model, c) in store.models().filter(|(pid, ..)| *pid == id) {
                 println!("  model {id}/{model} type={:?}", c.kind.unwrap_or(p.kind));
-                for warning in
-                    code_engine::tool_names::warnings(store.snapshot(), &format!("{id}/{model}"))
-                {
+                for warning in code_engine::tool_names::warnings(&store, &format!("{id}/{model}")) {
                     println!("  warning: {warning}");
                 }
                 if c.autocompact_at_idle
@@ -259,10 +257,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        for id in store.snapshot().mcps.keys() {
+        for (id, _) in store.mcps() {
             println!("mcp {id} (parsed)");
         }
-        for e in &store.snapshot().errors {
+        for e in store.errors() {
             println!("skipped {e}");
         }
         if let Some(provider) = probe {
@@ -272,7 +270,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(Commands::Sessions { all }) = args.command {
         let listing = sessions::list_with_problems_in(
-            &store.directories.data,
+            &store.directories().data,
             if all { None } else { Some(&cwd) },
         )?;
         for problem in listing.problems {
@@ -373,7 +371,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let resume = if args.continue_session {
         Some(
-            sessions::list_in(&store.directories.data, Some(&cwd))?
+            sessions::list_in(&store.directories().data, Some(&cwd))?
                 .first()
                 .ok_or("no sessions for this cwd")?
                 .header
@@ -881,15 +879,10 @@ async fn consume(
     }
 }
 async fn probe_provider(store: &ConfigStore, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = store
-        .snapshot()
-        .providers
-        .get(id)
-        .ok_or("provider not found")?;
-    let (model, config) = provider
-        .models
-        .iter()
-        .next()
+    let provider = store.provider(id).ok_or("provider not found")?;
+    let (_, _, model, config) = store
+        .models()
+        .find(|(pid, ..)| *pid == id)
         .ok_or("provider has no models to probe")?;
     for kind in [
         ProviderType::Anthropic,
@@ -943,28 +936,25 @@ fn discover_providers(
     refresh: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(id) = provider
-        && !store.snapshot().providers.contains_key(id)
+        && store.provider(id).is_none()
     {
         return Err(format!("unknown provider {id}").into());
     }
     let ids: Vec<_> = store
-        .snapshot()
-        .providers
-        .iter()
-        .filter(|(id, p)| {
-            provider.is_none_or(|wanted| wanted == id.as_str()) && p.command.is_some()
-        })
+        .providers()
+        .filter(|(id, p)| provider.is_none_or(|wanted| wanted == id.as_str()) && p.has_command())
         .map(|(id, _)| id.clone())
         .collect();
     store.refresh_discovery_many(if refresh { ids.clone() } else { vec![] })?;
     for id in ids {
-        let p = &store.snapshot().providers[&id];
+        // Panics like a map index if the reload dropped this provider.
+        let p = store.provider(&id).expect("no entry found for key");
         println!(
             "{}",
-            serde_json::json!({"provider":id,"protocol":code_config::discovery::PROTOCOL,"models":p.models,"error":store.snapshot().discovery_errors.get(&id)})
+            serde_json::json!({"provider":id,"protocol":code_config::discovery::PROTOCOL,"models":p.models,"error":store.discovery_error(&id)})
         );
     }
-    for warning in &store.snapshot().errors {
+    for warning in store.errors() {
         eprintln!("{warning}");
     }
     Ok(())
@@ -975,16 +965,14 @@ async fn provider_test(
     cwd: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     store.refresh_discovery(id)?;
-    let p = store
-        .snapshot()
-        .providers
-        .get(id)
-        .ok_or("unknown provider")?
-        .clone();
+    let p = store.provider(id).ok_or("unknown provider")?.clone();
     if p.kind != ProviderType::Command {
         return Err("provider test requires type: command".into());
     }
-    let (mid, config) = p.models.iter().next().ok_or("provider has no models")?;
+    let (_, _, mid, config) = store
+        .models()
+        .find(|(pid, ..)| *pid == id)
+        .ok_or("provider has no models")?;
     let model = Model::new(id.into(), mid.clone(), p.clone(), config.clone(), None)?;
     let mut request = model.prepare(
         "Reply briefly.",
@@ -1021,7 +1009,7 @@ async fn provider_test(
         Ok(c) => {
             println!(
                 "{}",
-                serde_json::json!({"provider":id,"model":model.id(),"observed":{"textBytes":c.text.len(),"textDeltas":text_deltas,"reasoningDeltas":reasoning_deltas,"toolCalls":c.tool_calls.len(),"stopReason":c.stop_reason,"status":c.status},"usage":usages,"protocolWarnings":warnings,"configWarnings":store.snapshot().errors,"scope":"discovery and one minimal inference call; tools/cancel require live verification"})
+                serde_json::json!({"provider":id,"model":model.id(),"observed":{"textBytes":c.text.len(),"textDeltas":text_deltas,"reasoningDeltas":reasoning_deltas,"toolCalls":c.tool_calls.len(),"stopReason":c.stop_reason,"status":c.status},"usage":usages,"protocolWarnings":warnings,"configWarnings":store.errors(),"scope":"discovery and one minimal inference call; tools/cancel require live verification"})
             );
             Ok(())
         }

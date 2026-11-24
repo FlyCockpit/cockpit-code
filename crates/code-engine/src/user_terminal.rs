@@ -89,7 +89,7 @@ impl Control {
                 .unwrap()
                 .settings
                 .mode
-                .unwrap_or_else(|| self.config.lock().unwrap().config.permissions.mode)
+                .unwrap_or_else(|| self.config.lock().unwrap().config().permissions.mode)
                 != code_config::PermissionMode::Unattended
     }
     pub(crate) fn has_frozen_terminal(&self) -> bool {

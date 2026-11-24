@@ -74,14 +74,6 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn provider_key(provider: &Provider) -> u64 {
-    // Only a hash of unresolved configuration is stored, never connection data.
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_vec(provider)
-        .unwrap_or_default()
-        .hash(&mut hash);
-    hash.finish()
-}
 fn failure_path(cache: &Path) -> PathBuf {
     cache.with_extension("error.json")
 }
@@ -101,143 +93,155 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     result
 }
-fn cache_failure(provider: &Provider, cache: &Path, error: &DiscoveryError) {
-    let failure = Failure {
-        kind: error.kind,
-        failed_at: error.retry_at.saturating_sub(FAILURE_TTL_SECS),
-        provider_key: provider_key(provider),
-    };
-    if let Ok(bytes) = serde_json::to_vec(&failure) {
-        let _ = atomic_write(&failure_path(cache), &bytes);
+impl Provider {
+    fn key(&self) -> u64 {
+        // Only a hash of unresolved configuration is stored, never connection data.
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(self).unwrap_or_default().hash(&mut hash);
+        hash.finish()
     }
-}
-fn discover_cached(
-    provider: &Provider,
-    cache: &Path,
-    refresh: bool,
-    execute: bool,
-) -> std::result::Result<Option<serde_json::Value>, DiscoveryError> {
-    let Some(config) = provider.command.as_ref().and_then(|c| c.discover.as_ref()) else {
-        return Ok(None);
-    };
-    if !refresh {
-        if let Ok(failure) = parse::<Failure>(&failure_path(cache)) {
-            let retry_at = failure.failed_at.saturating_add(FAILURE_TTL_SECS);
-            if failure.provider_key == provider_key(provider)
-                && failure.failed_at <= now()
-                && now() < retry_at
+    fn cache_failure(&self, cache: &Path, error: &DiscoveryError) {
+        let failure = Failure {
+            kind: error.kind,
+            failed_at: error.retry_at.saturating_sub(FAILURE_TTL_SECS),
+            provider_key: self.key(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&failure) {
+            let _ = atomic_write(&failure_path(cache), &bytes);
+        }
+    }
+    /// The discovered models: from a fresh cache, else by running the
+    /// discover command when `execute`; `None` without either.
+    fn discover_cached(
+        &self,
+        cache: &Path,
+        refresh: bool,
+        execute: bool,
+    ) -> std::result::Result<Option<serde_json::Value>, DiscoveryError> {
+        let Some(config) = self.discovery() else {
+            return Ok(None);
+        };
+        if !refresh {
+            if let Ok(failure) = parse::<Failure>(&failure_path(cache)) {
+                let retry_at = failure.failed_at.saturating_add(FAILURE_TTL_SECS);
+                if failure.provider_key == self.key()
+                    && failure.failed_at <= now()
+                    && now() < retry_at
+                {
+                    return Err(DiscoveryError {
+                        kind: failure.kind,
+                        message: failure.kind.message().into(),
+                        cached: true,
+                        retry_at,
+                    });
+                }
+            }
+            let fresh = modified(cache)
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() < config.ttl_secs.unwrap_or(86400));
+            // A failure supersedes an older success even after its short TTL expires.
+            if fresh
+                && modified(&failure_path(cache))
+                    .is_none_or(|failed| modified(cache) > Some(failed))
+                && let Ok(value) = parse::<serde_json::Value>(cache)
+                && value["protocol"] == PROTOCOL
+                && value["models"].is_object()
             {
-                return Err(DiscoveryError {
-                    kind: failure.kind,
-                    message: failure.kind.message().into(),
-                    cached: true,
-                    retry_at,
-                });
+                return Ok(Some(value));
             }
         }
-        let fresh = modified(cache)
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age.as_secs() < config.ttl_secs.unwrap_or(86400));
-        // A failure supersedes an older success even after its short TTL expires.
-        if fresh
-            && modified(&failure_path(cache)).is_none_or(|failed| modified(cache) > Some(failed))
-            && let Ok(value) = parse::<serde_json::Value>(cache)
-            && value["protocol"] == PROTOCOL
-            && value["models"].is_object()
+        if !execute {
+            return Ok(None);
+        }
+        let result = self.run_discovery().and_then(|value| {
+            atomic_write(cache, &serde_json::to_vec(&value).unwrap())
+                .map_err(|_| DiscoveryError::new(DiscoveryErrorKind::Cache))?;
+            let _ = fs::remove_file(failure_path(cache));
+            Ok(Some(value))
+        });
+        if let Err(error) = &result {
+            self.cache_failure(cache, error);
+        }
+        result
+    }
+    fn run_discovery(&self) -> std::result::Result<serde_json::Value, DiscoveryError> {
+        use DiscoveryErrorKind as Kind;
+        let resolved = self
+            .resolved_command
+            .as_ref()
+            .ok_or_else(|| DiscoveryError::new(Kind::Configuration))?;
+        let argv = resolved
+            .discover_argv
+            .as_ref()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| DiscoveryError::new(Kind::Configuration))?;
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .envs(&resolved.env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(cwd) = &resolved.cwd {
+            command.current_dir(
+                cwd.replace(
+                    "{cwd}",
+                    &env::current_dir()
+                        .map_err(|_| DiscoveryError::new(Kind::Configuration))?
+                        .to_string_lossy(),
+                ),
+            );
+        }
+        #[cfg(unix)]
         {
-            return Ok(Some(value));
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
-    }
-    if !execute {
-        return Ok(None);
-    }
-    let result = run(provider).and_then(|value| {
-        atomic_write(cache, &serde_json::to_vec(&value).unwrap())
-            .map_err(|_| DiscoveryError::new(DiscoveryErrorKind::Cache))?;
-        let _ = fs::remove_file(failure_path(cache));
-        Ok(Some(value))
-    });
-    if let Err(error) = &result {
-        cache_failure(provider, cache, error);
-    }
-    result
-}
-fn run(provider: &Provider) -> std::result::Result<serde_json::Value, DiscoveryError> {
-    use DiscoveryErrorKind as Kind;
-    let resolved = provider
-        .connection_command()
-        .ok_or_else(|| DiscoveryError::new(Kind::Configuration))?;
-    let argv = resolved
-        .discover_argv
-        .as_ref()
-        .filter(|a| !a.is_empty())
-        .ok_or_else(|| DiscoveryError::new(Kind::Configuration))?;
-    let mut command = Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .envs(&resolved.env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    if let Some(cwd) = &resolved.cwd {
-        command.current_dir(
-            cwd.replace(
-                "{cwd}",
-                &env::current_dir()
-                    .map_err(|_| DiscoveryError::new(Kind::Configuration))?
-                    .to_string_lossy(),
-            ),
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|_| DiscoveryError::new(Kind::Spawn))?;
-    let stdout = child.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(4 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Err(_) => break Err(DiscoveryError::new(Kind::Wait)),
-            _ => {}
+        let mut child = command
+            .spawn()
+            .map_err(|_| DiscoveryError::new(Kind::Spawn))?;
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(_) => break Err(DiscoveryError::new(Kind::Wait)),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                break Err(DiscoveryError::new(Kind::Timeout));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Always reap the process group and join its stdout reader, including failures.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
-        if Instant::now() >= deadline {
-            break Err(DiscoveryError::new(Kind::Timeout));
+        let _ = child.kill();
+        let _ = child.wait();
+        let bytes = reader.join().ok().and_then(|r| r.ok());
+        let status = status?;
+        if !status.success() {
+            return Err(DiscoveryError::new(Kind::Exit));
         }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    // Always reap the process group and join its stdout reader, including failures.
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+        let bytes = bytes
+            .filter(|b| b.len() <= 4 * 1024 * 1024)
+            .ok_or_else(|| DiscoveryError::new(Kind::Output))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| DiscoveryError::new(Kind::Json))?;
+        if value["protocol"] != PROTOCOL || !value["models"].is_object() {
+            return Err(DiscoveryError::new(Kind::Protocol));
+        }
+        Ok(value)
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    let bytes = reader.join().ok().and_then(|r| r.ok());
-    let status = status?;
-    if !status.success() {
-        return Err(DiscoveryError::new(Kind::Exit));
-    }
-    let bytes = bytes
-        .filter(|b| b.len() <= 4 * 1024 * 1024)
-        .ok_or_else(|| DiscoveryError::new(Kind::Output))?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| DiscoveryError::new(Kind::Json))?;
-    if value["protocol"] != PROTOCOL || !value["models"].is_object() {
-        return Err(DiscoveryError::new(Kind::Protocol));
-    }
-    Ok(value)
 }
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok().and_then(|m| m.modified().ok())
@@ -256,6 +260,39 @@ fn merge(base: &mut serde_json::Value, overrides: &serde_json::Value) {
     }
 }
 
+impl ConfigStore {
+    /// Enabled discovering providers whose cache is missing, past its TTL or
+    /// older than the provider file, and cached failures due for a retry.
+    pub fn discovery_expired(&self) -> BTreeSet<String> {
+        let dirs = &self.directories;
+        self.snapshot
+            .providers
+            .iter()
+            .filter(|(_, p)| p.enabled)
+            .filter_map(|(id, p)| {
+                let d = p.discovery()?;
+                let cache = dirs.cache.join("discover").join(format!("{id}.json"));
+                let cached = fs::metadata(&cache).and_then(|m| m.modified()).ok();
+                let config = fs::metadata(dirs.config.join("providers").join(format!("{id}.json")))
+                    .and_then(|m| m.modified())
+                    .ok();
+                let fresh = cached.is_some_and(|c| {
+                    c.elapsed()
+                        .is_ok_and(|age| age.as_secs() < d.ttl_secs.unwrap_or(86_400))
+                        && config.is_none_or(|cfg| cfg <= c)
+                });
+                // A cached failure retries once its negative-cache entry expires.
+                let retry = self.snapshot.discovery_errors.get(id).is_some_and(|e| {
+                    e.cached
+                        && SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .is_ok_and(|now| now.as_secs() >= e.retry_at)
+                });
+                (!fresh || retry).then(|| id.clone())
+            })
+            .collect()
+    }
+}
 pub(super) fn enrich(
     snapshot: &mut Snapshot,
     dirs: &Directories,
@@ -275,11 +312,7 @@ pub(super) fn enrich_selected(
     for (id, provider) in &mut snapshot.providers {
         if selected.is_some_and(|selected| selected != id)
             || !provider.enabled
-            || provider
-                .command
-                .as_ref()
-                .and_then(|c| c.discover.as_ref())
-                .is_none()
+            || provider.discovery().is_none()
         {
             continue;
         }
@@ -289,7 +322,8 @@ pub(super) fn enrich_selected(
         let changed = modified(&source)
             .zip(latest)
             .is_some_and(|(config, cached)| config > cached);
-        let result = discover_cached(provider, &cache, refresh.contains(id) || changed, execute)
+        let result = provider
+            .discover_cached(&cache, refresh.contains(id) || changed, execute)
             .and_then(|value| {
                 let Some(value) = value else { return Ok(None) };
                 let result = (|| -> Result<Provider> {
@@ -307,7 +341,7 @@ pub(super) fn enrich_selected(
                 })();
                 result.map(Some).map_err(|_| {
                     let error = DiscoveryError::new(DiscoveryErrorKind::Schema);
-                    cache_failure(provider, &cache, &error);
+                    provider.cache_failure(&cache, &error);
                     error
                 })
             });
@@ -323,20 +357,32 @@ pub(super) fn enrich_selected(
         }
     }
     for (id, provider) in &mut snapshot.providers {
-        if provider
+        for mid in provider.warn_latest_history() {
+            snapshot
+                .errors
+                .push(format!("{id}/{mid}: {LATEST_HISTORY_WARNING}"));
+        }
+    }
+}
+const LATEST_HISTORY_WARNING: &str = "Warning: history: latest disables hidden forks and selfEvaluateWrites; context usage requires provider reporting.";
+impl Provider {
+    /// Note the `history: latest` limits in each affected model's description;
+    /// returns the IDs of those models.
+    fn warn_latest_history(&mut self) -> Vec<String> {
+        let latest = self
             .command
             .as_ref()
-            .is_some_and(|c| c.history.as_deref() == Some("latest"))
-        {
-            for (mid, model) in &mut provider.models {
-                if model.kind.unwrap_or(provider.kind) != ProviderType::Command {
-                    continue;
-                }
-                let warning = "Warning: history: latest disables hidden forks and selfEvaluateWrites; context usage requires provider reporting.";
-                model.description.push_str(&format!("\n{warning}"));
-                snapshot.errors.push(format!("{id}/{mid}: {warning}"));
+            .is_some_and(|c| c.history.as_deref() == Some("latest"));
+        let mut warned = Vec::new();
+        for (mid, model) in &mut self.models {
+            if latest && model.kind.unwrap_or(self.kind) == ProviderType::Command {
+                model
+                    .description
+                    .push_str(&format!("\n{LATEST_HISTORY_WARNING}"));
+                warned.push(mid.clone());
             }
         }
+        warned
     }
 }
 
@@ -349,7 +395,8 @@ mod tests {
         let provider: Provider =
             serde_json::from_value(serde_json::json!({"type":"openai-chat"})).unwrap();
         assert!(
-            discover_cached(&provider, Path::new("unused-cache"), false, false)
+            provider
+                .discover_cached(Path::new("unused-cache"), false, false)
                 .unwrap()
                 .is_none()
         );

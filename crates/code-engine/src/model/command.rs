@@ -45,34 +45,15 @@ impl<'a> Target<'a> {
             provider_id,
             model_id,
             command: provider.connection_command(),
-            latest: latest(provider),
-            text: text_output(provider),
-            reported_cost: config
-                .reported_cost
-                .as_ref()
-                .or(provider.reported_cost.as_ref()),
+            latest: provider.latest_history_only(config),
+            text: provider.text_command(config),
+            reported_cost: provider.reported_cost(config),
             output_reservation: config.max_output_tokens.unwrap_or(8192),
         }
     }
     fn id(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
     }
-}
-/// `history: latest`: the provider keeps its own conversation and receives only the delta.
-pub(super) fn latest(provider: &Provider) -> bool {
-    provider.kind == ProviderType::Command
-        && provider
-            .command
-            .as_ref()
-            .is_some_and(|c| c.history.as_deref() == Some("latest"))
-}
-/// `output: text` (the default): stdout is the assistant text, not JSONL events.
-pub(super) fn text_output(provider: &Provider) -> bool {
-    provider.kind == ProviderType::Command
-        && provider
-            .command
-            .as_ref()
-            .is_some_and(|c| c.output.as_deref().unwrap_or("text") == "text")
 }
 
 /// Only replayable conversation events. Metadata and credentials never enter model history.
@@ -990,9 +971,9 @@ mod tests {
                 cache: root.path().join("cache"),
             })
             .unwrap();
-            assert!(store.snapshot().errors.is_empty());
-            let provider = store.snapshot().providers["p"].clone();
-            let model = Target::new("p", "m", &provider, &provider.models["m"]);
+            assert!(store.errors().is_empty());
+            let (provider, config) = store.model("p/m").unwrap();
+            let model = Target::new("p", "m", provider, config);
             let mut request: PreparedRequest =
                 serde_json::from_value(super::super::tests::request_value()).unwrap();
             request.body = serde_json::to_vec(&json!({"messages":[]})).unwrap();
@@ -1032,8 +1013,8 @@ mod tests {
             cache: root.path().join("cache"),
         })
         .unwrap();
-        let provider = store.snapshot().providers["p"].clone();
-        let model = Target::new("p", "m", &provider, &provider.models["m"]);
+        let (provider, config) = store.model("p/m").unwrap();
+        let model = Target::new("p", "m", provider, config);
         let mut request: PreparedRequest =
             serde_json::from_value(super::super::tests::request_value()).unwrap();
         request.body = serde_json::to_vec(&json!({"messages":[]})).unwrap();

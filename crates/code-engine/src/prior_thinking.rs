@@ -1,13 +1,13 @@
 //! Substitutions are durably resolved before the first replay, once only.
 use crate::{Control, model::Model, schema::*};
-use code_config::{ModelConfig, PriorThinking, Snapshot, ThinkingMode};
+use code_config::{ConfigStore, ModelConfig, PriorThinking, ThinkingMode};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn substitute(
     control: Arc<Control>,
-    snapshot: Snapshot,
+    snapshot: ConfigStore,
     config: ModelConfig,
     agent: String,
     assistant: usize,
@@ -52,7 +52,7 @@ pub(crate) async fn substitute(
 }
 async fn summarize(
     control: &Control,
-    snapshot: &Snapshot,
+    snapshot: &ConfigStore,
     source: &ModelConfig,
     agent: &str,
     raw: &[ReasoningBlock],
@@ -74,10 +74,11 @@ async fn summarize(
         .split_once('/')
         .ok_or_else(|| EngineError::bad("invalid thinking summary model"))?;
     let provider = snapshot
-        .providers
-        .get(provider_id)
+        .provider(provider_id)
         .ok_or_else(|| EngineError::bad("thinking summary provider unavailable"))?;
-    let mut config = provider.models[model_id].clone();
+    // validate_model checked that the model exists; panics like a map index otherwise.
+    let (_, config) = snapshot.model(id).expect("no entry found for key");
+    let mut config = config.clone();
     config.reasoning.default = None;
     config.reasoning.efforts.clear();
     config.thinking = Some(ThinkingMode::None);

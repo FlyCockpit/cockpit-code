@@ -2,7 +2,7 @@
 //! The session owns protocol clients; servers never receive workspace/applyEdit approval.
 use super::{PreparedOperation, ToolBox, ToolDefinition};
 use anyhow::{Context, Result, bail};
-use code_config::{Snapshot, lsp::LspServer};
+use code_config::{ConfigStore, lsp::LspServer};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -39,7 +39,7 @@ pub(super) fn definition() -> ToolDefinition {
 #[derive(Default)]
 pub struct Manager {
     model_overrides: Mutex<HashMap<String, code_config::lsp::LspOverrides>>,
-    config: Option<Arc<Mutex<Snapshot>>>,
+    config: Option<Arc<Mutex<ConfigStore>>>,
     servers: std::collections::BTreeMap<String, LspServer>,
     state: AsyncMutex<State>,
     connected: AtomicBool,
@@ -51,7 +51,7 @@ struct State {
 }
 impl Manager {
     pub(crate) fn new(
-        config: Arc<Mutex<Snapshot>>,
+        config: Arc<Mutex<ConfigStore>>,
         servers: std::collections::BTreeMap<String, LspServer>,
     ) -> Self {
         Self {
@@ -645,10 +645,10 @@ impl Manager {
         let model = overrides.get(agent);
         let mode = model
             .and_then(|m| m.after_write)
-            .unwrap_or(config.config.lsp.after_write);
+            .unwrap_or(config.config().lsp.after_write);
         let wait = model
             .and_then(|m| m.after_write_ms)
-            .unwrap_or(config.config.lsp.after_write_ms);
+            .unwrap_or(config.config().lsp.after_write_ms);
         (mode != code_config::lsp::AfterWrite::Off && wait > 0)
             .then_some((mode, Duration::from_millis(wait)))
     }

@@ -249,7 +249,7 @@ impl Engine {
     }
     /// The configured default for new sessions.
     pub fn subagents_default(&self) -> bool {
-        self.store.snapshot().config.subagents.mode == SubagentMode::Flat
+        self.store.config().subagents.mode == SubagentMode::Flat
     }
     pub fn set_subagents(&self, flat: bool) -> Result<(), String> {
         self.session

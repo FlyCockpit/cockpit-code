@@ -83,7 +83,7 @@ pub mod usage;
 mod user_terminal;
 mod variations;
 pub mod wire_schema;
-use code_config::{ConfigStore, PermissionMode, Snapshot};
+use code_config::{ConfigStore, PermissionMode};
 use futures_util::{StreamExt, stream};
 use model::EventSender;
 use schema::*;
@@ -119,7 +119,7 @@ pub(crate) struct Control {
     scope_applies: Mutex<HashMap<String, (Arc<CommitBarrier>, CancellationToken)>>,
     idle: Mutex<idle::IdleState>,
     compact_suggestion: Mutex<Option<(String, bool)>>,
-    config: Arc<Mutex<Snapshot>>,
+    config: Arc<Mutex<ConfigStore>>,
     pub journal: Mutex<Journal>,
     usage: Arc<usage::Cache>,
     pub approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
@@ -571,7 +571,7 @@ struct State {
     store: ConfigStore,
     tools: ToolBox,
     gate: Arc<dyn PermissionGate>,
-    config: Arc<Mutex<Snapshot>>,
+    config: Arc<Mutex<ConfigStore>>,
     control: Arc<Control>,
     cwd: PathBuf,
     anchor: Option<(u64, u64)>,
@@ -610,7 +610,7 @@ pub struct Session {
     state: Arc<AsyncMutex<State>>,
     control: Arc<Control>,
     coordinator: Arc<Mutex<Coordinator>>,
-    config: Arc<Mutex<Snapshot>>,
+    config: Arc<Mutex<ConfigStore>>,
     /// The session policy (shared grants), for work outside the root state lock (fork chats).
     gate: Arc<dyn PermissionGate>,
     _lifetime: Arc<SessionLifetime>,
@@ -667,8 +667,8 @@ impl Session {
         let settings = SessionSettings {
             model: options.model,
             effort: options.effort,
-            safety_model: store.snapshot().config.permissions.auto_model.clone(),
-            subagents: store.snapshot().config.subagents.mode,
+            safety_model: store.config().permissions.auto_model.clone(),
+            subagents: store.config().subagents.mode,
             ..Default::default()
         };
         let journal = Journal::create(&store, cwd, settings)?;
@@ -711,9 +711,9 @@ impl Session {
         custom_gate: Option<Arc<dyn PermissionGate>>,
     ) -> Result<Self, EngineError> {
         let cwd = canonical_cwd(journal.header.cwd.clone())?;
-        freeze_strict_tools(&mut journal, store.snapshot())?;
+        freeze_strict_tools(&mut journal, &store)?;
         if journal.settings.lsp_servers.is_none() {
-            let resolved = lsp_defaults::resolve(&store.snapshot().config.lsp, &cwd).servers;
+            let resolved = lsp_defaults::resolve(&store.config().lsp, &cwd).servers;
             if journal.is_persisted() && !journal.read_only {
                 journal
                     .change_settings(vec![("lspServers".into(), serde_json::json!(resolved))])?;
@@ -723,31 +723,25 @@ impl Session {
         }
         let lsp_servers = journal.settings.lsp_servers.clone().unwrap_or_default();
         if let Some(id) = &exclusive::safety(&journal.settings) {
-            permissions::validate_model(store.snapshot(), id)?;
+            permissions::validate_model(&store, id)?;
         }
-        let config = Arc::new(Mutex::new(store.snapshot().clone()));
+        let config = Arc::new(Mutex::new(store.clone()));
         let enabled = journal.settings.mcps.clone().unwrap_or_else(|| {
             store
-                .snapshot()
-                .mcps
-                .iter()
+                .mcps()
                 .filter(|(_, m)| m.enabled_by_default)
                 .map(|(n, _)| n.clone())
                 .collect()
         });
         journal.settings.mcps = Some(enabled.clone());
-        let effective_enabled = exclusive::enabled_mcps(&journal.settings, store.snapshot());
-        let mcp = Arc::new(mcp::Manager::new(
-            store.snapshot(),
-            &effective_enabled,
-            cwd.clone(),
-        ));
+        let effective_enabled = exclusive::enabled_mcps(&journal.settings, &store);
+        let mcp = Arc::new(mcp::Manager::new(&store, &effective_enabled, cwd.clone()));
         let exclusive_policy = Arc::new(Mutex::new(journal.settings.exclusive.clone()));
         exclusive::register_policy(journal.header.id.clone(), &exclusive_policy);
         let usage = usage::Cache::start(&store);
         let control = Arc::new(Control {
-            data_dir: store.directories.data.clone(),
-            directories: store.directories.clone(),
+            data_dir: store.directories().data,
+            directories: store.directories(),
             guidance_turns: Mutex::default(),
             guidance_selection_locks: Mutex::default(),
             guidance: Mutex::default(),
@@ -835,7 +829,7 @@ impl Session {
             cwd,
             anchor,
             agent_id: "root".into(),
-            remaining_depth: config.lock().unwrap().config.subagents.max_depth,
+            remaining_depth: config.lock().unwrap().config().subagents.max_depth,
             model_override: None,
             effort_override: None,
             compact_request: Arc::new(Mutex::new(None)),
@@ -860,7 +854,7 @@ impl Session {
             coordinator: Arc::clone(&coordinator),
         });
         let session = Self {
-            directories: state.store.directories.clone(),
+            directories: state.store.directories(),
             _lifetime: lifetime,
             state: Arc::new(AsyncMutex::new(state)),
             control,
@@ -977,9 +971,8 @@ impl Session {
         let id = settings
             .model
             .as_deref()
-            .or(snapshot.config.default_model.as_deref())?;
-        let (p, m) = id.split_once('/')?;
-        snapshot.providers.get(p)?.models.get(m)?.context_window
+            .or(snapshot.config().default_model.as_deref())?;
+        snapshot.model(id)?.1.context_window
     }
     pub fn lock_status(&self) -> Result<sessions::LockStatus, EngineError> {
         self.control.journal.lock().unwrap().lock_status()
@@ -1025,7 +1018,7 @@ impl Session {
         let id = settings
             .model
             .as_ref()
-            .or(snapshot.config.default_model.as_ref());
+            .or(snapshot.config().default_model.as_ref());
         if !id.is_some_and(|id| discovery::pending_model(&snapshot, id)) {
             build_model(&snapshot, &settings)?;
         }
@@ -1060,7 +1053,7 @@ impl Session {
             return Err(EngineError::bad("session is shutting down"));
         }
         let snapshot = self.config.lock().unwrap();
-        if mcps.iter().any(|id| !snapshot.mcps.contains_key(id)) {
+        if mcps.iter().any(|id| !snapshot.mcp(id).is_some()) {
             return Err(EngineError::bad("MCP is not configured"));
         }
         drop(snapshot);
@@ -1092,7 +1085,7 @@ impl Session {
     }
     pub fn set_mcp_enabled(&self, name: &str, enabled: bool) -> Result<(), EngineError> {
         let mut names = self.settings().mcps.unwrap_or_default();
-        if !self.config.lock().unwrap().mcps.contains_key(name) {
+        if !self.config.lock().unwrap().mcp(name).is_some() {
             return Err(EngineError::bad("MCP is not configured"));
         }
         if enabled {
@@ -1537,14 +1530,12 @@ fn canonical_cwd(cwd: PathBuf) -> Result<PathBuf, EngineError> {
     }
     Ok(cwd)
 }
-fn freeze_strict_tools(journal: &mut Journal, snapshot: &Snapshot) -> Result<(), EngineError> {
+fn freeze_strict_tools(journal: &mut Journal, snapshot: &ConfigStore) -> Result<(), EngineError> {
     let mut strict = journal.settings.strict_tools.clone();
-    for (id, provider) in &snapshot.providers {
-        for (model, config) in &provider.models {
-            strict
-                .entry(format!("{id}/{model}"))
-                .or_insert_with(|| provider.strict_tools(config));
-        }
+    for (id, provider, model, config) in snapshot.models() {
+        strict
+            .entry(format!("{id}/{model}"))
+            .or_insert_with(|| provider.strict_tools(config));
     }
     if strict != journal.settings.strict_tools {
         if journal.is_persisted() && !journal.read_only {
@@ -1556,7 +1547,7 @@ fn freeze_strict_tools(journal: &mut Journal, snapshot: &Snapshot) -> Result<(),
     Ok(())
 }
 fn build_model(
-    snapshot: &Snapshot,
+    snapshot: &ConfigStore,
     settings: &SessionSettings,
 ) -> Result<model::Model, EngineError> {
     let id = settings
@@ -1564,18 +1555,16 @@ fn build_model(
         .as_ref()
         .map(|ex| ex.model.as_str())
         .or(settings.model.as_deref())
-        .or(snapshot.config.default_model.as_deref())
+        .or(snapshot.config().default_model.as_deref())
         .ok_or_else(|| EngineError::bad("set defaultModel or pass --model provider/model"))?;
     let (p, m) = id
         .split_once('/')
         .ok_or_else(|| EngineError::bad("model must be provider/model"))?;
-    let provider = snapshot
-        .providers
-        .get(p)
-        .ok_or_else(|| EngineError::bad(format!("provider {p} is not configured")))?;
-    let config = provider
-        .models
-        .get(m)
+    if snapshot.provider(p).is_none() {
+        return Err(EngineError::bad(format!("provider {p} is not configured")));
+    }
+    let (provider, config) = snapshot
+        .model(id)
         .ok_or_else(|| EngineError::bad(format!("model {id} is not configured")))?;
     let mut config = config.clone();
     config.strict_tools = settings
@@ -1611,17 +1600,12 @@ impl State {
                 }
             }
         }
-        *self.config.lock().unwrap() = self.store.snapshot().clone();
-        self.control.usage.update_config(self.store.snapshot());
-        freeze_strict_tools(
-            &mut self.control.journal.lock().unwrap(),
-            self.store.snapshot(),
-        )?;
-        let enabled = exclusive::enabled_mcps(
-            &self.control.journal.lock().unwrap().settings,
-            self.store.snapshot(),
-        );
-        self.control.mcp.refresh(self.store.snapshot(), &enabled);
+        *self.config.lock().unwrap() = self.store.clone();
+        self.control.usage.update_config(&self.store);
+        freeze_strict_tools(&mut self.control.journal.lock().unwrap(), &self.store)?;
+        let enabled =
+            exclusive::enabled_mcps(&self.control.journal.lock().unwrap().settings, &self.store);
+        self.control.mcp.refresh(&self.store, &enabled);
         Ok(())
     }
     fn model(&self) -> Result<model::Model, EngineError> {
@@ -1638,14 +1622,11 @@ impl State {
                 .model
                 .split_once('/')
                 .ok_or_else(|| EngineError::bad("invalid frozen goal model"))?;
-            let mut provider_config = self
+            let provider_config = self
                 .store
-                .snapshot()
-                .providers
-                .get(provider)
+                .provider(provider)
                 .ok_or_else(|| EngineError::bad("frozen goal provider removed"))?
-                .clone();
-            provider_config.prompt_caching = goal.caching.clone();
+                .with_caching(goal.caching.clone());
             return model::Model::new(
                 provider.into(),
                 model.into(),
@@ -1663,7 +1644,7 @@ impl State {
             .exclusive
             .is_some()
         {
-            return build_model(self.store.snapshot(), &self.model_settings());
+            return build_model(&self.store, &self.model_settings());
         }
         if let Some(profile) = &self.child_profile {
             let id = self
@@ -1673,14 +1654,11 @@ impl State {
             let (p, m) = id
                 .split_once('/')
                 .ok_or_else(|| EngineError::bad("invalid child model"))?;
-            let mut provider = self
+            let provider = self
                 .store
-                .snapshot()
-                .providers
-                .get(p)
+                .provider(p)
                 .ok_or_else(|| EngineError::bad("child provider removed"))?
-                .clone();
-            provider.prompt_caching = profile.primary_caching.clone();
+                .with_caching(profile.primary_caching.clone());
             let mut config = profile.primary_config.clone();
             config.strict_tools = self
                 .model_settings()
@@ -1696,7 +1674,7 @@ impl State {
                 profile.primary_effort.as_deref(),
             );
         }
-        build_model(self.store.snapshot(), &self.model_settings())
+        build_model(&self.store, &self.model_settings())
     }
     fn model_settings(&self) -> SessionSettings {
         let mut settings = self.control.journal.lock().unwrap().settings.clone();
@@ -1785,7 +1763,7 @@ impl State {
             }
             request.command_context = model::command::RequestContext {
                 cwd: self.cwd.clone(),
-                state_dir: Some(self.store.directories.data.join("command-conversations")),
+                state_dir: Some(self.store.directories().data.join("command-conversations")),
                 parent_conversation_id: record
                     .parent_id
                     .as_ref()
@@ -1797,7 +1775,7 @@ impl State {
                     journal
                         .settings
                         .mode
-                        .unwrap_or(self.store.snapshot().config.permissions.mode),
+                        .unwrap_or(self.store.config().permissions.mode),
                 )
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned))
@@ -1884,7 +1862,7 @@ impl State {
             .frozen
             .as_ref()
             .map(|c| c.tool_profiles.clone())
-            .unwrap_or_else(|| tool_profiles::snapshots(self.store.snapshot()));
+            .unwrap_or_else(|| self.store.tool_profiles());
         tool_profiles::native(
             catalog,
             tool_profiles::selected(&profiles, &id),
@@ -1914,7 +1892,7 @@ impl State {
         if self.control.flat_mode() {
             return Some(usize::from(self.agent_id == "root"));
         }
-        let max = self.config.lock().unwrap().config.subagents.max_depth;
+        let max = self.config.lock().unwrap().config().subagents.max_depth;
         let journal = self.control.journal.lock().unwrap();
         let mut depth = 0usize;
         let mut id = self.agent_id.as_str();
@@ -2019,28 +1997,26 @@ impl State {
         };
         if context.model_tools.is_empty() {
             let raw = self.raw_definitions();
-            for (provider, p) in &self.store.snapshot().providers {
-                for (model, config) in &p.models {
-                    let mut raw = raw.clone();
-                    tools::media::filter(&mut raw, &config.capabilities);
-                    let id = format!("{provider}/{model}");
-                    let overrides = tool_names::frozen(&context.tool_overrides, &id);
-                    let mut definitions = tool_names::apply(raw.clone(), &overrides)?;
-                    if self.control.flat_mode() {
-                        crate::flat::filter_tools(
-                            &mut definitions,
-                            self.agent_id != "root",
-                            &tool_names::names(&overrides),
-                        );
-                    }
-                    let native = tool_profiles::native(
-                        &definitions,
-                        tool_profiles::selected(&context.tool_profiles, &id),
+            for (provider, _, model, config) in self.store.models() {
+                let mut raw = raw.clone();
+                tools::media::filter(&mut raw, &config.capabilities);
+                let id = format!("{provider}/{model}");
+                let overrides = tool_names::frozen(&context.tool_overrides, &id);
+                let mut definitions = tool_names::apply(raw.clone(), &overrides)?;
+                if self.control.flat_mode() {
+                    crate::flat::filter_tools(
+                        &mut definitions,
+                        self.agent_id != "root",
                         &tool_names::names(&overrides),
                     );
-                    context.model_catalogs.insert(id.clone(), definitions);
-                    context.model_tools.insert(id, native);
                 }
+                let native = tool_profiles::native(
+                    &definitions,
+                    tool_profiles::selected(&context.tool_profiles, &id),
+                    &tool_names::names(&overrides),
+                );
+                context.model_catalogs.insert(id.clone(), definitions);
+                context.model_tools.insert(id, native);
             }
             if let (Some(id), Some(defs)) = (&context.tool_model, &context.offered_tools) {
                 context.model_tools.insert(id.clone(), defs.clone());
@@ -2212,7 +2188,7 @@ impl State {
                 .unwrap()
                 .settings
                 .mode
-                .unwrap_or(self.store.snapshot().config.permissions.mode);
+                .unwrap_or(self.store.config().permissions.mode);
             self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text:format!("Current date: {date}. cwd: {}. Permission mode: {:?}. Enabled MCP servers: {}. MCP tools are reachable through script; discover with tools.search(query=...).{}", self.cwd.display(), mode, serde_json::json!(self.control.mcp.statuses().into_iter().filter(|s|s.enabled).map(|s|s.name).collect::<Vec<_>>()), if self.agent_id != "root" { " You are a noninteractive subagent. Finish with a concise report for your parent; use question with wait=blocking when you cannot make progress without an answer. Your cwd is your inside-cwd permission boundary." } else { "" }) })?;
             self.context_state.date = date;
         }
@@ -2334,7 +2310,7 @@ impl State {
             .frozen
             .as_ref()
             .map(|c| c.tool_profiles.clone())
-            .unwrap_or_else(|| tool_profiles::snapshots(self.store.snapshot()));
+            .unwrap_or_else(|| self.store.tool_profiles());
         let profile = match tool_profiles::selected(&profiles, &model.id()) {
             code_config::tools::Profile::Full => "full",
             code_config::tools::Profile::Core => "core",
@@ -2684,7 +2660,7 @@ async fn run(
             .subscriptions
             .contains_key("root")
     {
-        let paths = state.config.lock().unwrap().config.subscribe.clone();
+        let paths = state.config.lock().unwrap().config().subscribe.clone();
         if !paths.is_empty() {
             state.control.set_subscriptions("root", &paths)?;
         }
@@ -2800,7 +2776,7 @@ async fn run(
             state
                 .model_settings()
                 .mode
-                .unwrap_or(state.store.snapshot().config.permissions.mode),
+                .unwrap_or(state.store.config().permissions.mode),
         )?;
         if exclusive::check_model(&state.model_settings(), &turn_model).is_err() {
             state.active_model = None;
@@ -2831,14 +2807,11 @@ async fn run(
         state.model_reminder(&turn_model)?;
         state.control.scope_turn_serviced(&state.agent_id);
         state.drain_mailbox()?;
-        let mut provider = state
+        let provider = state
             .store
-            .snapshot()
-            .providers
-            .get(&turn_model.provider_id)
+            .provider(&turn_model.provider_id)
             .ok_or_else(|| EngineError::bad("active provider was removed"))?
-            .clone();
-        provider.prompt_caching = turn_model.caching();
+            .with_caching(turn_model.caching());
         let mut config = turn_model.config.clone();
         let steering = state
             .context_state
@@ -2977,7 +2950,7 @@ async fn run(
                     let mut settings = state.model_settings();
                     settings.model = Some(id.clone());
                     settings.effort = None;
-                    let Ok(candidate) = build_model(state.store.snapshot(), &settings) else {
+                    let Ok(candidate) = build_model(&state.store, &settings) else {
                         continue;
                     };
                     if exclusive::check_model(&settings, &candidate).is_err()
@@ -3262,7 +3235,7 @@ async fn run(
             .count();
         let thinking = prior_thinking::substitute(
             state.control.clone(),
-            state.store.snapshot().clone(),
+            state.store.clone(),
             model.config.clone(),
             state.agent_id.clone(),
             assistant_index,
@@ -3710,7 +3683,7 @@ fn execute_inner<'a>(
         state.control.check_owner()?;
         if tools::web::handles(&call.name) {
             let blocked = state.model_settings().exclusive.as_ref().is_some_and(|ex| ex.block_network);
-            let web = state.config.lock().unwrap().config.web.clone();
+            let web = state.config.lock().unwrap().config().web.clone();
             return tools::web::execute(state.gate.as_ref(), state.metadata_operation(call.clone(), None), &web, blocked, &cancel)
                 .await
                 .map_err(|e| EngineError::bad(format!("{e:#}")));
@@ -3780,7 +3753,7 @@ fn execute_inner<'a>(
                     Some(serde_json::Value::String(wait)) if wait == "whenever" => false,
                     None => {
                         let mode = state.control.journal.lock().unwrap().settings.mode
-                            .unwrap_or_else(|| state.config.lock().unwrap().config.permissions.mode);
+                            .unwrap_or_else(|| state.config.lock().unwrap().config().permissions.mode);
                         mode == PermissionMode::Manual
                     },
                     _ => return Err(EngineError::bad("wait must be blocking or whenever")),
@@ -4189,9 +4162,9 @@ mod tests {
     #[tokio::test]
     async fn current_profiles_do_not_receive_old_schema_migration_notices() {
         let (temp, store) = crate::test_support::store(serde_json::json!({"defaultModel":"p/m"}));
-        std::fs::create_dir_all(store.directories.config.join("providers")).unwrap();
+        std::fs::create_dir_all(store.directories().config.join("providers")).unwrap();
         std::fs::write(
-            store.directories.config.join("providers/p.json"),
+            store.directories().config.join("providers/p.json"),
             serde_json::to_vec(&serde_json::json!({
                 "type":"command", "command":{"argv":["unused-provider"]},
                 "models":{"m":{"capabilities":{"input":["text"],"output":["text"],"tools":true}}}
@@ -4199,7 +4172,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let store = ConfigStore::load(store.directories).unwrap();
+        let store = ConfigStore::load(store.directories()).unwrap();
         let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
         {
             let mut state = session.state.lock().await;

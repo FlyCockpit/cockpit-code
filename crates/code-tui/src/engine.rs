@@ -466,7 +466,7 @@ impl Engine {
                 .map(|p| p.id)
                 .collect()
         } else {
-            catalog::discovery_expired(self.store.snapshot(), &self.directories)
+            self.store.discovery_expired()
         };
         if targets.is_empty() {
             return false;
@@ -497,9 +497,7 @@ impl Engine {
     pub fn discovering(&self) -> BTreeSet<String> {
         match &self.discovery {
             Some((s, _)) => s.clone(),
-            None if self.session.discovery_running() => {
-                catalog::discovery_expired(self.store.snapshot(), &self.directories)
-            }
+            None if self.session.discovery_running() => self.store.discovery_expired(),
             None => BTreeSet::new(),
         }
     }
@@ -527,12 +525,11 @@ impl Engine {
     /// Every enabled provider's usage, from the engine cache (no I/O but
     /// the discovery-account fallback).
     pub fn provider_usage(&self) -> Vec<ProviderUsage> {
-        let snap = self.store.snapshot();
         self.session
             .provider_usage()
             .into_iter()
             .filter_map(|u| {
-                let p = snap.providers.get(&u.provider).filter(|p| p.enabled)?;
+                let p = self.store.provider(&u.provider).filter(|p| p.enabled)?;
                 Some(catalog::usage_of(&self.directories, p, u))
             })
             .collect()
@@ -540,11 +537,7 @@ impl Engine {
 
     pub fn catalog(&self) -> Catalog {
         let exclusive = self.session.exclusive().map(|ex| ex.model);
-        catalog::build(
-            self.store.snapshot(),
-            exclusive.as_deref(),
-            &self.directories.config,
-        )
+        catalog::build(&self.store, exclusive.as_deref(), &self.directories.config)
     }
 
     fn settings(&self) -> SessionSettings {
@@ -554,7 +547,7 @@ impl Engine {
     pub fn active_model(&self) -> Option<String> {
         self.settings()
             .model
-            .or_else(|| self.store.snapshot().config.default_model.clone())
+            .or_else(|| self.store.config().default_model.clone())
     }
     pub fn effort(&self) -> Option<String> {
         self.settings().effort
@@ -593,7 +586,7 @@ impl Engine {
         Mode::from_engine(
             self.pending_mode
                 .or(self.settings().mode)
-                .unwrap_or(self.store.snapshot().config.permissions.mode),
+                .unwrap_or(self.store.config().permissions.mode),
         )
     }
     /// An explicit user choice: persisted (and materializes the session).
@@ -748,12 +741,7 @@ impl Engine {
     pub fn guidance_config(&self) -> (bool, Option<String>, usize) {
         // Read fresh: the engine re-reads config.json every turn.
         let fresh = ConfigStore::load(self.directories.clone()).ok();
-        let g = &fresh
-            .as_ref()
-            .unwrap_or(&self.store)
-            .snapshot()
-            .config
-            .guidance;
+        let g = &fresh.as_ref().unwrap_or(&self.store).config().guidance;
         (g.enabled, g.model.clone(), g.max_items)
     }
     pub fn prune_preview(&self) -> Result<PruneView, String> {
@@ -1111,7 +1099,7 @@ impl Engine {
     }
     /// `config.modelSwitchWarnMinutes` (0 is off).
     pub fn switch_warn_minutes(&self) -> u64 {
-        self.store.snapshot().config.model_switch_warn_minutes
+        self.store.config().model_switch_warn_minutes
     }
     /// Minutes since root's last user message, from the persisted records.
     pub fn last_message_minutes(&self) -> Option<f64> {

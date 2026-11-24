@@ -297,7 +297,7 @@ impl Session {
                 "/goal requires a model with native tool calls so drafting and review restrictions can be enforced",
             ));
         }
-        let policy = snapshot.config.goal.clone();
+        let policy = snapshot.config().goal.clone();
         if policy.no_progress_turns == 0
             || policy.repeated_gap_rounds == 0
             || policy.max_review_rounds == 0

@@ -269,7 +269,7 @@ pub fn list_with_problems_in(data: &Path, cwd: Option<&Path>) -> Result<SessionL
 /// user title, recorded like `/rename`. Fails while another process holds it.
 pub fn rename_session(store: &ConfigStore, id: &str, title: &str) -> Result<()> {
     // A stale lock (its process is gone) is not a hold.
-    let stale = lock_status(&store.directories.data, id)
+    let stale = lock_status(&store.directories().data, id)
         .is_ok_and(|l| l.holder.is_some() && l.pid_alive == Some(false));
     let mut journal = Journal::load(store, id, stale)?;
     let result = journal
@@ -587,7 +587,7 @@ impl Journal {
     }
 
     pub fn create(store: &ConfigStore, cwd: PathBuf, settings: SessionSettings) -> Result<Self> {
-        let root = store.directories.data.join("sessions");
+        let root = store.directories().data.join("sessions");
         let id = Uuid::new_v4().to_string();
         let dir = root.join(&id);
         let header = SessionHeader {
@@ -608,7 +608,7 @@ impl Journal {
             model: settings
                 .model
                 .clone()
-                .or(store.snapshot().config.default_model.clone()),
+                .or(store.config().default_model.clone()),
             status: "waiting".into(),
             created_at: now(),
             stable_prompt: crate::BUILD_PROMPT.into(),
@@ -713,7 +713,7 @@ impl Journal {
     }
     pub fn load(store: &ConfigStore, id: &str, claim: bool) -> Result<Self> {
         valid_id(id)?;
-        let dir = store.directories.data.join("sessions").join(id);
+        let dir = store.directories().data.join("sessions").join(id);
         let _guard = Guard::acquire(&dir)?;
         let header: SessionHeader = read_json(&dir.join("session.json"))?;
         let existing = status(&dir, None, false)?;
@@ -872,7 +872,7 @@ impl Journal {
     }
     pub fn fork(store: &ConfigStore, id: &str, point: Option<ForkPoint>) -> Result<Self> {
         valid_id(id)?;
-        let dir = store.directories.data.join("sessions").join(id);
+        let dir = store.directories().data.join("sessions").join(id);
         let _guard = Guard::acquire(&dir)?;
         let header: SessionHeader = read_json(&dir.join("session.json"))?;
         if header.id != id {
@@ -950,7 +950,7 @@ impl Journal {
             events[point.line - 1].ts.clone()
         };
         let id = Uuid::new_v4().to_string();
-        let root = store.directories.data.join("sessions");
+        let root = store.directories().data.join("sessions");
         fs::create_dir_all(&root).map_err(bad)?;
         let dir = root.join(&id);
         create_private_dir(&dir)?;
@@ -1020,7 +1020,7 @@ impl Journal {
         }
         // Assets are immutable attachments; copy without following symlink directories.
         let source_assets = store
-            .directories
+            .directories()
             .data
             .join("sessions")
             .join(&snapshot.header.fork_of.as_ref().unwrap().session_id)
@@ -1029,7 +1029,7 @@ impl Journal {
             copy_assets(&source_assets, &dir.join("assets"))?;
         }
         let source_jobs = store
-            .directories
+            .directories()
             .data
             .join("sessions")
             .join(&snapshot.header.fork_of.as_ref().unwrap().session_id)
@@ -1038,7 +1038,7 @@ impl Journal {
             copy_assets(&source_jobs, &dir.join("jobs"))?;
         }
         let source_outputs = store
-            .directories
+            .directories()
             .data
             .join("sessions")
             .join(&snapshot.header.fork_of.as_ref().unwrap().session_id)
@@ -1847,7 +1847,7 @@ mod tests {
         assert_eq!(loaded.totals.known_cost_usd, 0.25);
         assert_eq!(loaded.agent_totals["root"].calls, 1);
         assert_eq!(
-            list_in(&store.directories.data, None).unwrap()[0]
+            list_in(&store.directories().data, None).unwrap()[0]
                 .totals
                 .calls,
             1
@@ -1914,7 +1914,7 @@ mod tests {
             snapshot.header.id = id.into();
             let error = Journal::restore(&store, snapshot, None).err().unwrap();
             assert!(error.message.contains("invalid session/agent id"));
-            assert!(!store.directories.data.join("sessions").exists());
+            assert!(!store.directories().data.join("sessions").exists());
         }
     }
 
@@ -1930,7 +1930,7 @@ mod tests {
             .unwrap();
         assert!(error.message.contains("header id does not match"));
         assert_eq!(
-            fs::read_dir(store.directories.data.join("sessions"))
+            fs::read_dir(store.directories().data.join("sessions"))
                 .unwrap()
                 .count(),
             1
