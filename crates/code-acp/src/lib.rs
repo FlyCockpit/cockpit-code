@@ -16,5 +16,6 @@ mod replay;
 mod rpc;
 mod server;
 mod session;
+mod view;
 
 pub use server::{Options, run};

@@ -96,7 +96,7 @@ pub async fn run(options: Options) -> Result<(), String> {
     // Disconnect: unanswered approvals become denials, open questions stay
     // pending on disk, and every session tree stops and releases its lock.
     out.close();
-    let shutdowns = server.sessions.values().map(|s| s.session.shutdown());
+    let shutdowns = server.sessions.values().map(|s| s.shutdown());
     for result in futures_util::future::join_all(shutdowns).await {
         if let Err(e) = result {
             eprintln!("acp: shutdown: {}", e.message);
@@ -224,7 +224,7 @@ impl Server {
             json!({"name":"compact","description":"Summarize into a fresh context","input":{"hint":"optional focus"}}),
             json!({"name":"goal","description":"Draft/run criteria; pause, resume, clear or status","input":{"hint":"objective | pause | resume | clear"}}),
         ];
-        if let Ok(skills) = s.session.skills() {
+        if let Ok(skills) = s.skills() {
             for skill in skills {
                 let shadowed = [
                     "compact",
@@ -385,13 +385,10 @@ impl Server {
             Err(e) => self.out.fail(id, e),
             Ok(s) => {
                 if replay {
-                    crate::replay::replay(&self.out, &acp_id, &s.session);
+                    s.replay();
                 }
                 let mut result = Self::settings_result(&s);
-                result["_meta"] = json!({"cockpitCode": {
-                    "engineSessionId": s.session.id(),
-                    "forkedFrom": (s.session.id() != acp_id).then_some(&acp_id),
-                }});
+                result["_meta"] = s.open_meta();
                 self.out.respond(id, result);
                 self.after_open(&s);
                 s.restore_questions();
@@ -474,7 +471,7 @@ impl Server {
         let result = (|| {
             decode::<v1::PromptRequest>(params)?;
             let s = self.session(params)?;
-            let (text, attachments) = prompt_content(&params["prompt"], &s.session)?;
+            let (text, attachments) = prompt_content(&params["prompt"], &s)?;
             let trimmed = text.trim();
             let action = if attachments.is_empty()
                 && trimmed
@@ -511,33 +508,16 @@ impl Server {
                         let focus = rest.trim();
                         Action::Compact((!focus.is_empty()).then(|| focus.to_owned()))
                     }
-                    _ => {
-                        if let Some(command) = trimmed.strip_prefix('/') {
-                            let (name, args) = command
-                                .split_once(char::is_whitespace)
-                                .unwrap_or((command, ""));
-                            let explicit = name.starts_with("skill:");
-                            let skill_name = name.strip_prefix("skill:").unwrap_or(name);
-                            if explicit
-                                || s.session
-                                    .skills()
-                                    .map_err(|e| RpcError::params(e.message))?
-                                    .iter()
-                                    .any(|skill| skill.name == skill_name)
-                            {
-                                Action::Send(
-                                    s.session
-                                        .skill_message(skill_name, args.trim())
-                                        .map_err(|e| RpcError::params(e.message))?,
-                                    attachments,
-                                )
-                            } else {
-                                Action::Send(text, attachments)
-                            }
-                        } else {
-                            Action::Send(text, attachments)
-                        }
-                    }
+                    _ => match trimmed.strip_prefix('/') {
+                        Some(command) => match s
+                            .skill_prompt(command)
+                            .map_err(|e| RpcError::params(e.message))?
+                        {
+                            Some(message) => Action::Send(message, attachments),
+                            None => Action::Send(text, attachments),
+                        },
+                        None => Action::Send(text, attachments),
+                    },
                 }
             };
             s.prompt(id.clone(), action);
@@ -571,7 +551,7 @@ impl Server {
         let id = params["sessionId"].as_str().unwrap_or("").to_string();
         let s = self.session(params)?;
         s.prepare_close();
-        let result = s.session.shutdown().await;
+        let result = s.shutdown().await;
         self.sessions.remove(&id);
         s.stop();
         result.map_err(|e| RpcError::internal(e.message))?;
@@ -614,7 +594,7 @@ fn prompt_text(blocks: &Value) -> String {
 
 fn prompt_content(
     blocks: &Value,
-    session: &Session,
+    session: &AcpSession,
 ) -> Result<(String, Vec<Attachment>), RpcError> {
     let text = prompt_text(blocks);
     let mut attachments = Vec::new();
@@ -641,7 +621,7 @@ fn prompt_content(
                 .unwrap_or("attachment");
             attachments.push(
                 session
-                    .attach_bytes(name, mime, &bytes)
+                    .attach(name, mime, &bytes)
                     .map_err(|e| RpcError::params(e.message))?,
             );
         }
