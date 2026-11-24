@@ -23,6 +23,7 @@ mod picker;
 mod questions;
 mod rows;
 mod termview;
+mod textbuf;
 mod theme;
 mod transcript;
 mod ui;

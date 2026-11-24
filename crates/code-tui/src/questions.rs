@@ -4,9 +4,9 @@
 //! questions show Yes / No plus an optional note; text questions show a
 //! field. Any question can be skipped. Every option is clickable (with the
 //! shared hover) and keyboard-driven: number keys pick options.
-use crate::composer::TextBuf;
 use crate::engine::{QAnswer, QItem, QKind};
 use crate::markdown;
+use crate::textbuf::TextBuf;
 use crate::theme::theme;
 use crate::ui::{self, Hits, ScrollId, Target};
 use crate::wrap::{truncate, wrap_lines};
@@ -191,9 +191,9 @@ impl QDialog {
         let s = &self.state[i];
         s.skipped
             || match self.items[i].kind {
-                QKind::Choice => s.picked.iter().any(|&p| p) || !s.field.text.trim().is_empty(),
+                QKind::Choice => s.picked.iter().any(|&p| p) || !s.field.text().trim().is_empty(),
                 QKind::Boolean => s.yes.is_some(),
-                QKind::Text => !s.field.text.trim().is_empty(),
+                QKind::Text => !s.field.text().trim().is_empty(),
             }
     }
 
@@ -223,7 +223,7 @@ impl QDialog {
                 if s.skipped || !self.answered(i) {
                     return QAnswer::Skipped;
                 }
-                let field = s.field.text.trim().to_string();
+                let field = s.field.text().trim().to_string();
                 match q.kind {
                     QKind::Choice => QAnswer::Choice {
                         labels: q
@@ -394,7 +394,7 @@ impl QDialog {
                 // Enter on an empty field keeps it focused for typing (it
                 // used to advance, so typed letters became hotkeys); with
                 // text it answers and moves on.
-                KeyCode::Enter if buf.text.trim().is_empty() => {}
+                KeyCode::Enter if buf.text().trim().is_empty() => {}
                 KeyCode::Enter => self.advance(),
                 KeyCode::Char(c) if !ctrl => {
                     buf.insert(c.encode_utf8(&mut [0; 4]));
@@ -633,7 +633,7 @@ impl QDialog {
                         },
                     );
                     let pw = prefix.content.width();
-                    if s.field.text.is_empty() {
+                    if s.field.text().is_empty() {
                         tail.push(Line::from(vec![
                             prefix,
                             Span::styled(
@@ -855,11 +855,11 @@ mod tests {
             d.focus = d.rows().iter().position(|r| *r == Row::Field).unwrap();
             d.state[0].skipped = true;
             d.paste("界\nanswer");
-            assert_eq!(d.state[0].field.text, "界 answer");
+            assert_eq!(d.state[0].field.text(), "界 answer");
             assert!(!d.state[0].skipped);
             d.focus = d.rows().len();
             d.paste("ignored");
-            assert_eq!(d.state[0].field.text, "界 answer");
+            assert_eq!(d.state[0].field.text(), "界 answer");
         }
     }
 
@@ -868,7 +868,7 @@ mod tests {
         let mut d = dialog(QKind::Choice);
         d.pick(Row::Option(0), false);
         d.paste("ignored while option focused");
-        assert!(d.state[0].field.text.is_empty());
+        assert!(d.state[0].field.text().is_empty());
         d.focus = 1;
         d.paste("other");
         assert!(!d.state[0].picked[0]);

@@ -3,8 +3,8 @@
 //! roadblock pivot. Both share the dialog chrome: a rounded accent border
 //! on the surface color, a faint key-hint footer, and a scrollbar in the
 //! right padding column.
-use crate::composer::TextBuf;
 use crate::engine::{ContractDraft, ContractView, CriterionView, DraftItem, Section};
+use crate::textbuf::TextBuf;
 use crate::theme::theme;
 use crate::ui::{self, Hits, ScrollId, Target};
 use crate::wrap::{truncate, wrap_lines};
@@ -985,7 +985,7 @@ impl ContractEditor {
             return;
         };
         let rows = self.rows();
-        let text = buf.text.trim().to_string();
+        let text = buf.text().trim().to_string();
         match (rows.get(self.sel).copied(), field) {
             (Some(ERow::Objective), _) => self.draft.objective = text,
             (Some(ERow::Item(s, i)), Field::Text) => {

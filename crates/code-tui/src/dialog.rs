@@ -2,7 +2,7 @@
 //! and an optional free-text field. Adapted from FlyCockpit's Cockpit dialog state
 //! machine reduced to one page; approvals, questions and the session-lock
 //! dialog will reuse it.
-use crate::composer::TextBuf;
+use crate::textbuf::TextBuf;
 use crate::theme::theme;
 use crate::ui::{self, Hits, ScrollId, Target};
 use crate::wrap::wrap_lines;
@@ -201,7 +201,7 @@ impl Dialog {
         if self
             .text
             .as_ref()
-            .is_some_and(|(_, b)| b.text.trim().is_empty())
+            .is_some_and(|(_, b)| b.text().trim().is_empty())
             && self.wants_text(idx)
             && (!self.text_focus
                 || self
@@ -216,7 +216,7 @@ impl Dialog {
         let text = self
             .text
             .as_ref()
-            .map(|(_, b)| b.text.clone())
+            .map(|(_, b)| b.text().to_string())
             .filter(|t| !t.trim().is_empty());
         match self.options.get(idx) {
             Some(o) => Outcome::Chosen {
@@ -398,7 +398,7 @@ impl Dialog {
                 "✎ ",
                 Style::default().fg(if self.text_focus { t.accent } else { t.dim }),
             );
-            if buf.text.is_empty() {
+            if buf.text().is_empty() {
                 // Focused: say what Enter will do.
                 let hint = if self.text_focus {
                     let target = self

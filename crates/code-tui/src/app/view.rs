@@ -126,7 +126,7 @@ impl App {
             "read-only · /fork, /new or /resume"
         } else if viewing.is_some() {
             view_placeholder.as_str()
-        } else if self.running && self.composer.vim.is_some() {
+        } else if self.running && self.composer.vim_on() {
             "type to queue a message · esc normal mode, esc again cancels the turn"
         } else if self.running {
             "type to queue a message · esc cancels the turn"
@@ -135,14 +135,13 @@ impl App {
         };
         // Attachment chips the active model can't take show in yellow.
         let inputs = self.active_info().map(|m| m.input.clone());
-        for b in &mut self.composer.buf.blocks {
-            b.warn = match (&b.attach, &inputs) {
-                (Some(k), Some(i)) => !crate::attach::supported(k, i),
-                _ => false,
-            };
-        }
+        self.composer.warn_attachments(|k| {
+            inputs
+                .as_ref()
+                .is_some_and(|i| !crate::attach::supported(k, i))
+        });
         // The composer keeps its rightmost column for the scrollbar.
-        let crate::composer::BufLayout {
+        let crate::textbuf::BufLayout {
             rows: all_rows,
             cursor: (cx, cy),
             chips,
@@ -1027,13 +1026,17 @@ impl App {
                 spans.push(span);
             };
         push(&mut spans, Span::styled(" ", t.bold()), None);
-        if let Some(v) = &self.composer.vim {
+        if let Some(label) = self.composer.vim_label() {
             push(
                 &mut spans,
                 Span::styled(
-                    v.label(),
+                    label,
                     Style::default()
-                        .fg(if v.block_cursor() { t.link } else { t.green })
+                        .fg(if self.composer.block_cursor() {
+                            t.link
+                        } else {
+                            t.green
+                        })
                         .add_modifier(Modifier::BOLD),
                 ),
                 None,

@@ -442,7 +442,7 @@ impl App {
             Target::Status(seg) => match seg {
                 StatusSeg::Title => {
                     let title = self.title.clone().unwrap_or_default();
-                    self.composer.buf.set(format!("/rename {title}"));
+                    self.composer.set_text(format!("/rename {title}"));
                     self.hint("edit the title and press enter");
                 }
                 StatusSeg::Model => self.command("model", ""),
@@ -473,7 +473,7 @@ impl App {
                 let matches = self.slash_matches();
                 if let Some((cmd, _)) = matches.get(i) {
                     let cmd = cmd.clone();
-                    self.composer.buf.set(format!("/{cmd}"));
+                    self.composer.set_text(format!("/{cmd}"));
                     self.submit();
                 }
             }
@@ -562,7 +562,7 @@ impl App {
             ScrollId::Composer => {
                 let delta = off as isize - self.comp_skip as isize;
                 for _ in 0..delta.unsigned_abs() {
-                    self.composer.buf.vertical(delta < 0);
+                    self.composer.move_vertical(delta < 0);
                 }
             }
             ScrollId::Overlay => match &mut self.overlay {
@@ -658,7 +658,7 @@ impl App {
         // Composer paste chips (from the chip menu).
         match btn {
             Btn::ChipView(b) => {
-                if let Some(blk) = self.composer.buf.blocks.get(b) {
+                if let Some(blk) = self.composer.chip(b) {
                     let title = format!("paste #{} · read-only", blk.n);
                     let text = blk.full.clone();
                     self.overlay = Overlay::Pager(Box::new(Pager::text(title, &text)));
@@ -667,17 +667,17 @@ impl App {
             }
             Btn::ChipEdit(b) => return self.edit_chip(b),
             Btn::ChipExpand(b) => {
-                self.composer.buf.expand_block(b);
+                self.composer.expand_chip(b);
                 self.composer.edited();
                 return;
             }
             Btn::ChipRemove(b) => {
-                self.composer.buf.remove_block(b);
+                self.composer.remove_chip(b);
                 self.composer.edited();
                 return;
             }
             Btn::ChipOpen(b) => {
-                if let Some(blk) = self.composer.buf.blocks.get(b) {
+                if let Some(blk) = self.composer.chip(b) {
                     let path = std::path::PathBuf::from(&blk.full);
                     self.open_file(&path);
                 }
@@ -863,12 +863,7 @@ impl App {
             .iter()
             .find(|(_, i)| *i == b)
             .map_or(self.comp_area.x, |(r, _)| r.x);
-        let attachment = self
-            .composer
-            .buf
-            .blocks
-            .get(b)
-            .is_some_and(|x| x.attach.is_some());
+        let attachment = self.composer.chip(b).is_some_and(|x| x.attach.is_some());
         let items = if attachment {
             vec![Btn::ChipOpen(b), Btn::ChipExpand(b), Btn::ChipRemove(b)]
         } else {
