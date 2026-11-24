@@ -75,12 +75,12 @@ async fn run(
     } else {
         Modality::Image
     };
-    if !model.config.capabilities.input.contains(&kind) {
+    if !model.capabilities().input.contains(&kind) {
         bail!("the active model does not accept {kind:?} input");
     }
     if video
         && !matches!(
-            model.provider.kind,
+            model.wire(),
             ProviderType::OpenaiChat | ProviderType::OpenaiResponses
         )
     {

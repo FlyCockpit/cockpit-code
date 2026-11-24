@@ -292,7 +292,7 @@ impl Session {
         let snapshot = self.config.lock().unwrap().clone();
         let settings = self.settings();
         let model = crate::build_model(&snapshot, &settings)?;
-        if model.command_latest() || model.command_text() || !model.config.capabilities.tools {
+        if model.command_latest() || model.command_text() || !model.capabilities().tools {
             return Err(EngineError::bad(
                 "/goal requires a model with native tool calls so drafting and review restrictions can be enforced",
             ));
@@ -348,9 +348,9 @@ impl Session {
             baseline_usd: totals.known_cost_usd,
             unknown_cost_calls: 0,
             baseline_unknown_cost_calls: totals.unknown_cost_calls,
-            caching: model.provider.prompt_caching.clone(),
+            caching: model.caching(),
         };
-        run.model_config.kind = Some(model.provider.kind);
+        run.model_config.kind = Some(model.wire());
         run.transition("running", None);
         self.control.save_goal(run)?;
         let generation = self.control.journal.lock().unwrap().header.title_generation;

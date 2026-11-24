@@ -1714,7 +1714,7 @@ impl State {
     ) -> Result<model::PreparedRequest, EngineError> {
         let assets = self.control.journal.lock().unwrap().dir.join("assets");
         let cache_key = self.cache_key(model, definitions)?;
-        crate::attachments::validate(&model.config.capabilities, history, Some(&assets))?;
+        crate::attachments::validate(model.capabilities(), history, Some(&assets))?;
         let mut request = if self.continuing {
             if let Some(profile) = &self.child_profile {
                 let context = self.control.journal.lock().unwrap().contexts[&self.agent_id];
@@ -1774,7 +1774,7 @@ impl State {
                 .and_then(|c| c.model_catalogs.get(&model.id()).cloned())
                 .unwrap_or_else(|| self.available_definitions()),
         );
-        if model.provider.kind == code_config::ProviderType::Command {
+        if model.wire() == code_config::ProviderType::Command {
             let journal = self.control.journal.lock().unwrap();
             let record = &journal.agents[&self.agent_id];
             let mut depth = 0;
@@ -1851,7 +1851,7 @@ impl State {
     fn live_definitions(&self) -> Vec<tools::ToolDefinition> {
         let mut definitions = self.raw_definitions();
         if let Ok(model) = self.model() {
-            tools::media::filter(&mut definitions, &model.config.capabilities);
+            tools::media::filter(&mut definitions, model.capabilities());
         }
         let overrides = self.tool_overrides();
         let mut definitions = tool_names::apply(definitions, &overrides).unwrap_or_default();
@@ -2090,7 +2090,7 @@ impl State {
         let overrides = tool_names::frozen(&context.tool_overrides, &id);
         let names = tool_names::names(&overrides);
         let mut raw = self.raw_definitions();
-        tools::media::filter(&mut raw, &model.config.capabilities);
+        tools::media::filter(&mut raw, model.capabilities());
         let mut catalog = tool_names::apply(raw, &overrides)?;
         if self.control.flat_mode() {
             flat::filter_tools(&mut catalog, self.agent_id != "root", &names);
@@ -2294,7 +2294,7 @@ impl State {
             return Ok(false);
         }
         let used = self.context_used(request.input_estimate).0;
-        let Some(window) = model.config.context_window else {
+        let Some(window) = model.context_window() else {
             return Ok(false);
         };
         let bucket = if used >= window * 9 / 10 {
@@ -2309,7 +2309,7 @@ impl State {
         if bucket <= self.context_state.budget_bucket {
             return Ok(false);
         }
-        self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text:format!("Context token budget: approximately {used}/{window} input tokens used; reserve {} for output. Preserve the contract and open criteria and consider compact with a focus.", model.config.max_output_tokens.unwrap_or(8192)) })?;
+        self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text:format!("Context token budget: approximately {used}/{window} input tokens used; reserve {} for output. Preserve the contract and open criteria and consider compact with a focus.", model.output_reservation()) })?;
         self.context_state.budget_bucket = bucket;
         Ok(true)
     }
@@ -2496,20 +2496,20 @@ impl State {
                     if model.command_latest() && usage.context_window.is_none() {
                         None
                     } else {
-                        Some((used, usage.context_window.or(model.config.context_window)))
+                        Some((used, usage.context_window.or(model.context_window())))
                     }
                 } else if !model.command_latest() {
                     usage.tokens.input_tokens.map(|input| {
                         (
                             input.saturating_add(usage.tokens.output_tokens.unwrap_or(0)),
-                            usage.context_window.or(model.config.context_window),
+                            usage.context_window.or(model.context_window()),
                         )
                     })
                 } else {
                     None
                 };
                 if let Some((used, window)) = context {
-                    let output = model.config.max_output_tokens.unwrap_or(8192);
+                    let output = model.output_reservation();
                     let meter = ContextMeter {
                         used,
                         window,
@@ -2600,7 +2600,7 @@ impl State {
             let meter = ContextMeter {
                 used: reported.map_or(0, |(u, _)| u),
                 window: reported.map(|(_, w)| w),
-                output_reservation: model.config.max_output_tokens.unwrap_or(8192),
+                output_reservation: model.output_reservation(),
                 source: if reported.is_some() {
                     "provider"
                 } else {
@@ -2617,15 +2617,14 @@ impl State {
             return Ok(());
         }
         let (used, source) = self.context_used(request.input_estimate);
-        let output = model.config.max_output_tokens.unwrap_or(8192);
+        let output = model.output_reservation();
         let meter = ContextMeter {
             used,
-            window: model.config.context_window,
+            window: model.context_window(),
             output_reservation: output,
             source: source.into(),
             warning: model
-                .config
-                .context_window
+                .context_window()
                 .is_some_and(|w| used.saturating_add(output) >= w * 9 / 10),
         };
         if self.agent_id == "root" {
@@ -2634,8 +2633,7 @@ impl State {
         self.control
             .emit_for(&self.agent_id, EngineEvent::Context { meter });
         if model
-            .config
-            .context_window
+            .context_window()
             .is_some_and(|window| used.saturating_add(output) >= window)
         {
             return Err(EngineError {
@@ -2840,7 +2838,7 @@ async fn run(
             .get(&turn_model.provider_id)
             .ok_or_else(|| EngineError::bad("active provider was removed"))?
             .clone();
-        provider.prompt_caching = turn_model.provider.prompt_caching.clone();
+        provider.prompt_caching = turn_model.caching();
         let mut config = turn_model.config.clone();
         let steering = state
             .context_state
@@ -2850,7 +2848,7 @@ async fn run(
         config.model_prompt = steering.and_then(|s| s.prompt.clone());
         config.model_reminder = steering.and_then(|s| s.reminder.clone());
         config.model_reminder_turns = steering.map(|s| s.reminder_turns);
-        config.kind = Some(turn_model.provider.kind);
+        config.kind = Some(turn_model.wire());
         config.reasoning.default = turn_model.effort.clone();
         let model = model::Model::new(
             turn_model.provider_id.clone(),
@@ -2875,20 +2873,16 @@ async fn run(
                 .unwrap_or(0.8);
             let used = state.context_used(request.input_estimate).0;
             let ratio = model
-                .config
-                .context_window
+                .context_window()
                 .map(|w| used as f64 / w.max(1) as f64)
                 .unwrap_or(0.0);
-            let budget_full = model.config.context_window.is_some_and(|w| {
-                used.saturating_add(model.config.max_output_tokens.unwrap_or(8192)) >= w
-            });
+            let budget_full = model.budget_full(used);
             if (ratio >= threshold || budget_full)
                 && state.compacted_estimate.is_none_or(|previous| {
                     request.input_estimate
                         > previous.saturating_add(
                             model
-                                .config
-                                .context_window
+                                .context_window()
                                 .unwrap_or(5120)
                                 .saturating_div(20)
                                 .max(256),
@@ -2919,14 +2913,14 @@ async fn run(
                 provider_id: model.provider_id.clone(),
                 primary_config: primary_model.config.clone(),
                 primary_effort: primary_model.effort.clone(),
-                primary_caching: primary_model.provider.prompt_caching.clone(),
+                primary_caching: primary_model.caching(),
                 request: request.clone(),
                 system: state.prompt(),
                 compacted_estimate: state.compacted_estimate,
                 warned_context: state.warned_context,
                 config: model.config.clone(),
                 effort: model.effort.clone(),
-                caching: model.provider.prompt_caching.clone(),
+                caching: model.caching(),
                 history_len: history.len(),
                 history_hash: model::history_hash(&history),
                 context: state.control.journal.lock().unwrap().contexts[&state.agent_id],
@@ -3108,7 +3102,7 @@ async fn run(
         {
             state.anchor = Some((input, request.input_estimate));
         }
-        if model.provider.kind == code_config::ProviderType::Command
+        if model.wire() == code_config::ProviderType::Command
             && completion.status == CompletionStatus::Cancelled
         {
             state.control.commit(
@@ -3915,14 +3909,8 @@ async fn compact(
     state.pair_interrupted_calls()?;
     state.drain_mailbox()?;
     let mut model = state.model()?;
-    let window = model.config.context_window.unwrap_or(65536);
-    model.config.max_output_tokens = Some(
-        model
-            .config
-            .max_output_tokens
-            .unwrap_or(8192)
-            .min((window / 8).max(256)),
-    );
+    let window = model.context_window().unwrap_or(65536);
+    model.reserve_output(model.output_reservation().min((window / 8).max(256)));
 
     let history = state.history();
     let latest = history.iter().rposition(|e| match e {
@@ -4032,12 +4020,7 @@ async fn compact(
     events.extend(tail);
     let active_model = state.model()?;
     let final_request = state.prepare(&active_model, &state.definitions(), &events)?;
-    if active_model.config.context_window.is_some_and(|w| {
-        final_request
-            .input_estimate
-            .saturating_add(active_model.config.max_output_tokens.unwrap_or(8192))
-            >= w
-    }) {
+    if active_model.budget_full(final_request.input_estimate) {
         return Err(EngineError::bad(
             "compacted summary, whole-exchange tail and authoritative criteria do not fit; current context retained",
         ));
