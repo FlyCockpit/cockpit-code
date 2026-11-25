@@ -11,7 +11,7 @@ ignore = [
     # atomic-polyfill is unmaintained. Pulled in by monty -> postcard -> heapless 0.7.
     { id = "RUSTSEC-2023-0089", reason = "via monty; no upstream fix" },
     # Owner decision 2026-11-23: chrono 0.4.45 is used directly by code-engine and
-    # code-tui for timestamps and is required by monty / monty-types 1.5.0, which we
+    # code-tui for timestamps and is required by monty / monty-types 1.6.0, which we
     # don't control. Remove when monty moves off chrono (then replace our own chrono
     # use) or at expiry, whichever comes first.
     # drop-after: 2027-01-23

@@ -51,9 +51,9 @@ htmd = "0.5"
 base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 
-monty = "1.5"
-monty-types = "1.5"
-webpki-root-certs = "1.0.11"
+monty = "1.6"
+monty-types = "1.6"
+webpki-root-certs = "1.0.12"
 
 [features]
 intel-c = ["dep:tree-sitter-c"]
