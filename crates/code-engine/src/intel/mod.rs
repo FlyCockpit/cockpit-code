@@ -3,6 +3,7 @@
 mod impact;
 mod js;
 pub(crate) mod lang;
+mod path;
 mod query;
 mod resolve;
 use crate::{

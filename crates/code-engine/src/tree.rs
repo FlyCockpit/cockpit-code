@@ -606,7 +606,7 @@ async fn start_child(
     let current_remaining = state.current_remaining_depth();
     if current_remaining == Some(0) {
         let j = state.control.journal.lock().unwrap();
-        let depth = crate::subtree::depth(&j, &state.agent_id);
+        let depth = j.depth(&state.agent_id);
         let max = state
             .config
             .lock()
