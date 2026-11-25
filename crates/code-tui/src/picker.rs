@@ -26,10 +26,24 @@ pub enum Action {
     Activate(String),
     ToggleModel(String),
     ToggleProvider(String),
-    /// Mark this model as the session's safety model.
-    SetSafety(String),
+    /// Mark this model as the session's safety model; `close`: the
+    /// picker was opened to choose it, so it is done.
+    SetSafety {
+        id: String,
+        close: bool,
+    },
     /// Re-run discovery for every discovering provider.
     Refresh,
+}
+
+/// What Enter picks.
+pub enum Purpose {
+    /// The session's model.
+    Use,
+    /// The safety model (`/model safety`).
+    Safety,
+    /// A model for another purpose, named by the heading (`/exclusive`).
+    Exclusive(String),
 }
 
 /// Picker cell columns (for `Target::Cell`).
@@ -46,16 +60,16 @@ enum Row {
 pub struct Picker {
     catalog: Catalog,
     active: Option<String>,
-    pub disabled_models: BTreeSet<String>,
-    pub disabled_providers: BTreeSet<String>,
+    disabled_models: BTreeSet<String>,
+    disabled_providers: BTreeSet<String>,
     filter: TextBuf,
     /// The session's safety model (shield badge).
-    pub safety: Option<String>,
+    safety: Option<String>,
     /// Opened from `/permissions`: Enter chooses the safety model.
-    pub choose_safety: bool,
+    choose_safety: bool,
     /// A title replacing "Models" when Enter picks for another purpose
     /// (`/exclusive`).
-    pub heading: Option<String>,
+    heading: Option<String>,
     view: usize,
     pinned: bool,
     /// Index into `catalog.benchmarks`; None sorts by label.
@@ -63,9 +77,9 @@ pub struct Picker {
     rows: Vec<Row>,
     selected: usize,
     scroll: usize,
-    pub message: Option<String>,
+    message: Option<String>,
     /// Providers whose discovery is running.
-    pub discovering: BTreeSet<String>,
+    discovering: BTreeSet<String>,
 }
 
 pub fn fmt_tokens(n: u64) -> String {
@@ -94,21 +108,31 @@ fn fmt_bench(v: f64) -> String {
 }
 
 impl Picker {
+    /// `safety` is the session's safety model; `discovering` the providers
+    /// whose discovery is running.
     pub fn new(
         catalog: Catalog,
         active: Option<String>,
         disabled_models: BTreeSet<String>,
         disabled_providers: BTreeSet<String>,
+        safety: Option<String>,
+        purpose: Purpose,
+        discovering: BTreeSet<String>,
     ) -> Self {
+        let (choose_safety, heading) = match purpose {
+            Purpose::Use => (false, None),
+            Purpose::Safety => (true, None),
+            Purpose::Exclusive(heading) => (false, Some(heading)),
+        };
         let mut p = Self {
             catalog,
             active,
             disabled_models,
             disabled_providers,
             filter: TextBuf::default(),
-            safety: None,
-            choose_safety: false,
-            heading: None,
+            safety,
+            choose_safety,
+            heading,
             view: 1,
             pinned: false,
             sort: None,
@@ -116,7 +140,7 @@ impl Picker {
             selected: 0,
             scroll: 0,
             message: None,
-            discovering: BTreeSet::new(),
+            discovering,
         };
         p.rebuild();
         if let Some(a) = &p.active
@@ -130,9 +154,25 @@ impl Picker {
         p
     }
 
+    /// Discovery moved on: `discovering` providers are still running and
+    /// `catalog` holds what arrived.
+    pub fn discovery_updated(&mut self, discovering: BTreeSet<String>, catalog: Catalog) {
+        self.discovering = discovering;
+        self.set_catalog(catalog);
+    }
+
+    /// Ctrl+R asked to re-run discovery: `started` says whether a run
+    /// began; `discovering` providers are running now.
+    pub fn discovery_restarted(&mut self, started: bool, discovering: BTreeSet<String>) {
+        if !started && discovering.is_empty() {
+            self.message = Some("no provider uses model discovery".into());
+        }
+        self.discovering = discovering;
+    }
+
     /// Swap in a refreshed catalog (discovery finished), keeping the
     /// selection, filter and toggles.
-    pub fn set_catalog(&mut self, catalog: Catalog) {
+    fn set_catalog(&mut self, catalog: Catalog) {
         let keep = self.current().map(|m| m.id.clone());
         self.catalog = catalog;
         self.sort = self.sort.filter(|&s| s < self.catalog.benchmarks.len());
@@ -359,7 +399,10 @@ impl Picker {
             }
             let id = m.id.clone();
             self.safety = Some(id.clone());
-            return Action::SetSafety(id);
+            return Action::SetSafety {
+                id,
+                close: self.choose_safety,
+            };
         }
         Action::None
     }

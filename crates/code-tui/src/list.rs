@@ -29,11 +29,11 @@ pub enum Action {
 
 pub struct ListPicker {
     pub title: String,
-    pub footer: String,
-    pub rows: Vec<Row>,
-    pub empty: String,
+    footer: String,
+    rows: Vec<Row>,
+    empty: String,
     /// Keys reported as `Action::Key`.
-    pub keys: Vec<char>,
+    keys: Vec<char>,
     /// Typing filters the rows (the session picker): plain keys go to the
     /// filter, so the picker's own keys use Tab and Ctrl (reported as
     /// `Action::Key`: Tab `'\t'`, Ctrl+R `'r'`, Ctrl+D / Delete `'d'`).
@@ -42,7 +42,7 @@ pub struct ListPicker {
     /// Every row; `rows` is the filtered view.
     all: Vec<Row>,
     /// Lines shown under the list for the selected row (a preview).
-    pub preview: Vec<Line<'static>>,
+    preview: Vec<Line<'static>>,
     selected: usize,
     scroll: usize,
     view: usize,
@@ -67,6 +67,21 @@ impl ListPicker {
             view: 1,
             pinned: false,
         }
+    }
+    /// The key hints under the list.
+    pub fn with_footer(mut self, footer: impl Into<String>) -> Self {
+        self.footer = footer.into();
+        self
+    }
+    /// What an empty list says.
+    pub fn with_empty(mut self, empty: impl Into<String>) -> Self {
+        self.empty = empty.into();
+        self
+    }
+    /// Plain keys the caller handles (reported as `Action::Key`).
+    pub fn with_keys(mut self, keys: &[char]) -> Self {
+        self.keys = keys.to_vec();
+        self
     }
     /// Make typing filter the rows, starting from `filter`.
     pub fn with_filter(mut self, filter: &str) -> Self {
@@ -106,6 +121,29 @@ impl ListPicker {
     }
     pub fn selected_id(&self) -> Option<String> {
         self.rows.get(self.selected).map(|r| r.id.clone())
+    }
+    /// The label of the shown row `id`.
+    pub fn label_of(&self, id: &str) -> Option<String> {
+        self.rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.label.clone())
+    }
+    /// Live rows (an unfiltered list): replace the rows when a label or
+    /// detail changed. True when they did.
+    pub fn refresh_rows(&mut self, rows: Vec<Row>) -> bool {
+        let fresh: Vec<_> = rows.iter().map(|r| (&r.label, &r.detail)).collect();
+        let old: Vec<_> = self.rows.iter().map(|r| (&r.label, &r.detail)).collect();
+        if fresh != old {
+            self.rows = rows;
+            return true;
+        }
+        false
+    }
+    /// Show `preview`'s lines for the selected row (its id, if any) under
+    /// the list.
+    pub fn preview_selected(&mut self, preview: impl FnOnce(Option<String>) -> Vec<Line<'static>>) {
+        self.preview = preview(self.selected_id());
     }
     /// Select the row with `id`, if present (after a refresh).
     pub fn select_id(mut self, id: Option<&str>) -> Self {

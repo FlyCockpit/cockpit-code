@@ -369,13 +369,10 @@ impl App {
         if self.tick.is_multiple_of(5) && matches!(self.overlay, Overlay::List(_, ListPurpose::Mcp))
         {
             let rows = self.mcp_rows();
-            if let Overlay::List(l, _) = &mut self.overlay {
-                let fresh: Vec<_> = rows.iter().map(|r| (&r.label, &r.detail)).collect();
-                let old: Vec<_> = l.rows.iter().map(|r| (&r.label, &r.detail)).collect();
-                if fresh != old {
-                    l.rows = rows;
-                    changed = true;
-                }
+            if let Overlay::List(l, _) = &mut self.overlay
+                && l.refresh_rows(rows)
+            {
+                changed = true;
             }
         }
         for a in &mut self.tree.agents {
@@ -547,8 +544,8 @@ impl App {
             ScrollId::Mentions => self.mention_top = Some(off),
             ScrollId::OverlayList => match &mut self.overlay {
                 Overlay::Diff(d) => d.set_list_offset(off),
-                Overlay::Agents(v) => v.set_detail_offset(off),
-                Overlay::Decisions(v) => v.set_detail_offset(off),
+                Overlay::Agents(v) => v.set_scroll(id, off),
+                Overlay::Decisions(v) => v.set_scroll(id, off),
                 _ => {}
             },
             ScrollId::Composer => {
@@ -568,8 +565,8 @@ impl App {
                 Overlay::Criteria(v) => v.set_offset(off),
                 Overlay::Contract(ed, _) => ed.set_offset(off),
                 Overlay::Diff(d) => d.set_offset(off),
-                Overlay::Agents(v) => v.set_offset(off),
-                Overlay::Decisions(v) => v.set_offset(off),
+                Overlay::Agents(v) => v.set_scroll(id, off),
+                Overlay::Decisions(v) => v.set_scroll(id, off),
                 Overlay::Menu(_) | Overlay::ForkChat(_) | Overlay::None => {}
             },
         }

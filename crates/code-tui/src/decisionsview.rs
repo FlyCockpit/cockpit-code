@@ -147,8 +147,13 @@ impl DecisionsView {
         self.top = top.min(self.shown().len().saturating_sub(self.view));
         self.pinned = true;
     }
-    pub fn set_detail_offset(&mut self, top: usize) {
-        self.detail_top = top;
+    /// A scrollbar or the wheel set the top row of pane `id` (the detail
+    /// pane is `OverlayList`, the list the overlay's own).
+    pub fn set_scroll(&mut self, id: &ScrollId, top: usize) {
+        match id {
+            ScrollId::OverlayList => self.detail_top = top,
+            _ => self.set_offset(top),
+        }
     }
 
     fn act(&mut self, act: u8) -> DecisionsAction {

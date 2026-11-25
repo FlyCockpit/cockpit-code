@@ -325,15 +325,7 @@ impl App {
             Overlay::None => {}
             Overlay::ForkChat(c) => c.render(frame, area, &mut self.hits, self.tick),
             Overlay::Questions(d) => {
-                let waiting = self.prompts.len().saturating_sub(d.calls.len());
-                if self.prompt_title.is_empty() {
-                    self.prompt_title = d.title.clone();
-                }
-                d.title = if waiting > 0 {
-                    format!("{} · {waiting} more waiting", self.prompt_title)
-                } else {
-                    self.prompt_title.clone()
-                };
+                d.show_waiting(&mut self.prompt_title, self.prompts.len());
                 d.render(frame, area, &mut self.hits)
             }
             Overlay::Dialog(d, purpose) => {
@@ -344,14 +336,7 @@ impl App {
                         | DialogPurpose::Proposal(..)
                         | DialogPurpose::Roadblock(_)
                 ) {
-                    if self.prompt_title.is_empty() {
-                        self.prompt_title = d.title.clone();
-                    }
-                    d.title = if waiting > 0 {
-                        format!("{} · {waiting} more waiting", self.prompt_title)
-                    } else {
-                        self.prompt_title.clone()
-                    };
+                    d.show_waiting(&mut self.prompt_title, waiting);
                 } else {
                     self.prompt_title.clear();
                 }
@@ -1051,12 +1036,12 @@ impl App {
             );
             push(&mut spans, sep.clone(), None);
         }
-        if let Some(g) = &self.git.state {
+        if let Some((label, dirty)) = self.git.label() {
             push(
                 &mut spans,
                 Span::styled(
-                    g.label(),
-                    Style::default().fg(if g.dirty() { t.yellow } else { t.fog }),
+                    label,
+                    Style::default().fg(if dirty { t.yellow } else { t.fog }),
                 ),
                 Some(StatusSeg::Git),
             );
@@ -1221,7 +1206,7 @@ impl App {
             );
         }
         // Running background jobs, so they are not forgotten (click: /jobs).
-        let jobs = self.tree.jobs.iter().filter(|j| j.running()).count();
+        let jobs = self.tree.running_jobs();
         if jobs > 0 {
             push(&mut spans, sep.clone(), None);
             push(

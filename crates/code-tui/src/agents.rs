@@ -21,7 +21,7 @@ pub struct Agent {
 #[derive(Default)]
 pub struct Tree {
     pub agents: Vec<Agent>,
-    pub jobs: Vec<JobView>,
+    jobs: Vec<JobView>,
     counts: HashMap<String, usize>,
 }
 
@@ -134,6 +134,22 @@ impl Tree {
             Some(j) => *j = job,
             None => self.jobs.push(job),
         }
+    }
+    pub fn job(&self, id: &str) -> Option<&JobView> {
+        self.jobs.iter().find(|j| j.id == id)
+    }
+    pub fn job_running(&self, id: &str) -> bool {
+        self.jobs.iter().any(|j| j.id == id && j.running())
+    }
+    /// The running background job of agent `agent`.
+    pub fn agent_job(&self, agent: &str) -> Option<String> {
+        self.jobs
+            .iter()
+            .find(|j| j.running() && j.agent.as_deref() == Some(agent))
+            .map(|j| j.id.clone())
+    }
+    pub fn running_jobs(&self) -> usize {
+        self.jobs.iter().filter(|j| j.running()).count()
     }
     /// Agents depth-first from root: (depth, index), root's children at depth 1.
     pub fn order(&self) -> Vec<(usize, usize)> {

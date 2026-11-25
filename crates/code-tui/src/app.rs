@@ -725,8 +725,7 @@ impl App {
             }
         }
         if let Overlay::Picker(p) = &mut self.overlay {
-            p.discovering = self.engine.discovering();
-            p.set_catalog(self.catalog.clone());
+            p.discovery_updated(self.engine.discovering(), self.catalog.clone());
         }
     }
 
@@ -893,8 +892,7 @@ impl App {
                     .notice(Level::Error, format!("model discovery: {e}")),
             }
             if let Overlay::Picker(p) = &mut self.overlay {
-                p.discovering = self.engine.discovering();
-                p.set_catalog(self.catalog.clone());
+                p.discovery_updated(self.engine.discovering(), self.catalog.clone());
             }
         }
         if self.poll_goal_action() {
@@ -1371,7 +1369,7 @@ impl App {
             })
             .collect();
         let filter = self.resume_filter.clone();
-        let mut picker = ListPicker::new(
+        let picker = ListPicker::new(
             if self.list_all {
                 "Resume · all sessions"
             } else {
@@ -1379,8 +1377,8 @@ impl App {
             },
             rows,
         )
-        .with_filter(&filter);
-        picker.footer = format!(
+        .with_filter(&filter)
+        .with_footer(format!(
             "↑↓ select · enter resume · tab {} · ctrl+r rename · ctrl+d delete · esc close{}",
             if self.list_all {
                 "this directory"
@@ -1392,12 +1390,12 @@ impl App {
                 1 => " · 1 unreadable session skipped".into(),
                 n => format!(" · {n} unreadable sessions skipped"),
             }
-        );
-        picker.empty = if filter.is_empty() {
-            "no other sessions".into()
+        ))
+        .with_empty(if filter.is_empty() {
+            "no other sessions"
         } else {
-            "no sessions match".into()
-        };
+            "no sessions match"
+        });
         self.overlay = Overlay::List(Box::new(picker), ListPurpose::Resume);
         self.resume_preview();
     }
@@ -1406,19 +1404,15 @@ impl App {
     /// never touches its context; `text` is sent at once.
     fn open_btw(&mut self, text: &str) {
         let agent = self.view.clone().unwrap_or_else(|| "root".into());
-        let mut chat = ForkChat::with_summary(self.tree.label(&agent), vec![]);
-        chat.side = true;
-        match self.engine.open_side_chat(&agent) {
-            Ok(fork) => {
-                if !text.trim().is_empty()
-                    && let Err(e) = self.engine.fork_chat_send(&fork, text.to_string())
-                {
-                    chat.notice(Level::Error, e);
-                }
-                chat.fork = Some(fork);
-            }
-            Err(e) => chat.notice(Level::Error, e),
+        let mut chat = ForkChat::side_chat(self.tree.label(&agent));
+        let opened = self.engine.open_side_chat(&agent);
+        if let Ok(fork) = &opened
+            && !text.trim().is_empty()
+            && let Err(e) = self.engine.fork_chat_send(fork, text.to_string())
+        {
+            chat.notice(Level::Error, e);
         }
+        chat.connect(opened);
         self.overlay = Overlay::ForkChat(Box::new(chat));
     }
 
@@ -1439,41 +1433,39 @@ impl App {
 
     /// The selected session's last messages under the picker.
     fn resume_preview(&mut self) {
-        let id = match &self.overlay {
-            Overlay::List(l, ListPurpose::Resume) => l.selected_id(),
-            _ => return,
+        let Overlay::List(l, ListPurpose::Resume) = &mut self.overlay else {
+            return;
         };
-        let t = theme();
-        let lines: Vec<Line<'static>> = id
-            .map(|id| self.engine.session_preview(&id, 3))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(role, text)| {
-                // Plain text: no markdown marks, one line.
-                let text = crate::paste::collapse(&text)
-                    .replace("```", " ")
-                    .replace("**", "")
-                    .replace('`', "")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let (mark, style) = if role == "user" {
-                    ("▌ ", Style::default().fg(t.accent))
-                } else {
-                    ("  ", Style::default().fg(t.fog))
-                };
-                Line::from(vec![
-                    Span::styled(mark, style),
-                    Span::styled(
-                        truncate(&text, 400),
-                        style.fg(if role == "user" { t.ink } else { t.fog }),
-                    ),
-                ])
-            })
-            .collect();
-        if let Overlay::List(l, ListPurpose::Resume) = &mut self.overlay {
-            l.preview = lines;
-        }
+        let engine = &self.engine;
+        l.preview_selected(|id| {
+            let t = theme();
+            id.map(|id| engine.session_preview(&id, 3))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(role, text)| {
+                    // Plain text: no markdown marks, one line.
+                    let text = crate::paste::collapse(&text)
+                        .replace("```", " ")
+                        .replace("**", "")
+                        .replace('`', "")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let (mark, style) = if role == "user" {
+                        ("▌ ", Style::default().fg(t.accent))
+                    } else {
+                        ("  ", Style::default().fg(t.fog))
+                    };
+                    Line::from(vec![
+                        Span::styled(mark, style),
+                        Span::styled(
+                            truncate(&text, 400),
+                            style.fg(if role == "user" { t.ink } else { t.fog }),
+                        ),
+                    ])
+                })
+                .collect()
+        });
     }
 
     fn open_fork_at(&mut self) {
@@ -1491,9 +1483,9 @@ impl App {
                 alert: false,
             })
             .collect();
-        let mut picker =
-            ListPicker::new("Fork before message (it returns to the composer)", rows).select_last();
-        picker.footer = "↑↓ select · enter fork · esc close".into();
+        let picker = ListPicker::new("Fork before message (it returns to the composer)", rows)
+            .select_last()
+            .with_footer("↑↓ select · enter fork · esc close");
         let points = candidates
             .into_iter()
             .map(|c| (c.context, c.line, c.text))
@@ -2561,17 +2553,18 @@ impl App {
 
     /// The model picker for `/exclusive`: the model, or its safety model.
     fn exclusive_picker(&mut self, model: Option<String>) {
-        let mut picker = Picker::new(
+        let picker = Picker::new(
             self.catalog.clone(),
             self.engine.active_model(),
             Default::default(),
             Default::default(),
+            self.engine.safety_model(),
+            picker::Purpose::Exclusive(match &model {
+                None => "Exclusive model · every model use in this session".into(),
+                Some(m) => format!("Safety model for exclusive {}", self.model_label(Some(m))),
+            }),
+            Default::default(),
         );
-        picker.safety = self.engine.safety_model();
-        picker.heading = Some(match &model {
-            None => "Exclusive model · every model use in this session".into(),
-            Some(m) => format!("Safety model for exclusive {}", self.model_label(Some(m))),
-        });
         self.exclusive_pick = Some(model);
         self.overlay = Overlay::Picker(Box::new(picker));
     }
@@ -2688,12 +2681,8 @@ impl App {
                     return;
                 }
                 match &mut self.overlay {
-                    Overlay::Dialog(d, _) => {
-                        if let Some((_, buf)) = &mut d.text {
-                            buf.insert(&text.replace('\n', " "));
-                        }
-                    }
-                    Overlay::ForkChat(c) => c.input.insert(&text),
+                    Overlay::Dialog(d, _) => d.paste(&text),
+                    Overlay::ForkChat(c) => c.paste(&text),
                     Overlay::Contract(ed, _) => ed.paste(&text),
                     Overlay::Questions(d) => d.paste(&text),
                     Overlay::Criteria(_)
@@ -2872,12 +2861,7 @@ impl App {
     /// Kill a background subagent through its job.
     fn kill_agent(&mut self, id: &str) {
         let label = self.tree.label(id);
-        let job = self
-            .tree
-            .jobs
-            .iter()
-            .find(|j| j.running() && j.agent.as_deref() == Some(id))
-            .map(|j| j.id.clone());
+        let job = self.tree.agent_job(id);
         match job {
             Some(job) => {
                 self.engine.kill_job(job);
@@ -2923,22 +2907,24 @@ impl App {
                 }
             })
             .collect();
-        let mut picker = ListPicker::new("Background jobs", rows).select_id(select);
-        picker.keys = vec!['x', 'r'];
-        picker.footer = "↑↓ select · enter output · x kill · r refresh · esc close".into();
-        picker.empty = "no background jobs in this session".into();
+        let picker = ListPicker::new("Background jobs", rows)
+            .select_id(select)
+            .with_keys(&['x', 'r'])
+            .with_footer("↑↓ select · enter output · x kill · r refresh · esc close")
+            .with_empty("no background jobs in this session");
         self.overlay = Overlay::List(Box::new(picker), ListPurpose::Jobs);
     }
 
     /// `/mcp`: configured servers; space, enter or a click toggles one.
     fn open_mcp(&mut self, select: Option<&str>) {
         let rows = self.mcp_rows();
-        let mut picker = ListPicker::new("MCP servers · this session", rows).select_id(select);
-        picker.keys = vec![' '];
-        picker.footer =
-            "↑↓ select · space/enter/click toggle · esc close · tools are called from script"
-                .into();
-        picker.empty = "no MCP servers configured (add mcps/<name>.json)".into();
+        let picker = ListPicker::new("MCP servers · this session", rows)
+            .select_id(select)
+            .with_keys(&[' '])
+            .with_footer(
+                "↑↓ select · space/enter/click toggle · esc close · tools are called from script",
+            )
+            .with_empty("no MCP servers configured (add mcps/<name>.json)");
         self.overlay = Overlay::List(Box::new(picker), ListPurpose::Mcp);
     }
 
@@ -2995,7 +2981,7 @@ impl App {
     }
 
     fn open_job_output(&mut self, id: &str) {
-        let Some(job) = self.tree.jobs.iter().find(|j| j.id == id).cloned() else {
+        let Some(job) = self.tree.job(id).cloned() else {
             return;
         };
         let title = format!(
@@ -3163,7 +3149,7 @@ impl App {
                         p.set_text(&text);
                     }
                     pager::Action::Kill => {
-                        if self.tree.jobs.iter().any(|j| j.id == id && j.running()) {
+                        if self.tree.job_running(&id) {
                             self.engine.kill_job(id);
                             self.hint("killing job…");
                         } else {
@@ -3378,17 +3364,13 @@ impl App {
                 let started = self.engine.discover(true);
                 let discovering = self.engine.discovering();
                 if let Overlay::Picker(p) = &mut self.overlay {
-                    if !started && discovering.is_empty() {
-                        p.message = Some("no provider uses model discovery".into());
-                    }
-                    p.discovering = discovering;
+                    p.discovery_restarted(started, discovering);
                 }
                 Ok(())
             }
             picker::Action::ToggleModel(id) => self.engine.toggle_subagent_model(&id),
             picker::Action::ToggleProvider(p) => self.engine.toggle_subagent_provider(&p),
-            picker::Action::SetSafety(id) => {
-                let close = matches!(&self.overlay, Overlay::Picker(p) if p.choose_safety);
+            picker::Action::SetSafety { id, close } => {
                 let r = self.engine.set_safety_model(&id);
                 if r.is_ok() {
                     self.hint(format!("safety model: {}", self.model_label(Some(&id))));
@@ -3436,12 +3418,7 @@ impl App {
                 let Some(id) = selected else { return };
                 self.resume_filter = self.list_filter();
                 let title = match &self.overlay {
-                    Overlay::List(l, _) => l
-                        .rows
-                        .iter()
-                        .find(|r| r.id == id)
-                        .map(|r| r.label.clone())
-                        .unwrap_or_default(),
+                    Overlay::List(l, _) => l.label_of(&id).unwrap_or_default(),
                     _ => String::new(),
                 };
                 let dialog = Dialog::new(
@@ -3462,12 +3439,7 @@ impl App {
                 let Some(id) = selected else { return };
                 self.resume_filter = self.list_filter();
                 let title = match &self.overlay {
-                    Overlay::List(l, _) => l
-                        .rows
-                        .iter()
-                        .find(|r| r.id == id)
-                        .map(|r| r.label.clone())
-                        .unwrap_or_default(),
+                    Overlay::List(l, _) => l.label_of(&id).unwrap_or_default(),
                     _ => String::new(),
                 };
                 let dialog = Dialog::new(
@@ -3486,7 +3458,7 @@ impl App {
             }
             list::Action::Key('x') if jobs => {
                 if let Some(id) = selected {
-                    if self.tree.jobs.iter().any(|j| j.id == id && j.running()) {
+                    if self.tree.job_running(&id) {
                         self.engine.kill_job(id);
                         self.hint("killing job…");
                     } else {
@@ -3800,17 +3772,24 @@ impl App {
                     .filter(|m| self.engine.provider_subagent_disabled(&m.provider))
                     .map(|m| m.provider.clone())
                     .collect();
-                let mut picker = Picker::new(
-                    self.catalog.clone(),
-                    self.engine.active_model(),
-                    disabled_models,
-                    disabled_providers,
-                );
-                picker.safety = self.engine.safety_model();
-                picker.choose_safety = arg == "safety";
+                let catalog = self.catalog.clone();
+                let active = self.engine.active_model();
+                let safety = self.engine.safety_model();
                 // Expired discovery caches refresh in the background.
                 self.engine.discover(false);
-                picker.discovering = self.engine.discovering();
+                let picker = Picker::new(
+                    catalog,
+                    active,
+                    disabled_models,
+                    disabled_providers,
+                    safety,
+                    if arg == "safety" {
+                        picker::Purpose::Safety
+                    } else {
+                        picker::Purpose::Use
+                    },
+                    self.engine.discovering(),
+                );
                 self.overlay = Overlay::Picker(Box::new(picker));
             }
             "effort" => {
@@ -4194,7 +4173,7 @@ impl App {
         let Overlay::Questions(d) = &self.overlay else {
             return;
         };
-        let ids: Vec<String> = d.calls.iter().map(|c| c.id.clone()).collect();
+        let ids: Vec<String> = d.call_ids();
         if !matches!(outcome, questions::Outcome::Pending) {
             self.overlay = Overlay::None;
         }
@@ -4244,10 +4223,7 @@ impl App {
                 let Some(q) = self.question(&id) else { return };
                 let who = self.tree.label(&q.asker);
                 let mut chat = ForkChat::new(who, &q.questions);
-                match self.engine.open_fork_chat(&id) {
-                    Ok(fork) => chat.fork = Some(fork),
-                    Err(e) => chat.notice(Level::Error, e),
-                }
+                chat.connect(self.engine.open_fork_chat(&id));
                 // Defer the question while chatting: the fork answers it.
                 for p in &mut self.prompts {
                     if let Prompt::Question(x, deferred) = p
@@ -4325,56 +4301,30 @@ impl App {
             (Overlay::ForkChat(c), _) | (_, Some(c)) => c,
             _ => return,
         };
-        if c.fork.as_deref() != Some(fork.as_str()) {
+        if !c.shows(&fork) {
             return;
         }
-        match kind.as_str() {
-            "opened" => c.load(messages),
-            "tool_start" => c.tool_start(call),
-            "tool" => {
-                if let (Some(call), Some(result)) = (call, result) {
-                    c.tool(call, result);
-                }
+        if c.event(&kind, text, messages, call, result) {
+            if parked {
+                self.parked_fork = None;
+            } else {
+                self.overlay = Overlay::None;
             }
-            "user" | "assistant" => c.message(&kind, text),
-            "status" => c.status = text,
-            "idle" => c.status.clear(),
-            "error" => {
-                c.status.clear();
-                c.notice(Level::Error, text);
-            }
-            "closed" => {
-                let reopened = c.closed;
-                c.status.clear();
-                c.closed = true;
-                if !reopened {
-                    if parked {
-                        self.parked_fork = None;
-                    } else {
-                        self.overlay = Overlay::None;
-                    }
-                    self.hint("the fork answered the question · its chat stays on the answer row");
-                }
-            }
-            _ => {}
+            self.hint("the fork answered the question · its chat stays on the answer row");
         }
     }
 
     /// Reopen a fork's saved chat from its "answered via fork" row.
     pub(super) fn reopen_fork(&mut self, question: &str, summary: &str) {
         let who = self.tree.label(&self.queue_agent());
-        let mut chat = ForkChat::with_summary(
+        let mut chat = ForkChat::reopened(
             who,
             vec![format!(
                 "answered: {}",
                 summary.lines().next().unwrap_or_default()
             )],
         );
-        chat.closed = true;
-        match self.engine.open_fork_chat(question) {
-            Ok(fork) => chat.fork = Some(fork),
-            Err(e) => chat.notice(Level::Error, e),
-        }
+        chat.connect(self.engine.open_fork_chat(question));
         self.overlay = Overlay::ForkChat(Box::new(chat));
     }
 
@@ -4386,16 +4336,12 @@ impl App {
         match c.handle_key(key) {
             crate::forkchat::Action::None => {}
             crate::forkchat::Action::Close => {
-                let side = c.side;
+                let hint = c.close_hint();
                 self.overlay = Overlay::None;
-                self.hint(if side {
-                    "side chat closed · /btw reopens it"
-                } else {
-                    "fork chat closed · the question stays pending · /answer"
-                });
+                self.hint(hint);
             }
-            crate::forkchat::Action::Send(text) => {
-                let result = match &c.fork {
+            crate::forkchat::Action::Send { fork, text } => {
+                let result = match &fork {
                     Some(fork) => self.engine.fork_chat_send(fork, text.clone()),
                     None => Err("this fork chat is not connected".into()),
                 };
@@ -4403,8 +4349,7 @@ impl App {
                 if let Err(e) = result
                     && let Overlay::ForkChat(c) = &mut self.overlay
                 {
-                    c.input.insert(&text);
-                    c.notice(Level::Error, e);
+                    c.send_failed(&text, e);
                 }
             }
         }
