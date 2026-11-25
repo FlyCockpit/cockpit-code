@@ -377,12 +377,14 @@ impl App {
             vec![
                 DialogOption::new("apply", "Apply")
                     .key('a')
+                    .guarded()
                     .describe("make this change for the requester"),
                 DialogOption::new("reject", "Reject with a reason")
                     .key('r')
                     .describe("type the reason below; the requester reads it"),
                 DialogOption::new("grant", "Grant scope")
                     .key('g')
+                    .guarded()
                     .describe(format!(
                         "let it write there itself: `{dir}`, or directories typed below (comma-separated)"
                     )),
@@ -563,6 +565,7 @@ impl App {
             vec![
                 DialogOption::new("prune", "Prune")
                     .key('p')
+                    .guarded()
                     .describe("stub them now; no model call"),
                 DialogOption::new("cancel", "Cancel").key('c'),
             ],

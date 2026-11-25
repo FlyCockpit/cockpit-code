@@ -296,7 +296,10 @@ impl App {
                 "A **read-only fork** of {label}'s context answers; {label} itself is not interrupted or told. The answer shows here and as a row in root's transcript."
             )),
             vec![
-                DialogOption::new("ask", "Ask").key('a').describe("send the question below"),
+                DialogOption::new("ask", "Ask")
+                    .key('a')
+                    .guarded()
+                    .describe("send the question below"),
                 DialogOption::new("cancel", "Cancel"),
             ],
         )
@@ -331,6 +334,7 @@ impl App {
                 DialogOption::new("cancel", "Keep it running"),
                 DialogOption::new("stop", "Stop the branch")
                     .key('s')
+                    .guarded()
                     .describe("type the reason below (required)"),
             ],
         )
@@ -353,7 +357,7 @@ impl App {
             )),
             vec![
                 DialogOption::new("cancel", "Keep it running"),
-                DialogOption::new("finalize", "Finalize").key('f'),
+                DialogOption::new("finalize", "Finalize").key('f').guarded(),
             ],
         );
         self.panel_dialog(dialog, PanelDialog::AgentFinalize(id.to_string()));
@@ -481,7 +485,7 @@ impl App {
                         }
                     )),
                     vec![
-                        DialogOption::new("send", "Send the change").key('s'),
+                        DialogOption::new("send", "Send the change").key('s').guarded(),
                         DialogOption::new("cancel", "Cancel"),
                     ],
                 )
@@ -501,7 +505,7 @@ impl App {
                         "Opens a private, read-only side chat with **{who}** about this decision. {who} itself is not interrupted. The record stays open as *discussing*."
                     )),
                     vec![
-                        DialogOption::new("discuss", "Discuss").key('d'),
+                        DialogOption::new("discuss", "Discuss").key('d').guarded(),
                         DialogOption::new("cancel", "Cancel"),
                     ],
                 )

@@ -187,7 +187,7 @@ impl App {
                             .into(),
                     ),
                     vec![
-                        DialogOption::new("clear", "Clear goal").key('y'),
+                        DialogOption::new("clear", "Clear goal").key('y').guarded(),
                         DialogOption::new("keep", "Keep").key('n'),
                     ],
                 )
@@ -320,6 +320,7 @@ impl App {
                     vec![
                         DialogOption::new("approve", "Approve and start")
                             .key('a')
+                            .guarded()
                             .describe("root works autonomously until every acceptance or findings criterion is met and the review passes"),
                         DialogOption::new("edit", "Edit…")
                             .key('e')
@@ -329,6 +330,7 @@ impl App {
                             .describe("the contract as YAML"),
                         DialogOption::new("cancel", "Cancel the goal")
                             .key('c')
+                            .guarded()
                             .describe("discard the draft"),
                     ],
                 );
@@ -366,9 +368,10 @@ impl App {
                     format!("Criteria proposal · {label}"),
                     Body::Markdown(md),
                     vec![
-                        DialogOption::new("accept", "Accept").key('a'),
+                        DialogOption::new("accept", "Accept").key('a').guarded(),
                         DialogOption::new("edit", "Accept with my edit")
                             .key('e')
+                            .guarded()
                             .describe("edit the text below, then enter"),
                         DialogOption::new("reject", "Reject")
                             .key('r')
@@ -408,16 +411,21 @@ impl App {
                     vec![
                         DialogOption::new("pivot", "Pivot with a message")
                             .key('p')
+                            .guarded()
                             .describe("type instructions below; the goal continues with them"),
                         DialogOption::new("pivot-edit", "Pivot: edit the contract…")
                             .key('e')
                             .describe("change the criteria, then continue"),
                         DialogOption::new("override", "Override")
                             .key('o')
+                            .guarded()
                             .describe("continue, recording the note below as an accepted risk"),
-                        DialogOption::new("stop", "Stop").key('s').describe(
-                            "the goal stays roadblocked; /goal edit or /goal clear later",
-                        ),
+                        DialogOption::new("stop", "Stop")
+                            .key('s')
+                            .guarded()
+                            .describe(
+                                "the goal stays roadblocked; /goal edit or /goal clear later",
+                            ),
                     ],
                 )
                 .with_text("message or override note")
@@ -814,7 +822,7 @@ impl App {
         match g.disposition.as_str() {
             "running" => options.push(DialogOption::new("pause", "Pause").key('p')),
             "paused" if !g.awaiting_approval() => {
-                options.push(DialogOption::new("resume", "Resume").key('r'));
+                options.push(DialogOption::new("resume", "Resume").key('r').guarded());
             }
             _ => {}
         }
@@ -822,7 +830,11 @@ impl App {
             options.push(DialogOption::new("edit", "Edit the contract…").key('e'));
         }
         options.push(DialogOption::new("criteria", "Criteria checklist").key('v'));
-        options.push(DialogOption::new("clear", "Clear the goal").key('x'));
+        options.push(
+            DialogOption::new("clear", "Clear the goal")
+                .key('x')
+                .guarded(),
+        );
         options.push(DialogOption::new("close", "Close").key('q'));
         let dialog = Dialog::new("Goal", Body::Markdown(md), options);
         self.overlay = Overlay::Dialog(Box::new(dialog), DialogPurpose::GoalStatus);

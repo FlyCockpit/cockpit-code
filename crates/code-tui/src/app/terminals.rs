@@ -884,11 +884,11 @@ impl App {
                 info.breadcrumb
             )),
             vec![
-                DialogOption::new("close", "Close and send"),
+                DialogOption::new("close", "Close and send").guarded(),
                 DialogOption::new("stay", "Keep it open"),
             ],
         )
-        .with_text("optional note for the agent · enter closes and sends · esc keeps it open")
+        .with_text("optional note for the agent · alt+enter closes and sends · esc keeps it open")
         .text_option("close", true);
         self.overlay = Overlay::Dialog(
             Box::new(dialog),

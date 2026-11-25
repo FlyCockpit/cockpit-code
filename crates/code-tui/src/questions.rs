@@ -80,8 +80,11 @@ pub struct QDialog {
     state: Vec<State>,
     tab: usize,
     /// Focused row of the page; `rows().len()` and `+1` are the Submit
-    /// and later chips.
+    /// and later chips. Only a navigation key (↑↓, tab, ←→ on the chips)
+    /// puts it on a chip, so typed text never reaches Submit.
     focus: usize,
+    /// Keys typed ahead into a dialog that just opened are dropped.
+    typeahead: crate::dialog::TypeAhead,
     body_top: usize,
     body_view: usize,
     body_len: usize,
@@ -114,6 +117,7 @@ impl QDialog {
             state,
             tab: 0,
             focus: 0,
+            typeahead: crate::dialog::TypeAhead::opened_at(std::time::Instant::now()),
             body_top: 0,
             body_view: 0,
             body_len: 0,
@@ -264,13 +268,11 @@ impl QDialog {
         self.body_top = 0;
     }
 
-    /// After answering the current question: the next unanswered one, else
-    /// the Submit chip.
+    /// After answering the current question: the next unanswered one (the
+    /// focus stays when there is none; Submit takes a deliberate step).
     fn advance(&mut self) {
         if let Some(next) = (self.tab + 1..self.items.len()).find(|&i| !self.answered(i)) {
             self.go_tab(next);
-        } else {
-            self.focus = self.rows().len();
         }
     }
 
@@ -312,6 +314,7 @@ impl QDialog {
         let Some(&row) = rows.get(k) else {
             return Outcome::Pending;
         };
+        self.typeahead.end();
         self.focus = k;
         if row != Row::Field {
             self.pick(row, false);
@@ -321,6 +324,7 @@ impl QDialog {
 
     pub fn click_tab(&mut self, i: usize) {
         if i < self.items.len() {
+            self.typeahead.end();
             self.go_tab(i);
         }
     }
@@ -344,7 +348,24 @@ impl QDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        self.key_at(key, std::time::Instant::now())
+    }
+
+    /// One key at `now`. Typed text (letters, digits, space, Enter) only
+    /// answers questions; Submit needs alt+s / ctrl+s or ↓ + Enter.
+    pub(crate) fn key_at(&mut self, key: KeyEvent, now: std::time::Instant) -> Outcome {
+        if self.typeahead.swallows(&key, now) {
+            return Outcome::Pending;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // An arrow is deliberate: the keys after it count at once.
+        if matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::BackTab
+        ) {
+            self.typeahead.end();
+        }
         let rows = self.rows();
         let n = rows.len();
         let acts = self.acts();
@@ -352,7 +373,7 @@ impl QDialog {
         if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
             return Outcome::Later;
         }
-        if ctrl && matches!(key.code, KeyCode::Char('s')) {
+        if (ctrl || alt) && matches!(key.code, KeyCode::Char('s')) {
             return Outcome::Submit(self.answers());
         }
         match key.code {
@@ -394,9 +415,7 @@ impl QDialog {
             match key.code {
                 KeyCode::Left => self.focus = (self.focus - 1).max(n),
                 KeyCode::Right => self.focus = (self.focus + 1).min(n + chips - 1),
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    return self.act(acts[act.min(chips - 1)].1);
-                }
+                KeyCode::Enter => return self.act(acts[act.min(chips - 1)].1),
                 _ => {}
             }
             return Outcome::Pending;
@@ -409,7 +428,7 @@ impl QDialog {
                 // text it answers and moves on.
                 KeyCode::Enter if buf.text().trim().is_empty() => {}
                 KeyCode::Enter => self.advance(),
-                KeyCode::Char(c) if !ctrl => {
+                KeyCode::Char(c) if !ctrl && !alt => {
                     buf.insert(c.encode_utf8(&mut [0; 4]));
                     let tab = self.tab;
                     let s = &mut self.state[tab];
@@ -440,6 +459,7 @@ impl QDialog {
                     self.go_tab(self.tab + 1);
                 }
             }
+            _ if ctrl || alt => {}
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let row = rows[self.focus];
                 self.pick(row, key.code == KeyCode::Enter);
@@ -725,9 +745,9 @@ impl QDialog {
         tail.push(Line::from(Span::styled(
             truncate(
                 if self.items.len() > 1 {
-                    "1-9 pick · ↑↓ move · ←→/tab question · s skip · ctrl+s submit · esc later"
+                    "1-9 pick · ↑↓ move · ←→/tab question · s skip · submit: alt+s or ↓ + enter · esc later"
                 } else {
-                    "1-9 pick · ↑↓ move · enter choose · s skip · ctrl+s submit · esc later"
+                    "1-9 pick · ↑↓ move · enter choose · s skip · submit: alt+s or ↓ + enter · esc later"
                 },
                 inner_w,
             ),
@@ -888,5 +908,170 @@ mod tests {
         assert!(
             matches!(&d.answers()[0].1[0], QAnswer::Choice { labels, other: Some(text) } if labels.is_empty() && text == "other")
         );
+    }
+
+    fn at(open: std::time::Instant, ms: u64) -> std::time::Instant {
+        open + std::time::Duration::from_millis(ms)
+    }
+    fn qk(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+    fn opened(mut d: QDialog, open: std::time::Instant) -> QDialog {
+        d.typeahead = crate::dialog::TypeAhead::opened_at(open);
+        d
+    }
+    fn submitted(o: Outcome) -> bool {
+        matches!(o, Outcome::Submit(_))
+    }
+
+    /// Several questions over two calls, one of them a child's.
+    fn mixed(rng: &mut crate::dialog::tests::Rng) -> QDialog {
+        let call = |id: &str, can_jump| Call {
+            id: id.into(),
+            asker: id.into(),
+            label: id.into(),
+            preamble: String::new(),
+            can_jump,
+        };
+        let item = |rng: &mut crate::dialog::tests::Rng| {
+            let kind = [QKind::Choice, QKind::Boolean, QKind::Text][rng.below(3)];
+            QItem {
+                id: None,
+                text: "Question?".into(),
+                kind,
+                options: (0..if kind == QKind::Choice {
+                    1 + rng.below(4)
+                } else {
+                    0
+                })
+                    .map(|i| QOption {
+                        label: format!("O{i}"),
+                        description: None,
+                    })
+                    .collect(),
+                multi: rng.chance(30),
+            }
+        };
+        let calls = (0..1 + rng.below(2))
+            .map(|c| {
+                let items = (0..1 + rng.below(3)).map(|_| item(rng)).collect();
+                (call(&format!("c{c}"), rng.chance(50)), items)
+            })
+            .collect();
+        QDialog::new("questions".into(), calls)
+    }
+
+    #[test]
+    fn random_prose_never_submits_or_reaches_a_chip() {
+        use crate::dialog::tests::{Rng, gap, prose_key};
+        for seed in 0..3000 {
+            let mut rng = Rng::new(seed);
+            let mut d = mixed(&mut rng);
+            let mut now = std::time::Instant::now();
+            d.typeahead = crate::dialog::TypeAhead::opened_at(now);
+            let mut typed = String::new();
+            for _ in 0..80 {
+                now += gap(&mut rng);
+                let key = prose_key(&mut rng);
+                typed.push_str(&format!("{:?} ", key.code));
+                let out = d.key_at(key, now);
+                assert!(
+                    matches!(out, Outcome::Pending | Outcome::Jump(_)),
+                    "seed {seed}: {typed} left the questions"
+                );
+                assert!(
+                    d.focus < d.rows().len(),
+                    "seed {seed}: {typed} focused a chip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn so_and_enter_after_answering_do_not_submit() {
+        let open = std::time::Instant::now();
+        let mut d = opened(dialog(QKind::Choice), open);
+        // "so " then Enter: s skips, o opens Other, the rest is its text.
+        for (i, c) in "so \n".chars().enumerate() {
+            let key = if c == '\n' {
+                code(KeyCode::Enter)
+            } else {
+                qk(c)
+            };
+            assert!(!submitted(d.key_at(key, at(open, 1000 + 50 * i as u64))));
+        }
+        // 1 then Enter Enter: answered, the focus stays on the option.
+        let mut d = opened(dialog(QKind::Choice), open);
+        assert!(!submitted(d.key_at(qk('1'), at(open, 1000))));
+        assert!(!submitted(d.key_at(code(KeyCode::Enter), at(open, 1100))));
+        assert!(!submitted(d.key_at(code(KeyCode::Enter), at(open, 1200))));
+        assert!(!submitted(d.key_at(qk(' '), at(open, 1300))));
+        assert_eq!(d.focus, 0);
+    }
+
+    #[test]
+    fn submit_takes_alt_s_ctrl_s_or_a_move_and_enter() {
+        let open = std::time::Instant::now();
+        let mut d = opened(dialog(QKind::Boolean), open);
+        d.key_at(qk('y'), at(open, 1000));
+        // ↓ to the Submit chip (after Yes, No, the note and Skip).
+        for _ in 0..4 {
+            d.key_at(code(KeyCode::Down), at(open, 1100));
+        }
+        assert_eq!(d.focus, d.rows().len());
+        // Space there is not Enter.
+        assert!(!submitted(d.key_at(qk(' '), at(open, 1200))));
+        assert!(submitted(d.key_at(code(KeyCode::Enter), at(open, 1300))));
+        for m in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut d = opened(dialog(QKind::Text), open);
+            // Also from the answer field and within the opening grace.
+            assert!(d.in_field());
+            assert!(submitted(
+                d.key_at(KeyEvent::new(KeyCode::Char('s'), m), at(open, 10))
+            ));
+        }
+        // Tab on the last question goes to Submit.
+        let mut d = opened(dialog(QKind::Text), open);
+        d.key_at(code(KeyCode::Tab), at(open, 1000));
+        assert!(submitted(d.key_at(code(KeyCode::Enter), at(open, 1100))));
+    }
+
+    #[test]
+    fn an_arrow_ends_the_opening_grace() {
+        let open = std::time::Instant::now();
+        let mut d = opened(dialog(QKind::Boolean), open);
+        for i in 0..4 {
+            d.key_at(code(KeyCode::Down), at(open, 10 + i));
+        }
+        assert_eq!(d.focus, d.rows().len());
+        assert!(submitted(d.key_at(code(KeyCode::Enter), at(open, 20))));
+        // ↓ onto the note field, then type at once.
+        let mut d = opened(dialog(QKind::Boolean), open);
+        d.key_at(code(KeyCode::Down), at(open, 10));
+        d.key_at(code(KeyCode::Down), at(open, 20));
+        assert!(d.in_field());
+        d.key_at(qk('h'), at(open, 30));
+        d.key_at(qk('i'), at(open, 40));
+        assert_eq!(d.state[0].field.text(), "hi");
+    }
+
+    #[test]
+    fn the_opening_grace_drops_a_burst_and_a_click_ends_it() {
+        let open = std::time::Instant::now();
+        let mut d = opened(dialog(QKind::Text), open);
+        for (i, c) in "typed ahead".chars().enumerate() {
+            d.key_at(qk(c), at(open, 50 * i as u64));
+        }
+        assert!(d.state[0].field.text().is_empty());
+        d.key_at(qk('x'), at(open, 2000));
+        assert_eq!(d.state[0].field.text(), "x");
+        let mut d = opened(dialog(QKind::Choice), open);
+        d.click_row(1);
+        d.key_at(qk('o'), at(open, 20));
+        d.key_at(qk('k'), at(open, 40));
+        assert_eq!(d.state[0].field.text(), "ok");
     }
 }
