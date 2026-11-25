@@ -5,7 +5,6 @@
 //! dropped (vt100's default callbacks do nothing). Private screens are
 //! dropped with the view; nothing here is Debug, serialized or copied to
 //! the clipboard.
-use crate::engine::TermInfo;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -19,39 +18,28 @@ const SCROLLBACK: usize = 5000;
 /// scrollback row). It is only ever used to stage an excerpt for sharing;
 /// it never reaches the clipboard.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct TermSel {
-    pub anchor: usize,
-    pub focus: usize,
+struct TermSel {
+    anchor: usize,
+    focus: usize,
 }
 
 impl TermSel {
-    pub fn range(&self) -> (usize, usize) {
+    fn range(&self) -> (usize, usize) {
         (self.anchor.min(self.focus), self.anchor.max(self.focus))
     }
 }
 
 pub struct TermView {
-    pub info: TermInfo,
     parser: vt100::Parser,
     /// The next byte offset expected from the stream.
-    pub next: u64,
+    next: u64,
     /// Earlier output was dropped (snapshot cap, lost chunks).
-    pub lost: bool,
-    pub sel: Option<TermSel>,
+    lost: bool,
+    sel: Option<TermSel>,
     /// The size last sent to the PTY.
-    pub pty_size: Option<(u16, u16)>,
+    pty_size: Option<(u16, u16)>,
     /// New output since the user last looked at this tab.
-    pub unread: bool,
-    /// The user closed it from this UI (else: cancel, shutdown, exit).
-    pub closing: bool,
-    /// The last share mode and staged size seen before close (for the
-    /// transcript row).
-    pub last_output: bool,
-    pub last_staged: usize,
-    /// The user downgraded output → status.
-    pub made_private: bool,
-    /// When the shell exited by itself (the close hint follows shortly).
-    pub exited_at: Option<std::time::Instant>,
+    unread: bool,
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -59,20 +47,92 @@ fn nz(n: u16) -> NonZeroU16 {
 }
 
 impl TermView {
-    pub fn new(info: TermInfo, rows: u16, cols: u16) -> Self {
+    pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            last_output: info.share_output,
-            last_staged: info.staged,
-            info,
             parser: vt100::Parser::new(nz(rows), nz(cols), SCROLLBACK),
             next: 0,
             lost: false,
             sel: None,
             pty_size: None,
             unread: false,
-            closing: false,
-            made_private: false,
-            exited_at: None,
+        }
+    }
+
+    /// The user looked at this tab.
+    pub fn seen(&mut self) {
+        self.unread = false;
+    }
+
+    /// New output since the user last looked at this tab.
+    pub fn unread(&self) -> bool {
+        self.unread
+    }
+
+    /// Earlier output could not be recovered.
+    pub fn mark_lost(&mut self) {
+        self.lost = true;
+    }
+
+    /// Earlier output was dropped (snapshot cap, lost chunks).
+    pub fn lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Record the PTY size `want` (cols, rows); true when the terminal
+    /// should be told the new size.
+    pub fn resize_pty(&mut self, want: (u16, u16)) -> bool {
+        if self.pty_size != Some(want) {
+            self.pty_size = Some(want);
+            return true;
+        }
+        false
+    }
+
+    /// The next byte offset expected from the stream.
+    pub fn next_offset(&self) -> u64 {
+        self.next
+    }
+
+    /// Feed a page read from the output log at `offset`; the stream goes
+    /// on at `next` (the page end).
+    pub fn feed_page(&mut self, offset: u64, bytes: &[u8], next: u64) {
+        self.feed(offset, bytes);
+        self.next = next;
+    }
+
+    /// Whether rows are selected.
+    pub fn has_selection(&self) -> bool {
+        self.sel.is_some()
+    }
+
+    /// Drop the selection; false when there was none.
+    pub fn clear_selection(&mut self) -> bool {
+        self.sel.take().is_some()
+    }
+
+    /// Select from absolute row `anchor` to `focus`.
+    pub fn select(&mut self, anchor: usize, focus: usize) {
+        self.sel = Some(TermSel { anchor, focus });
+    }
+
+    /// Start a keyboard selection on the cursor row and show it.
+    pub fn select_cursor_row(&mut self) {
+        let row = self.cursor_abs();
+        self.select(row, row);
+        self.reveal(row);
+    }
+
+    /// Move the selection's free end one row up or down and show it.
+    pub fn extend_selection(&mut self, up: bool) {
+        let last = self.last_abs();
+        if let Some(s) = &mut self.sel {
+            s.focus = if up {
+                s.focus.saturating_sub(1)
+            } else {
+                (s.focus + 1).min(last)
+            };
+            let f = s.focus;
+            self.reveal(f);
         }
     }
 
@@ -381,4 +441,29 @@ pub fn key_bytes(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
 pub fn is_leave_key(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pty_size_is_sent_once_per_change() {
+        let mut v = TermView::new(4, 20);
+        assert!(v.resize_pty((20, 4)));
+        assert!(!v.resize_pty((20, 4)));
+        assert!(v.resize_pty((30, 4)));
+    }
+
+    #[test]
+    fn selection_steps_and_clears() {
+        let mut v = TermView::new(4, 20);
+        assert!(!v.has_selection());
+        v.select_cursor_row();
+        assert!(v.has_selection());
+        v.extend_selection(false);
+        v.extend_selection(true);
+        assert!(v.clear_selection());
+        assert!(!v.clear_selection());
+    }
 }

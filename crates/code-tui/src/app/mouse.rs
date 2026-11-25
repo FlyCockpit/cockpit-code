@@ -2,7 +2,7 @@
 //! render time, hover tracking, scrollbars (track paging, thumb drags),
 //! inner box wheel routing, drag selection with edge auto-scroll, copy
 //! buttons and the right-click menu, keyboard focus on transcript entries.
-use super::view::{Menu, Sel};
+use super::view::{Focus, Menu, Sel};
 use super::*;
 use crate::clipboard::{Delivery, Outcome as ClipOutcome, TMUX_HINT};
 use crate::markdown;
@@ -20,13 +20,6 @@ pub(super) struct Press {
     /// The press started inside this entry's inner box.
     pub boxed: Option<usize>,
     pub dragged: bool,
-}
-
-/// Keyboard focus on a transcript entry (copy buttons, box scrolling).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Focus {
-    pub entry: usize,
-    pub button: Option<Btn>,
 }
 
 fn in_rect(r: Rect, x: u16, y: u16) -> bool {

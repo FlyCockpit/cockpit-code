@@ -99,6 +99,25 @@ impl Tree {
         chain.reverse();
         chain.join(" › ")
     }
+    /// Whether `id` is `root_id` or one of its descendants.
+    pub fn in_subtree(&self, id: &str, root_id: &str) -> bool {
+        if root_id == "root" {
+            return true;
+        }
+        let mut next = Some(id.to_string());
+        let mut n = 0;
+        while let Some(cur) = next {
+            if cur == root_id {
+                return true;
+            }
+            n += 1;
+            if n > 64 {
+                break;
+            }
+            next = self.get(&cur).map(|a| a.view.parent.clone());
+        }
+        false
+    }
     pub fn link(&self, id: &str, follow_up: bool) -> Option<ChildLink> {
         self.get(id).map(|a| ChildLink {
             id: id.to_string(),

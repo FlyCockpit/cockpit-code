@@ -22,45 +22,6 @@ pub(super) enum StripItem {
     Fold(usize),
 }
 
-/// Transcript geometry from the last frame.
-#[derive(Default, Clone)]
-pub(super) struct Layout {
-    pub starts: Vec<usize>,
-    pub lens: Vec<usize>,
-    pub total: usize,
-    pub top: usize,
-    pub view_h: usize,
-    /// The transcript rows on screen (sticky header excluded, scrollbar
-    /// column excluded).
-    pub area: Rect,
-}
-
-impl Layout {
-    /// The entry and its row at absolute transcript row `abs` (None on a gap).
-    pub fn locate(&self, abs: usize) -> Option<(usize, usize)> {
-        let i = self.starts.partition_point(|&s| s <= abs).checked_sub(1)?;
-        (abs < self.starts[i] + self.lens[i]).then(|| (i, abs - self.starts[i]))
-    }
-    /// The entry at screen row `y`, counting the gap row below an entry as
-    /// part of it (None outside the transcript rows).
-    pub fn entry_near(&self, x: u16, y: u16) -> Option<usize> {
-        let a = self.area;
-        if y < a.y || y >= a.bottom() || x < a.x || x > a.right() {
-            return None;
-        }
-        let abs = self.top + (y - a.y) as usize;
-        if abs >= self.total {
-            return None;
-        }
-        self.starts.partition_point(|&s| s <= abs).checked_sub(1)
-    }
-    /// The absolute row at screen row `y` (clamped into the view).
-    pub fn abs_at(&self, y: u16) -> usize {
-        let rel = (y as isize - self.area.y as isize).clamp(0, self.view_h.max(1) as isize - 1);
-        (self.top + rel as usize).min(self.total.saturating_sub(1))
-    }
-}
-
 /// Text selection in transcript coordinates (absolute row, display column).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Sel {
@@ -89,6 +50,13 @@ impl Sel {
         let b = if abs == r1 { c1 as usize } else { usize::MAX };
         Some((a, b))
     }
+}
+
+/// Keyboard focus on a transcript entry (copy buttons, box scrolling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Focus {
+    pub entry: usize,
+    pub button: Option<Btn>,
 }
 
 /// A status-line group: its priority and spans (with click targets).
@@ -480,8 +448,8 @@ impl App {
         let askers = self.prompt_agents();
         let marked_crumb = askers
             .iter()
-            .filter(|a| !self.in_subtree(a, &viewed) || **a == viewed)
-            .filter_map(|a| chain.iter().rposition(|c| self.in_subtree(a, c)))
+            .filter(|a| !self.tree.in_subtree(a, &viewed) || **a == viewed)
+            .filter_map(|a| chain.iter().rposition(|c| self.tree.in_subtree(a, c)))
             .max();
         let crumbs = chain
             .iter()
@@ -506,26 +474,6 @@ impl App {
             items.extend(finished.iter().map(|a| StripItem::Child(a.view.id.clone())));
         }
         (crumbs, items)
-    }
-
-    /// Whether `id` is `root_id` or one of its descendants.
-    pub(super) fn in_subtree(&self, id: &str, root_id: &str) -> bool {
-        if root_id == "root" {
-            return true;
-        }
-        let mut next = Some(id.to_string());
-        let mut n = 0;
-        while let Some(cur) = next {
-            if cur == root_id {
-                return true;
-            }
-            n += 1;
-            if n > 64 {
-                break;
-            }
-            next = self.tree.get(&cur).map(|a| a.view.parent.clone());
-        }
-        false
     }
 
     /// Agents with a waiting approval or question.
@@ -557,7 +505,7 @@ impl App {
         let mut totals = self.engine.agent_totals(id);
         let (mut n, mut running) = (0, 0);
         for a in &self.tree.agents {
-            if a.view.id != id && self.in_subtree(&a.view.id, id) {
+            if a.view.id != id && self.tree.in_subtree(&a.view.id, id) {
                 n += 1;
                 running += alive(&a.view.status) as usize;
                 totals.add(&self.engine.agent_totals(&a.view.id));
@@ -748,11 +696,11 @@ impl App {
                     let Some(a) = self.tree.get(id) else { continue };
                     let finished = !alive(&a.view.status);
                     let (mut icon, color) = status_icon(&a.view.status, self.tick);
-                    let waiting = blocked.iter().any(|b| self.in_subtree(b, id));
+                    let waiting = blocked.iter().any(|b| self.tree.in_subtree(b, id));
                     if waiting {
                         icon = "⧗";
                     }
-                    let mark = if askers.iter().any(|b| self.in_subtree(b, id)) {
+                    let mark = if askers.iter().any(|b| self.tree.in_subtree(b, id)) {
                         " !"
                     } else {
                         ""

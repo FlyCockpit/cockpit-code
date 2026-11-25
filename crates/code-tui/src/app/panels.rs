@@ -1,12 +1,13 @@
 //! Panels and controls: `/agents` with ask status,
-//! finalize and stop, the agent strip's actions, `/decisions` and
-//! `/subagents`.
+//! finalize (and its live progress) and stop, the agent strip's actions,
+//! `/decisions` and `/subagents`.
 use super::{App, DialogPurpose, Overlay};
+use crate::agents::Tree;
 use crate::agentsview::{AgentRow, AgentsAction, AgentsView};
 use crate::decisionsview::{DecisionsAction, DecisionsView};
 use crate::dialog::{Body, Dialog, DialogOption};
 use crate::engine::{AgentDone, Review, agent_filters};
-use crate::transcript::Level;
+use crate::transcript::{Card, CardPart, Level, Tone};
 use crate::wrap::truncate;
 use serde_json::Value;
 
@@ -21,6 +22,122 @@ pub(super) enum PanelDialog {
 }
 
 const STATUS_QUESTION: &str = "What is your current status? What is done, what are you doing now, what is left, and are you blocked on anything?";
+
+/// Live wrap-up progress of one `agents finalize` request.
+pub(super) struct Finalizing {
+    /// Who asked (its transcript holds the row).
+    caller: String,
+    target: String,
+    /// Deepest first, as the engine orders them.
+    agents: Vec<String>,
+    wrapping: Vec<String>,
+    done: Vec<String>,
+}
+
+impl Finalizing {
+    fn new(caller: &str, target: &str, agents: &[String]) -> Self {
+        Self {
+            caller: caller.to_string(),
+            target: target.to_string(),
+            agents: agents.to_vec(),
+            wrapping: vec![],
+            done: vec![],
+        }
+    }
+
+    /// `agent` is part of this request and has not reported yet.
+    fn pending(&self, agent: &str) -> bool {
+        self.agents.iter().any(|a| a == agent) && !self.done.iter().any(|a| a == agent)
+    }
+
+    /// `agent` started its final turn, or (`finished`) reported. False
+    /// when it is not part of this request.
+    fn advance(&mut self, agent: &str, finished: bool) -> bool {
+        if !self.agents.iter().any(|a| a == agent) {
+            return false;
+        }
+        if !self.wrapping.iter().any(|a| a == agent) {
+            self.wrapping.push(agent.to_string());
+        }
+        if finished && !self.done.iter().any(|a| a == agent) {
+            self.done.push(agent.to_string());
+        }
+        true
+    }
+
+    /// The finalize progress row: who is wrapping up, bottom-up.
+    fn card(&self, tree: &Tree, live: bool) -> Card {
+        let n = self.agents.len();
+        let done = self.done.len();
+        let wrapping: Vec<String> = self
+            .wrapping
+            .iter()
+            .filter(|a| !self.done.contains(a))
+            .map(|a| tree.label(a))
+            .collect();
+        let head = if !live {
+            format!(
+                "finalize {} · {n} agent{} wrap up, deepest first",
+                tree.label(&self.target),
+                if n == 1 { "" } else { "s" }
+            )
+        } else if done >= n && n == 1 {
+            format!(
+                "finalized {} · its final report is in",
+                tree.label(&self.target)
+            )
+        } else if done >= n && n > 0 {
+            format!("finalized {} · all {n} reported", tree.label(&self.target))
+        } else if wrapping.is_empty() {
+            format!(
+                "finalizing {} · {done}/{n} reported · waiting for in-flight calls",
+                tree.label(&self.target)
+            )
+        } else {
+            format!(
+                "finalizing {} · {done}/{n} reported · wrapping up: {}",
+                tree.label(&self.target),
+                wrapping.join(", ")
+            )
+        };
+        let mut md = String::from(
+            "Each agent finishes its current call, then gets one last turn with tools disabled to write its report; parents go after all their children reported.\n\n",
+        );
+        for a in &self.agents {
+            let state = if self.done.contains(a) {
+                "✓ reported"
+            } else if self.wrapping.contains(a) {
+                "◇ final turn"
+            } else if live {
+                "◌ waiting"
+            } else {
+                "·"
+            };
+            md.push_str(&format!("- {state} · **{}**\n", tree.label(a)));
+        }
+        Card {
+            key: format!("finalize:{}", self.target),
+            icon: if live && done >= n && n > 0 {
+                "✓"
+            } else {
+                "◇"
+            }
+            .into(),
+            tone: if live && done >= n && n > 0 {
+                Tone::Ok
+            } else {
+                Tone::Warn
+            },
+            head,
+            body: vec![CardPart::Md(md)],
+        }
+    }
+}
+
+/// The row of a finalize request without live progress (replay).
+pub(super) fn finalize_plan_card(tree: &Tree, target: &str, agents: &[String]) -> Card {
+    Finalizing::new("", target, agents).card(tree, false)
+}
 
 impl App {
     // ---- /agents --------------------------------------------------------
@@ -86,10 +203,7 @@ impl App {
             scope,
             context: s("context"),
             last_text: crate::markdown::plain(&s("lastText")),
-            finalizing: self
-                .finalizing
-                .iter()
-                .any(|f| f.agents.contains(&id) && !f.done.contains(&id)),
+            finalizing: self.finalizing.iter().any(|f| f.pending(&id)),
             depth: 0,
             order: if id == "root" {
                 0
@@ -203,7 +317,7 @@ impl App {
             .tree
             .agents
             .iter()
-            .filter(|a| a.view.id != id && self.in_subtree(&a.view.id, id))
+            .filter(|a| a.view.id != id && self.tree.in_subtree(&a.view.id, id))
             .count();
         let dialog = Dialog::new(
             format!("Stop {label}'s branch"),
@@ -290,6 +404,32 @@ impl App {
             StripAct::Finalize => self.finalize_dialog(id),
             StripAct::Agents => self.open_agents(Some(id)),
         }
+    }
+
+    /// A finalize request started: track its progress and return its row.
+    pub(super) fn finalize_started(
+        &mut self,
+        caller: &str,
+        target: &str,
+        agents: &[String],
+    ) -> Card {
+        let f = Finalizing::new(caller, target, agents);
+        let card = f.card(&self.tree, true);
+        self.finalizing.retain(|x| x.target != target);
+        self.finalizing.push(f);
+        card
+    }
+
+    /// `agent` started its final turn or (`finished`) reported: the
+    /// updated progress rows, with the caller whose transcript holds each.
+    pub(super) fn finalize_progress(&mut self, agent: &str, finished: bool) -> Vec<(String, Card)> {
+        let mut updates = vec![];
+        for f in &mut self.finalizing {
+            if f.advance(agent, finished) {
+                updates.push((f.caller.clone(), f.card(&self.tree, true)));
+            }
+        }
+        updates
     }
 
     // ---- /decisions -----------------------------------------------------

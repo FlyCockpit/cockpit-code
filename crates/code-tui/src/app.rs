@@ -3,6 +3,7 @@
 mod attention;
 mod engine_o;
 mod goal;
+mod layout;
 mod mention;
 mod mouse;
 mod panels;
@@ -32,7 +33,8 @@ use crate::transcript::{Entry, Kind, Level, Transcript};
 use crate::ui::{self, Hits, ScrollId, StatusSeg, Target};
 use crate::wrap::{truncate, wrap_lines};
 use goal::{EditPurpose, GoalAction, GoalPrompt};
-use mouse::{Focus, Press};
+use layout::Layout;
+use mouse::Press;
 use ratatui::Frame;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -46,7 +48,7 @@ use std::time::{Duration, Instant};
 use terminals::Terms;
 pub use terminals::recv_term;
 use usage_view::{UsageData, UsageView};
-use view::{CostView, Layout, Menu, Sel};
+use view::{CostView, Focus, Menu, Sel};
 
 const COMMANDS: &[(&str, &str)] = &[
     ("model", "pick the model; toggle subagent availability"),
@@ -295,7 +297,7 @@ pub struct App {
     /// The Ctrl+F find bar, while open.
     search: Option<search::Search>,
     /// URLs visible in the last frame (OSC 8, clicks).
-    pub links: Vec<crate::links::Link>,
+    links: Vec<crate::links::Link>,
     shells: Vec<shell::Shell>,
     shell_seq: u64,
     attention: attention::Attention,
@@ -359,10 +361,10 @@ pub struct App {
     ctrl_c_at: Option<Instant>,
     hint: Option<(String, Instant)>,
     pub mouse: bool,
-    pub mouse_changed: bool,
-    pub tick: usize,
+    mouse_changed: bool,
+    tick: usize,
     pub quit: bool,
-    pub dirty: bool,
+    dirty: bool,
     transcript_area: Rect,
     tree: Tree,
     /// The subagent whose transcript is open; None is root.
@@ -406,7 +408,7 @@ pub struct App {
     /// The provider reports no context (meter source `unknown`): `ctx ?`.
     ctx_unknown: bool,
     /// A pending `$EDITOR` run, serviced by the event loop.
-    pub editor: Option<EditorReq>,
+    editor: Option<EditorReq>,
     /// Composer chip rects from the last draw: (rect, block index).
     chip_rects: Vec<(Rect, usize)>,
     /// The session title (auto or `/rename`).
@@ -424,7 +426,7 @@ pub struct App {
     /// The latest background usage read.
     usage: Vec<crate::usage::ProviderUsage>,
     /// Live `agents finalize` progress.
-    finalizing: Vec<tree_rows::Finalizing>,
+    finalizing: Vec<panels::Finalizing>,
     /// Mail that arrived while root was idle: why its next turn started.
     wake_reasons: Vec<String>,
     /// Open decisions (status bar).
@@ -996,8 +998,71 @@ impl App {
         (&mut self.events, self.terms.rx_mut())
     }
 
-    pub fn events(&mut self) -> &mut Option<EventRx> {
-        &mut self.events
+    /// Handle one more queued engine event without waiting; false when
+    /// none is queued (or the channel closed).
+    pub fn next_engine_event(&mut self) -> bool {
+        let Some(rx) = &mut self.events else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(ev) => {
+                self.on_engine(Some(ev));
+                true
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+            Err(_) => {
+                self.on_engine(None);
+                false
+            }
+        }
+    }
+
+    /// A `$EDITOR` run is pending (the event loop hands it the terminal).
+    pub fn wants_editor(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Run the pending `$EDITOR` request through `edit` (the text in, the
+    /// edited text or None out) and apply the result.
+    pub async fn run_editor<F>(&mut self, edit: impl FnOnce(String) -> F)
+    where
+        F: std::future::Future<Output = Result<Option<String>, String>>,
+    {
+        let Some(req) = self.editor.take() else {
+            return;
+        };
+        let result = edit(req.text.clone()).await;
+        self.editor_done(req, result);
+    }
+
+    /// The new mouse capture mode, once after each toggle.
+    pub fn take_mouse_change(&mut self) -> Option<bool> {
+        std::mem::take(&mut self.mouse_changed).then_some(self.mouse)
+    }
+
+    /// Draw a frame (and emit its links) when something changed; true
+    /// when it drew.
+    pub fn redraw(
+        &mut self,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<bool, String> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        self.dirty = false;
+        terminal.draw(|f| self.draw(f)).map_err(|e| e.to_string())?;
+        crate::links::emit(&self.links);
+        Ok(true)
+    }
+
+    /// The event loop's 100 ms timer: advance the animation tick, redraw
+    /// when something moves, and update the attention state.
+    pub fn on_timer(&mut self) {
+        self.tick += 1;
+        if self.on_tick() || self.animating() || self.has_hint() {
+            self.dirty = true;
+        }
+        self.attention_tick();
     }
 
     /// Whether something animates (a turn, a live subagent, a fading
