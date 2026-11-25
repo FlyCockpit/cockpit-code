@@ -111,6 +111,23 @@ fn reclaim(mouse: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Clear the screen and make the next draw repaint everything, as after the
+/// external editor. `Terminal::clear` first asks the terminal for the cursor
+/// position, and after the editor that reply can be lost (seen on every second
+/// round trip): the query fails, nothing is cleared and only changed cells
+/// were redrawn.
+fn repaint_all<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+) -> Result<(), B::Error> {
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    // A swap resets the buffer it leaves behind, so two swaps reset both.
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
+}
+
 /// Run `$VISUAL` (else `$EDITOR`) on `text` with the TUI suspended: input
 /// reading stopped, mouse capture, bracketed paste, keyboard flags, the
 /// alternate screen and raw mode all released, then restored. Ok(None)
@@ -302,7 +319,7 @@ async fn event_loop(app: &mut app::App, typed: &[u8]) -> Result<(), String> {
             app.run_editor(|text| async move {
                 let result = external_edit(mouse, text).await;
                 *input = Some(EventStream::new());
-                let _ = terminal.clear();
+                let _ = repaint_all(terminal);
                 *block_cursor = false;
                 result
             })
@@ -376,6 +393,84 @@ async fn event_loop(app: &mut app::App, typed: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal that can't report its cursor position, like one whose
+    /// reply was lost; it counts the cells each draw sends.
+    struct NoCursorQuery {
+        inner: ratatui::backend::TestBackend,
+        drawn: Vec<usize>,
+        cleared: usize,
+    }
+
+    impl ratatui::backend::Backend for NoCursorQuery {
+        type Error = io::Error;
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            let cells: Vec<_> = content.collect();
+            self.drawn.push(cells.len());
+            self.inner.draw(cells.into_iter()).map_err(io::Error::other)
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            Err(io::Error::other("no cursor position reply"))
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            _: P,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            self.clear_region(ratatui::backend::ClearType::All)
+        }
+        fn clear_region(&mut self, kind: ratatui::backend::ClearType) -> io::Result<()> {
+            self.cleared += 1;
+            self.inner.clear_region(kind).map_err(io::Error::other)
+        }
+        fn size(&self) -> io::Result<ratatui::layout::Size> {
+            self.inner.size().map_err(io::Error::other)
+        }
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size().map_err(io::Error::other)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn repaint_all_redraws_the_screen_without_a_cursor_query() {
+        let backend = NoCursorQuery {
+            inner: ratatui::backend::TestBackend::new(6, 2),
+            drawn: vec![],
+            cleared: 0,
+        };
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let text = |f: &mut ratatui::Frame| {
+            f.render_widget(ratatui::widgets::Paragraph::new("abc\ndef"), f.area())
+        };
+        terminal.draw(text).unwrap();
+        terminal.draw(text).unwrap();
+        assert!(
+            terminal.clear().is_err(),
+            "Terminal::clear needs the cursor position"
+        );
+        repaint_all(&mut terminal).unwrap();
+        terminal.draw(text).unwrap();
+        let backend = terminal.backend();
+        assert_eq!(backend.cleared, 1);
+        // An unchanged frame sends nothing; after the repaint every nonblank
+        // cell is sent again, as on the first draw.
+        assert_eq!(backend.drawn, [6, 0, 6]);
+        backend.inner.assert_buffer_lines(["abc   ", "def   "]);
+    }
 
     #[test]
     fn burst_returns_with_backlog_and_preserves_order() {
