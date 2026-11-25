@@ -2415,6 +2415,8 @@ impl State {
         while let Some(event) = wire_rx.recv().await {
             capture(event)?;
         }
+        // Behind the call's last delta on the same stream.
+        let _ = tx.send(EngineEvent::ReplyEnd);
         if interrupted && !cancel.is_cancelled() {
             return Ok(model::Completion {
                 text,
@@ -3185,7 +3187,9 @@ async fn run(
         ) {
             completion.text = text.clone();
             completion.replay = None;
+            // The surfaced answer is a reply of its own, finished at once.
             let _ = tx.send(EngineEvent::Text { delta: text });
+            let _ = tx.send(EngineEvent::ReplyEnd);
         }
         for call in &mut completion.tool_calls {
             let _ = repair::repair(call, &request.offered_tools);
@@ -4078,6 +4082,62 @@ mod tests {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         exited.expect("dropping git output left the child running");
+    }
+
+    /// A model call's end reaches the frontend behind all of its text, on
+    /// the same stream: a frontend can start the next reply afresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_model_call_ends_with_reply_end_behind_its_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(config.join("providers")).unwrap();
+        std::fs::write(
+            config.join("config.json"),
+            serde_json::json!({"defaultModel":"p/m", "skillsDirs":[]}).to_string(),
+        )
+        .unwrap();
+        // The first call answers in text; the second (after "think") only in
+        // reasoning, which the engine surfaces as text afterwards.
+        let script = r#"if grep -q think "$1"; then printf '%s\n' '{"type":"reasoning","delta":"deep"}' '{"type":"done","stopReason":"end_turn"}'; else printf '%s\n' '{"type":"text","delta":"hel"}' '{"type":"text","delta":"lo"}' '{"type":"done","stopReason":"end_turn"}'; fi"#;
+        std::fs::write(
+            config.join("providers/p.json"),
+            serde_json::json!({"type":"command", "command":{"argv":["sh", "-c", format!("cat > /dev/null; {script}"), "adapter", "{messagesFile}"], "output":"jsonl"},
+                "models":{"m":{"capabilities":{"output":["text"], "tools":true}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let store = code_config::ConfigStore::load(code_config::Directories {
+            config,
+            data: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        let session = Session::create(store, temp.path().to_owned(), Default::default()).unwrap();
+        let mut turn = session.send("hi");
+        let mut seen = String::new();
+        while let Some(event) = turn.recv().await {
+            match event {
+                EngineEvent::Text { delta } => seen.push_str(&delta),
+                EngineEvent::ReplyEnd => seen.push('|'),
+                EngineEvent::TurnEnd { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(seen, "hello|");
+        let mut turn = session.send("think");
+        let mut seen = String::new();
+        while let Some(event) = turn.recv().await {
+            match event {
+                EngineEvent::Text { delta } => seen.push_str(&delta),
+                EngineEvent::ReplyEnd => seen.push('|'),
+                EngineEvent::TurnEnd { .. } => break,
+                _ => {}
+            }
+        }
+        // The surfaced answer is closed too: a later reply cannot join it.
+        assert!(seen.ends_with("deep|"), "{seen}");
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]

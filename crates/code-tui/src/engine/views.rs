@@ -347,6 +347,8 @@ pub enum UiEvent {
     Terminal(TermInfo),
     Text(String),
     Reasoning(String),
+    /// A model reply was committed: the next text is a new reply.
+    ReplyEnd,
     /// A tool call being written: tentative argument fragments.
     ToolDelta {
         index: usize,

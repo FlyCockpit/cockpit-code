@@ -227,10 +227,14 @@ impl Entry {
     }
     /// Whether a blank separator row sits between `prev` and this entry.
     pub(super) fn separated_from(&self, prev: &Entry) -> bool {
-        let history = |e: &Entry| matches!(e.kind, Kind::Earlier(_) | Kind::Older { .. });
         !(self.is_row() && prev.is_row())
             // Earlier contexts stack as one list of headers.
-            && !(history(self) && history(prev))
+            && !(self.is_history() && prev.is_history())
+    }
+    /// An earlier context or the "older contexts on disk" row: the headers
+    /// that stack at the top of a transcript.
+    pub(super) fn is_history(&self) -> bool {
+        matches!(self.kind, Kind::Earlier(_) | Kind::Older { .. })
     }
     pub fn render(&mut self, width: usize, tick: usize) -> &Rendered {
         let key = self.key(width);
@@ -384,9 +388,12 @@ impl Entry {
     /// not that stream.
     pub(super) fn append(&mut self, into: Stream, delta: &str) -> bool {
         let text = match (&mut self.kind, into) {
-            (Kind::Assistant(t), Stream::Text)
-            | (Kind::Reasoning(t), Stream::Reasoning)
-            | (Kind::Compacting(t), Stream::Compacting) => t,
+            // A finished reply takes no more text: the next one is its own
+            // paragraph.
+            (Kind::Assistant(t), Stream::Text) if !self.done => t,
+            (Kind::Reasoning(t), Stream::Reasoning) | (Kind::Compacting(t), Stream::Compacting) => {
+                t
+            }
             _ => return false,
         };
         text.push_str(delta);

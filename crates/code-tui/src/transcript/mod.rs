@@ -252,6 +252,11 @@ impl Transcript {
             e.seal();
         }
     }
+    /// A model reply was committed: its text is finished, so the next
+    /// reply's text starts a new paragraph.
+    pub fn end_reply(&mut self) {
+        self.seal_last();
+    }
     /// Mark every assistant segment finished (turn end, replay) and the
     /// last segment of each turn as carrying the turn's copy row.
     pub fn seal(&mut self) {
@@ -393,10 +398,15 @@ impl Transcript {
     pub fn take_older(&mut self) -> Option<(String, u32)> {
         self.entries.first_mut()?.take_older()
     }
-    /// Fold everything so far into one collapsed "earlier context" section.
+    /// Fold everything since the last fold into one collapsed "earlier
+    /// context" section. The contexts folded before (and the "on disk" row)
+    /// stay where they are, as headers of their own: each one still opens.
     fn fold_earlier(&mut self) {
         self.seal();
-        let entries: Vec<Entry> = std::mem::take(&mut self.entries)
+        let headers = self.entries.iter().take_while(|e| e.is_history()).count();
+        let entries: Vec<Entry> = self
+            .entries
+            .split_off(headers)
             .into_iter()
             .filter(|e| !e.folds_away())
             .collect();
@@ -1125,6 +1135,79 @@ mod tests {
         tr.stream_reset();
         assert_eq!(tr.entries.len(), 1);
         assert!(matches!(tr.entries[0].kind(), Kind::Assistant(text) if text == "committed reply"));
+    }
+
+    fn texts(tr: &Transcript) -> Vec<&str> {
+        tr.kinds()
+            .filter_map(|k| match k {
+                Kind::Assistant(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn consecutive_replies_are_separate_paragraphs() {
+        let mut tr = Transcript::default();
+        tr.push(Kind::User("go".into()));
+        for _ in 0..3 {
+            tr.append_text("done.");
+            tr.end_reply();
+        }
+        assert_eq!(texts(&tr), ["done.", "done.", "done."]);
+        assert!((2..=3).all(|i| tr.gap_before(i)));
+        // One reply streamed in pieces stays one paragraph.
+        tr.append_text("one ");
+        tr.append_text("reply");
+        assert_eq!(texts(&tr).last(), Some(&"one reply"));
+    }
+
+    #[test]
+    fn each_compaction_adds_an_earlier_context_that_opens() {
+        let mut tr = Transcript::default();
+        tr.push(Kind::Older {
+            agent: "root".into(),
+            contexts: vec![1],
+            loading: false,
+        });
+        for round in ["first", "second"] {
+            tr.push(Kind::User(round.into()));
+            tr.append_text("reply");
+            tr.end_reply();
+            tr.compacted(format!("summary {round}"));
+        }
+        let top: Vec<&Kind> = tr.kinds().collect();
+        assert!(matches!(top[0], Kind::Older { .. }));
+        let earlier: Vec<usize> = (0..top.len())
+            .filter(|&i| matches!(top[i], Kind::Earlier(_)))
+            .collect();
+        // Two folds side by side, neither inside the other.
+        assert_eq!(earlier, [1, 2]);
+        for &i in &earlier {
+            let Kind::Earlier(children) = top[i] else {
+                unreachable!()
+            };
+            assert!(
+                !children
+                    .iter()
+                    .any(|c| matches!(c.kind(), Kind::Earlier(_)))
+            );
+        }
+        for i in earlier {
+            assert!(tr.entry_mut(i).unwrap().toggle());
+        }
+        // The on-disk row still leads, so loading the older context works.
+        tr.insert_earlier(
+            1,
+            Transcript {
+                entries: vec![Entry::new(Kind::Assistant("old".into()), false)],
+                ..Transcript::default()
+            },
+        );
+        assert_eq!(
+            tr.kinds().filter(|k| matches!(k, Kind::Earlier(_))).count(),
+            3
+        );
     }
 
     #[test]

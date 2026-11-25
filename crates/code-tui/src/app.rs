@@ -1766,6 +1766,7 @@ impl App {
                     self.transcript.append_reasoning(&d);
                 }
             }
+            UiEvent::ReplyEnd => self.transcript.end_reply(),
             UiEvent::ToolDelta {
                 index,
                 id,
@@ -2317,6 +2318,7 @@ impl App {
                 }
             }
             UiEvent::TurnEnd { .. } => tr.seal(),
+            UiEvent::ReplyEnd => tr.end_reply(),
             UiEvent::Partial { status, text } => tr.partial(partial_text(&status, &text)),
             // The summary closes the old context and heads the new one; show it once.
             UiEvent::Compacted(summary) => {
@@ -5095,6 +5097,51 @@ mod tests {
                         .any(|k| matches!(k, Kind::Assistant(t) if t == "retry"))
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_and_child_replies_in_one_turn_stay_apart() {
+        let (_dir, mut app) = app();
+        app.tree.add(
+            AgentView {
+                id: "child".into(),
+                parent: "root".into(),
+                role: "worker".into(),
+                model: None,
+                status: "running".into(),
+                task: String::new(),
+                background: false,
+                created: String::new(),
+                call_id: None,
+            },
+            true,
+        );
+        for child in [false, true] {
+            for event in [
+                UiEvent::Text("done.".into()),
+                UiEvent::ReplyEnd,
+                UiEvent::Text("done.".into()),
+            ] {
+                if child {
+                    app.child_event("child", event);
+                } else {
+                    app.on_engine_event(Some(event));
+                }
+            }
+            let tr = if child {
+                &app.tree.get("child").unwrap().transcript
+            } else {
+                &app.transcript
+            };
+            let replies: Vec<_> = tr
+                .kinds()
+                .filter_map(|k| match k {
+                    Kind::Assistant(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replies, ["done.", "done."]);
         }
     }
 

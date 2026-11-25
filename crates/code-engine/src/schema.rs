@@ -884,6 +884,10 @@ pub enum EngineEvent {
     Text {
         delta: String,
     },
+    /// A model call of the agent finished streaming: sent on the agent's
+    /// event stream after the call's last delta, so the next text is a new
+    /// reply.
+    ReplyEnd,
     Reasoning {
         delta: String,
     },

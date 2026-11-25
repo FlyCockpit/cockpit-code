@@ -250,6 +250,7 @@ pub(super) fn translate(event: EngineEvent) -> Option<UiEvent> {
             roadblock: goal::roadblock(&roadblock),
         },
         EngineEvent::Text { delta } => UiEvent::Text(delta),
+        EngineEvent::ReplyEnd => UiEvent::ReplyEnd,
         EngineEvent::Reasoning { delta } => UiEvent::Reasoning(delta),
         EngineEvent::ToolCallDelta {
             index,
@@ -493,4 +494,26 @@ pub(super) fn translate(event: EngineEvent) -> Option<UiEvent> {
             ok: outcome.succeeded,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_model_call_ends_the_reply_of_its_agent() {
+        assert!(matches!(
+            translate(EngineEvent::ReplyEnd),
+            Some(UiEvent::ReplyEnd)
+        ));
+        let child = EngineEvent::AgentEvent {
+            agent_id: "child".into(),
+            breadcrumb: "root › child".into(),
+            event: Box::new(EngineEvent::ReplyEnd),
+        };
+        assert!(matches!(
+            translate(child),
+            Some(UiEvent::Child { id, event }) if id == "child" && matches!(*event, UiEvent::ReplyEnd)
+        ));
+    }
 }
