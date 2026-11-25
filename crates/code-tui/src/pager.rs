@@ -75,7 +75,7 @@ impl Pager {
             .map(|(i, l)| format!("{:>w$} │ {l}\n", i + 1))
             .collect();
         // Outside the cwd (a saved output): the last two components.
-        let mut name = crate::transcript::rel_path(path);
+        let mut name = crate::wrap::rel_path(path);
         if name.starts_with('/') {
             let parts: Vec<_> = path.iter().map(|p| p.to_string_lossy()).collect();
             name = format!("…/{}", parts[parts.len().saturating_sub(2)..].join("/"));

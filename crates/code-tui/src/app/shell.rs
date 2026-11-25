@@ -5,7 +5,6 @@
 //! output size).
 use super::App;
 use crate::engine::LocalRun;
-use crate::transcript::Kind;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -105,14 +104,7 @@ impl App {
             if let Some(transcript) = self.transcript_of(&agent) {
                 transcript.tool_end(&id, out, err, Default::default());
                 // A finished row is open, like a terminal.
-                if let Some(e) = transcript
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find(|e| matches!(&e.kind, Kind::Tool(t) if t.id == id))
-                {
-                    e.expanded = true;
-                }
+                transcript.open_tool(&id);
             }
             self.git.poke();
         }

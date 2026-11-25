@@ -564,7 +564,7 @@ impl App {
         if let Some(id) = self.view.clone() {
             let names = |v: &[std::path::PathBuf]| {
                 v.iter()
-                    .map(|p| crate::transcript::rel_path(p))
+                    .map(|p| crate::wrap::rel_path(p))
                     .map(|p| if p.is_empty() { ".".to_string() } else { p })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -1477,8 +1477,9 @@ impl App {
         lens: &[usize],
         top: usize,
     ) -> Option<usize> {
-        (0..tr.entries.len())
-            .filter(|&i| matches!(tr.entries[i].kind, Kind::User(_)) && lens[i] > 0)
+        tr.user_entries()
+            .into_iter()
+            .filter(|&i| lens[i] > 0)
             .rfind(|&i| starts[i] + lens[i] - 1 < top)
     }
 
@@ -1505,7 +1506,7 @@ impl App {
             Some(i) => &mut self.tree.agents[i].transcript,
             None => &mut self.transcript,
         };
-        let n = tr.entries.len();
+        let n = tr.len();
         let gaps: Vec<bool> = (0..n).map(|i| tr.gap_before(i)).collect();
         let mut starts = Vec::with_capacity(n);
         let mut lens = Vec::with_capacity(n);
@@ -1513,7 +1514,7 @@ impl App {
         for (i, gap) in gaps.iter().enumerate() {
             total += *gap as usize;
             starts.push(total);
-            let len = tr.entries[i].height(width, tick);
+            let len = tr[i].height(width, tick);
             lens.push(len);
             total += len;
         }
@@ -1565,8 +1566,8 @@ impl App {
         let margin = view_h.max(10) * 4;
         for i in 0..n {
             let (a, b) = (starts[i], starts[i] + lens[i]);
-            if (b + margin < top || a > top + view_h + margin) && tr.entries[i].cached() {
-                tr.entries[i].trim();
+            if b + margin < top || a > top + view_h + margin {
+                tr[i].trim();
             }
         }
         let mut out: Vec<Line<'static>> = Vec::with_capacity(view_h);
@@ -1583,7 +1584,7 @@ impl App {
             if start + lens[i] <= top {
                 continue;
             }
-            let r = tr.entries[i].render(width, tick);
+            let r = tr[i].render(width, tick);
             for (j, line) in r.lines.iter().enumerate() {
                 let row = start + j;
                 if row < top {
@@ -1601,7 +1602,7 @@ impl App {
         let mut boxes: Vec<(usize, BoxInfo)> = vec![];
         for r in &row_refs {
             metas.push(r.map(|(i, j)| {
-                let rendered = tr.entries[i].render(width, tick);
+                let rendered = tr[i].render(width, tick);
                 if let Some(b) = rendered.boxinfo
                     && !boxes.iter().any(|(e, _)| *e == i)
                 {
@@ -1613,21 +1614,13 @@ impl App {
         let anchored = tr.anchor();
         let task_child: Vec<Option<String>> = row_refs
             .iter()
-            .map(|r| {
-                r.and_then(|(i, _)| match &tr.entries[i].kind {
-                    Kind::Tool(t) => t.child.as_ref().map(|c| c.id.clone()),
-                    _ => None,
-                })
-            })
+            .map(|r| r.and_then(|(i, _)| tr[i].task_child().map(str::to_string)))
             .collect();
         let users: Vec<bool> = row_refs
             .iter()
-            .map(|r| r.is_some_and(|(i, _)| matches!(tr.entries[i].kind, Kind::User(_))))
+            .map(|r| r.is_some_and(|(i, _)| tr[i].user_text().is_some()))
             .collect();
-        let sticky_text = sticky.and_then(|i| match &tr.entries[i].kind {
-            Kind::User(text) => Some(text.clone()),
-            _ => None,
-        });
+        let sticky_text = sticky.and_then(|i| tr[i].user_text().map(str::to_string));
         if scroll.is_some() && view_h > 0 {
             // Show that the view is detached from the live bottom.
             let below = total.saturating_sub(top + view_h);
@@ -1779,9 +1772,7 @@ impl App {
         if let Some(i) = self.hover_entry
             && i + 1 < n
             && gaps[i + 1]
-            && matches!(&tr.entries[i].kind, Kind::Assistant(_))
-            && tr.entries[i].done
-            && !tr.entries[i].turn_last
+            && tr[i].shows_hover_copy()
         {
             let gap_abs = starts[i + 1] - 1;
             if gap_abs >= top && gap_abs < top + view_h {

@@ -7,6 +7,7 @@ use super::*;
 use crate::clipboard::{Delivery, Outcome as ClipOutcome, TMUX_HINT};
 use crate::markdown;
 use crate::rows::{self, Btn};
+use crate::transcript::entry::Clip;
 use crate::ui::ScrollGeom;
 
 /// A left press, until release.
@@ -228,7 +229,7 @@ impl App {
                 let width = a.width as usize;
                 let tick = self.tick;
                 let tr = self.view_transcript();
-                if let Some(e) = tr.entries.get_mut(i)
+                if let Some(e) = tr.entry_mut(i)
                     && e.render(width, tick).meta.get(j).is_some_and(|m| m.boxed)
                     && e.scroll_box(delta)
                 {
@@ -254,7 +255,7 @@ impl App {
                 let width = a.width as usize;
                 let tick = self.tick;
                 let tr = self.view_transcript();
-                if tr.entries[i].render(width, tick).meta[j].boxed {
+                if tr[i].render(width, tick).meta[j].boxed {
                     boxed = Some(i);
                 }
             }
@@ -330,7 +331,7 @@ impl App {
                 match boxed {
                     Some(e) => {
                         let tr = self.view_transcript();
-                        if let Some(entry) = tr.entries.get_mut(e) {
+                        if let Some(entry) = tr.entry_mut(e) {
                             entry.scroll_box(dir);
                         }
                     }
@@ -499,13 +500,9 @@ impl App {
     pub(super) fn toggle_entry(&mut self, e: usize, line: usize, y: u16) {
         let off = y as isize - self.layout.area.y as isize - line as isize;
         let tr = self.view_transcript();
-        let Some(entry) = tr.entries.get_mut(e) else {
-            return;
-        };
-        if !entry.selectable() {
+        if !tr.entry_mut(e).is_some_and(|entry| entry.toggle()) {
             return;
         }
-        entry.expanded = !entry.expanded;
         self.anchor_req = Some((e, 0, off));
         self.sel = None;
     }
@@ -538,13 +535,8 @@ impl App {
             }
             ScrollId::Box(e) => {
                 let tr = self.view_transcript();
-                if let Some(entry) = tr.entries.get_mut(*e) {
-                    let follow = entry.boxinfo().is_some_and(|b| b.follow);
-                    entry.box_scroll = if follow && off >= g.max() {
-                        None
-                    } else {
-                        Some(off)
-                    };
+                if let Some(entry) = tr.entry_mut(*e) {
+                    entry.scroll_box_to(off, off >= g.max());
                 }
             }
             ScrollId::Strip => self.strip_scroll = off,
@@ -606,7 +598,7 @@ impl App {
             };
             match layout.locate(abs) {
                 Some((i, j)) => {
-                    let r = tr.entries[i].render(width, tick);
+                    let r = tr[i].render(width, tick);
                     let meta = r.meta[j].clone();
                     if sel.boxed.is_some_and(|b| b != i || !meta.boxed) {
                         continue;
@@ -685,25 +677,15 @@ impl App {
             }
             Btn::Output => {
                 let tr = self.view_transcript();
-                let path = match tr.entries.get(e).map(|x| &x.kind) {
-                    Some(Kind::Tool(t)) => t
-                        .output
-                        .as_deref()
-                        .and_then(crate::transcript::full_output)
-                        .map(|(_, _, p)| p),
-                    _ => None,
-                };
-                if let Some(p) = path {
+                if let Some(p) = tr.entry(e).and_then(|x| x.output_file()) {
                     self.open_in_pager(&p, None);
                 }
                 return;
             }
             Btn::OpenFork => {
                 let tr = self.view_transcript();
-                if let Some(Kind::ForkAnswer { question, summary }) =
-                    tr.entries.get(e).map(|x| &x.kind)
-                {
-                    let (q, sum) = (question.clone(), summary.clone());
+                if let Some((question, summary)) = tr.entry(e).and_then(|x| x.fork_answer()) {
+                    let (q, sum) = (question.to_string(), summary.to_string());
                     self.reopen_fork(&q, &sum);
                 }
                 return;
@@ -711,16 +693,11 @@ impl App {
             _ => {}
         }
         let tr = self.view_transcript();
-        let Some(entry) = tr.entries.get(e) else {
-            return;
-        };
-        let (md, user, diff) = match &entry.kind {
-            // The turn's copy row copies the whole turn.
-            Kind::Assistant(_) if entry.turn_last => (Some(tr.turn_markdown(e)), None, None),
-            Kind::Assistant(m) => (Some(m.clone()), None, None),
-            Kind::User(t) => (None, Some(t.clone()), None),
-            Kind::Tool(t) => (None, None, crate::transcript::unified_diff(t)),
-            _ => return,
+        let (md, user, diff) = match tr.clip(e) {
+            Some(Clip::Markdown(m)) => (Some(m), None, None),
+            Some(Clip::User(t)) => (None, Some(t), None),
+            Some(Clip::Diff(d)) => (None, None, Some(d)),
+            None => return,
         };
         let why = if self.clip.ssh {
             "rich text isn't available over SSH"
@@ -803,10 +780,7 @@ impl App {
         }
         // The k-th equal message from the end of the transcript is the k-th
         // equal candidate from the end of the session.
-        let later = self.transcript.entries[e + 1..]
-            .iter()
-            .filter(|x| matches!(&x.kind, Kind::User(t) if t == text))
-            .count();
+        let later = self.transcript.count_prompts_after(e, text);
         let candidates = self.engine.fork_candidates();
         let Some(c) = candidates
             .iter()
@@ -897,7 +871,7 @@ impl App {
         if items.is_empty() {
             return;
         }
-        if matches!(self.view_transcript().entries[e].kind, Kind::User(_)) {
+        if self.view_transcript()[e].user_text().is_some() {
             self.view_transcript().set_anchor(Some(e));
         }
         self.overlay = Overlay::Menu(Box::new(Menu {
@@ -911,38 +885,9 @@ impl App {
 
     /// The actions an entry offers (buttons, menu items, keyboard focus).
     pub(super) fn entry_buttons(&mut self, e: usize) -> Vec<Btn> {
-        let tr = self.view_transcript();
-        let Some(entry) = tr.entries.get(e) else {
-            return vec![];
-        };
-        match &entry.kind {
-            Kind::Assistant(md) => {
-                let mut v = vec![Btn::CopyText, Btn::CopyRich, Btn::CopyMarkdown];
-                let parsed = markdown::render_md(md, 100_000, false);
-                v.extend((0..parsed.codes.len()).map(Btn::Code));
-                for n in 0..parsed.tables.len() {
-                    v.push(Btn::TableMd(n));
-                    v.push(Btn::TableHtml(n));
-                }
-                v
-            }
-            Kind::User(text) => {
-                let mut v = vec![Btn::Fork, Btn::CopyUser];
-                v.extend((0..crate::paste::bodies(text).len()).map(Btn::Paste));
-                v.extend((0..crate::paste::attachments(text).len()).map(Btn::Attachment));
-                v
-            }
-            Kind::Tool(t) if matches!(t.name.as_str(), "write" | "edit") => vec![Btn::Diff],
-            Kind::Tool(t)
-                if t.output
-                    .as_deref()
-                    .and_then(crate::transcript::full_output)
-                    .is_some() =>
-            {
-                vec![Btn::Output]
-            }
-            _ => vec![],
-        }
+        self.view_transcript()
+            .entry(e)
+            .map_or(vec![], |entry| entry.buttons())
     }
 
     // ---- keyboard focus -------------------------------------------------
@@ -979,7 +924,7 @@ impl App {
 
     /// Shift+Alt+Up/Down: focus the previous/next entry with actions or a box.
     pub(super) fn jump_entry(&mut self, up: bool) {
-        let n = self.view_transcript().entries.len();
+        let n = self.view_transcript().len();
         let from = self
             .focus
             .map(|f| f.entry as isize)
@@ -993,7 +938,7 @@ impl App {
             let e = i as usize;
             let buttons = self.entry_buttons(e);
             let tr = self.view_transcript();
-            let actionable = !buttons.is_empty() || tr.entries[e].selectable();
+            let actionable = !buttons.is_empty() || tr[e].selectable();
             if actionable {
                 self.focus = Some(Focus {
                     entry: e,
@@ -1015,7 +960,7 @@ impl App {
     /// passes the key on.
     pub(super) fn focus_key(&mut self, key: KeyEvent) -> bool {
         let Some(f) = self.focus else { return false };
-        if f.entry >= self.view_transcript().entries.len() {
+        if f.entry >= self.view_transcript().len() {
             self.focus = None;
             return false;
         }
@@ -1043,7 +988,7 @@ impl App {
             KeyCode::Up | KeyCode::Down => {
                 let d = if key.code == KeyCode::Up { -1 } else { 1 };
                 let tr = self.view_transcript();
-                if !tr.entries[f.entry].scroll_box(d) {
+                if !tr[f.entry].scroll_box(d) {
                     self.scroll_by(d);
                 }
             }

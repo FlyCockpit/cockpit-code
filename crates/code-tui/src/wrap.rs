@@ -1,5 +1,6 @@
 //! Word-aware styled wrapping, adapted from FlyCockpit's Cockpit
-//! (wrap separators retained for copying; grapheme clustering simplified).
+//! (wrap separators retained for copying; grapheme clustering simplified),
+//! and the short display forms of text, paths, byte counts and times.
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -224,4 +225,42 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// A message time: "14:05" today, "Oct 27 14:05" on another day.
+pub fn fmt_stamp(t: &chrono::DateTime<chrono::Local>) -> String {
+    if t.date_naive() == chrono::Local::now().date_naive() {
+        t.format("%H:%M").to_string()
+    } else {
+        t.format("%b %-d %H:%M").to_string()
+    }
+}
+
+static CWD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Paths under this directory are shown relative to it (tool rows, file lists).
+pub fn set_cwd(cwd: &std::path::Path) {
+    let _ = CWD.set(format!("{}/", cwd.display()));
+}
+
+/// A path relative to the session directory when it is inside it.
+pub fn rel_path(p: &std::path::Path) -> String {
+    rel(&p.display().to_string())
+}
+
+/// [`rel_path`] for a path written as text.
+pub fn rel(v: &str) -> String {
+    CWD.get()
+        .and_then(|c| v.strip_prefix(c.as_str()))
+        .unwrap_or(v)
+        .to_string()
+}
+
+/// A byte count for people: `812 B`, `12.3 kB`, `4.0 MB`.
+pub fn fmt_bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
+        n if n >= 1024 => format!("{:.1} kB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
 }

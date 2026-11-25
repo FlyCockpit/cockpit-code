@@ -5,7 +5,7 @@
 use crate::engine::{ForkChatMessage, QItem, ToolCall, ToolResultData};
 use crate::textbuf::TextBuf;
 use crate::theme::theme;
-use crate::transcript::{Kind, Level, SPINNER, Transcript};
+use crate::transcript::{Level, SPINNER, Transcript, entry::Kind};
 use crate::ui::{self, Hits, ScrollId};
 use crate::wrap::truncate;
 use ratatui::Frame;
@@ -88,17 +88,7 @@ impl ForkChat {
 
     /// A fork tool call finished: its structured row gets the result and run time.
     pub fn tool(&mut self, call: ToolCall, result: ToolResultData) {
-        let known = self
-            .transcript
-            .entries
-            .iter()
-            .any(|e| matches!(&e.kind, Kind::Tool(t) if t.id == call.id));
-        if known {
-            self.transcript
-                .tool_end(&call.id, result.output, result.is_error, result.details);
-        } else {
-            self.transcript.recorded_tool(call, Some(result));
-        }
+        self.transcript.tool_result(call, result);
         self.back = 0;
     }
 
@@ -117,9 +107,7 @@ impl ForkChat {
                 }
             }
         }
-        self.transcript.abandon_running();
-        self.transcript.seal();
-        self.transcript.restamp();
+        self.transcript.end_replay();
         self.back = 0;
     }
 
@@ -203,17 +191,12 @@ impl ForkChat {
         )));
         // Chat rows.
         let mut rows: Vec<Line<'static>> = vec![];
-        let n = self.transcript.entries.len();
+        let n = self.transcript.len();
         for i in 0..n {
             if i > 0 && self.transcript.gap_before(i) {
                 rows.push(Line::default());
             }
-            rows.extend(
-                self.transcript.entries[i]
-                    .render(inner_w, tick)
-                    .lines
-                    .clone(),
-            );
+            rows.extend(self.transcript[i].render(inner_w, tick).lines.clone());
         }
         if rows.is_empty() {
             rows.push(Line::from(Span::styled(
@@ -347,9 +330,8 @@ mod tests {
             chat.tool(call(), result());
             let tools = chat
                 .transcript
-                .entries
-                .iter()
-                .filter_map(|e| match &e.kind {
+                .kinds()
+                .filter_map(|k| match k {
                     Kind::Tool(t) => Some(t),
                     _ => None,
                 })
@@ -372,9 +354,8 @@ mod tests {
         }]);
         assert!(
             chat.transcript
-                .entries
-                .iter()
-                .any(|e| matches!(&e.kind, Kind::Tool(t) if t.args["path"] == "a.rs"))
+                .kinds()
+                .any(|k| matches!(k, Kind::Tool(t) if t.args["path"] == "a.rs"))
         );
         chat.load(vec![ForkChatMessage {
             role: "tool".into(),
@@ -383,6 +364,6 @@ mod tests {
             tool_call: None,
             tool_result: None,
         }]);
-        assert!(chat.transcript.entries.is_empty());
+        assert_eq!(chat.transcript.len(), 0);
     }
 }
