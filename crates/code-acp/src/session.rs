@@ -4,13 +4,14 @@
 
 use crate::mapping::{self, clip, text_block, text_content};
 use crate::rpc::{Out, RpcError, conforms};
+use crate::view::View;
 use code_config::{ConfigStore, Modality, PermissionMode};
 use code_engine::Session;
 use code_engine::schema::{
     ApprovalDecision, ApprovalRequest, EngineEvent, HistoryEvent, QuestionRecord, QuestionSpec,
 };
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -69,7 +70,7 @@ pub struct AcpSession {
     /// The id the client uses. After a `session/load` fork it names the source
     /// session while `session` is the fork.
     pub acp_id: String,
-    pub session: Session,
+    session: Session,
     pub store: ConfigStore,
     pub out: Arc<Out>,
     caps: ClientCaps,
@@ -374,6 +375,70 @@ impl AcpSession {
     pub fn cancel(&self) {
         self.cancel_pending(true);
     }
+    /// Stops the engine session tree and releases its lock.
+    pub async fn shutdown(&self) -> Result<(), code_engine::schema::EngineError> {
+        self.session.shutdown().await
+    }
+
+    /// Replays the stored transcript to the client as `session/update`s.
+    pub fn replay(&self) {
+        crate::replay::replay(&self.out, &self.acp_id, &self.session);
+    }
+
+    /// `_meta` of an open result: the engine session behind `acp_id`, and
+    /// the source when it is a fork.
+    pub fn open_meta(&self) -> Value {
+        let engine_id = self.session.id();
+        json!({"cockpitCode": {
+            "engineSessionId": engine_id,
+            "forkedFrom": (engine_id != self.acp_id).then_some(&self.acp_id),
+        }})
+    }
+
+    /// The skills available as slash commands.
+    pub fn skills(
+        &self,
+    ) -> Result<Vec<code_engine::context::Skill>, code_engine::schema::EngineError> {
+        self.session.skills()
+    }
+
+    /// The message a `/name args` prompt (`command` without the slash) sends
+    /// when `name` is a skill, always for an explicit `skill:` prefix; None
+    /// when it is not a skill.
+    pub fn skill_prompt(
+        &self,
+        command: &str,
+    ) -> Result<Option<String>, code_engine::schema::EngineError> {
+        let (name, args) = command
+            .split_once(char::is_whitespace)
+            .unwrap_or((command, ""));
+        let explicit = name.starts_with("skill:");
+        let skill_name = name.strip_prefix("skill:").unwrap_or(name);
+        if explicit
+            || self
+                .session
+                .skills()?
+                .iter()
+                .any(|skill| skill.name == skill_name)
+        {
+            self.session
+                .skill_message(skill_name, args.trim())
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Imports prompt content bytes as an attachment of this session.
+    pub fn attach(
+        &self,
+        name: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<code_engine::schema::Attachment, code_engine::schema::EngineError> {
+        self.session.attach_bytes(name, mime_type, bytes)
+    }
+
     pub(crate) fn prepare_close(&self) {
         self.cancel_pending(self.session.is_active());
     }
@@ -1009,7 +1074,7 @@ impl AcpSession {
             // Approval and review events are emitted directly while ToolStart
             // is relayed, so a root approval can arrive before its call: it
             // waits briefly for the call, then gets a call of its own.
-            let deadline = view.deferred.first().map(|(_, at)| *at);
+            let deadline = view.deferred_deadline();
             let event = tokio::select! {
                 e = rx.recv() => e,
                 _ = idle_timer.tick() => {
@@ -1022,7 +1087,7 @@ impl AcpSession {
                 }
                 _ = self.stop.notified() => break,
                 _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
-                    for (request, _) in std::mem::take(&mut view.deferred) {
+                    for request in view.take_deferred() {
                         self.approve(request, None, cwd.clone());
                     }
                     continue;
@@ -1151,9 +1216,7 @@ impl AcpSession {
                 format!("Discovery refreshed: {}", errors.join("; "))
             }),
             EngineEvent::GoalUpdate { state } => {
-                let phase = (state.disposition.clone(), state.phase.clone());
-                if v.goal_phase.as_ref() != Some(&phase) {
-                    v.goal_phase = Some(phase);
+                if v.goal_phase_changed(&state.disposition, &state.phase) {
                     self.plan(v);
                 }
             }
@@ -1202,24 +1265,7 @@ impl AcpSession {
                         "locations": mapping::locations(&call.name, &call.arguments, cwd),
                     }),
                 );
-                v.inflight.push(call.id.clone());
-                let view = CallView {
-                    base,
-                    notes: v.early_notes.remove(&call.id).unwrap_or_default(),
-                    output: None,
-                };
-                if !view.notes.is_empty() {
-                    out.update(
-                        sid,
-                        json!({"sessionUpdate": "tool_call_update", "toolCallId": call.id, "content": view.content()}),
-                    );
-                }
-                let (matched, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut v.deferred)
-                    .into_iter()
-                    .partition(|(r, _)| r.call_id == call.id);
-                v.deferred = rest;
-                v.calls.insert(call.id.clone(), view);
-                for (request, _) in matched {
+                for request in v.tool_started(out, sid, &call.id, base) {
                     self.approve(request, Some(call.id.clone()), cwd.to_path_buf());
                 }
             }
@@ -1234,24 +1280,22 @@ impl AcpSession {
                 if state.approving.contains(&id) {
                     state.terminal_calls.insert(id.clone());
                 }
-                v.inflight.retain(|c| *c != id);
-                let Some(call) = v.calls.get_mut(&id) else {
+                // A finished child's report replaces its progress lines.
+                let Some(content) = v.finished(
+                    &id,
+                    mapping::end_text(&name, &output, is_error),
+                    name == "task",
+                ) else {
                     return;
                 };
-                call.output = mapping::end_text(&name, &output, is_error);
                 let mut update = json!({
                     "sessionUpdate": "tool_call_update", "toolCallId": id,
                     "status": if is_error { "failed" } else { "completed" },
-                    "content": call.content(),
+                    "content": content,
                     "rawOutput": {"output": clip(&output, 16 * 1024), "isError": is_error, "details": details},
                 });
                 if !details.edits.is_empty() {
                     update["locations"] = json!(mapping::edit_locations(&details));
-                }
-                if name == "task" {
-                    // A finished child's report replaces its progress lines.
-                    call.notes.clear();
-                    update["content"] = json!(call.content());
                 }
                 out.update(sid, update);
             }
@@ -1272,20 +1316,7 @@ impl AcpSession {
                         reason.as_deref().unwrap_or("")
                     )
                 };
-                let review = |notes: &mut Vec<String>| {
-                    notes.retain(|n| !n.starts_with("Reviewing with "));
-                    notes.push(note);
-                };
-                match v.calls.get_mut(&call_id) {
-                    None => review(v.early_notes.entry(call_id).or_default()),
-                    Some(call) => {
-                        review(&mut call.notes);
-                        out.update(
-                        sid,
-                        json!({"sessionUpdate": "tool_call_update", "toolCallId": call_id, "content": call.content()}),
-                    );
-                    }
-                }
+                v.review(out, sid, call_id, note);
             }
             EngineEvent::ScriptCall {
                 call,
@@ -1303,28 +1334,31 @@ impl AcpSession {
                     if state.approving.contains(&call.id) {
                         state.terminal_calls.insert(call.id.clone());
                     }
-                    v.inflight.retain(|id| id != &call.id);
-                    if let Some(view) = v.calls.get_mut(&call.id) {
-                        view.output =
-                            mapping::end_text(&call.name, &result.output, result.is_error);
+                    if let Some(content) = v.finished(
+                        &call.id,
+                        mapping::end_text(&call.name, &result.output, result.is_error),
+                        false,
+                    ) {
                         out.update(
                             sid,
                             json!({"sessionUpdate":"tool_call_update", "toolCallId":call.id,
                             "status":if result.is_error {"failed"} else {"completed"},
-                            "content":view.content(), "rawOutput":result,
+                            "content":content, "rawOutput":result,
                             "locations":mapping::edit_locations(&result.details)}),
                         );
                     }
-                    if let Some(parent) = parent_call_id
-                        && let Some(view) = v.calls.get_mut(&parent)
-                    {
-                        view.note(format!(
-                            "{} {}({})",
-                            if result.is_error { "✗" } else { "✓" },
-                            call.name,
-                            clip(&args_summary, 120)
-                        ));
-                        out.update(sid,json!({"sessionUpdate":"tool_call_update", "toolCallId":parent,"content":view.content()}));
+                    if let Some(parent) = parent_call_id {
+                        v.note(
+                            out,
+                            sid,
+                            &parent,
+                            format!(
+                                "{} {}({})",
+                                if result.is_error { "✗" } else { "✓" },
+                                call.name,
+                                clip(&args_summary, 120)
+                            ),
+                        );
                     }
                 } else {
                     let base = mapping::start_content(&call.name, &call.arguments, cwd, None);
@@ -1333,15 +1367,7 @@ impl AcpSession {
                         "kind":mapping::tool_kind_with_args(&call.name,&call.arguments),"status":"in_progress", "content":base,
                         "rawInput":call.arguments,"locations":mapping::locations(&call.name,&call.arguments,cwd),
                         "_meta":{"cockpit-code":{"parentCallId":parent_call_id,"jobId":job_id}}}));
-                    v.inflight.push(call.id.clone());
-                    v.calls.insert(
-                        call.id,
-                        CallView {
-                            base,
-                            notes: vec![],
-                            output: None,
-                        },
-                    );
+                    v.script_call_started(call.id, base);
                 }
             }
             EngineEvent::Committed { envelope } => match envelope.event {
@@ -1370,11 +1396,10 @@ impl AcpSession {
             EngineEvent::ApprovalRequest { request } => {
                 let call = (request.agent_id == "root")
                     .then(|| request.call_id.clone())
-                    .filter(|id| v.calls.contains_key(id));
+                    .filter(|id| v.has_call(id));
                 if call.is_none() && request.agent_id == "root" && request.parent_call_id.is_none()
                 {
-                    let at = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-                    v.deferred.push((request, at));
+                    v.defer(request);
                 } else {
                     self.approve(request, call, cwd.to_path_buf());
                 }
@@ -1384,7 +1409,7 @@ impl AcpSession {
                     let call = (question.asker == "root")
                         .then(|| question.call_id.clone())
                         .flatten()
-                        .filter(|c| v.calls.contains_key(c));
+                        .filter(|c| v.has_call(c));
                     self.ask(question, call);
                 }
             }
@@ -1420,14 +1445,8 @@ impl AcpSession {
             }
             EngineEvent::TurnEnd { stop_reason } => self.turn_ended(&stop_reason),
             EngineEvent::AgentMessage { from, to, text, .. } if to == "root" && from != "jobs" => {
-                if let Some(task) = v.child_task.get(&from).cloned() {
-                    v.child_note(
-                        out,
-                        sid,
-                        &task,
-                        format!("{from} → root: {}", clip(&text, 200)),
-                    );
-                }
+                let line = format!("{from} → root: {}", clip(&text, 200));
+                v.agent_note(out, sid, &from, line);
             }
             EngineEvent::Job { job } if job.owner == "root" && !job.running() => {
                 self.message(&format!(
@@ -1561,208 +1580,6 @@ fn matches_goal_draft(goal_id: Option<&str>, current: Option<&code_engine::GoalR
     current.is_some_and(|goal| {
         Some(goal.id.as_str()) == goal_id && goal.phase == "draft" && goal.disposition == "paused"
     })
-}
-
-struct CallView {
-    base: Vec<Value>,
-    notes: Vec<String>,
-    output: Option<String>,
-}
-
-impl CallView {
-    fn note(&mut self, line: String) {
-        self.notes.push(line);
-        if self.notes.len() > 12 {
-            self.notes.remove(0);
-        }
-    }
-    fn content(&self) -> Vec<Value> {
-        let mut c = self.base.clone();
-        if !self.notes.is_empty() {
-            c.push(text_content(&self.notes.join("\n")));
-        }
-        if let Some(o) = &self.output {
-            c.push(text_content(o));
-        }
-        c
-    }
-}
-
-#[derive(Default)]
-struct View {
-    goal_phase: Option<(String, String)>,
-    calls: HashMap<String, CallView>,
-    /// Root calls started and not yet ended, oldest first.
-    inflight: Vec<String>,
-    /// Every subagent to the root `task` call that (transitively) spawned it.
-    child_task: HashMap<String, String>,
-    status: HashMap<String, String>,
-    /// Review notes for calls whose ToolStart has not arrived yet.
-    early_notes: HashMap<String, Vec<String>>,
-    /// Root approvals waiting for their ToolStart, with a deadline.
-    deferred: Vec<(ApprovalRequest, tokio::time::Instant)>,
-}
-
-impl View {
-    fn child_note(&mut self, out: &Out, sid: &str, task: &str, line: String) {
-        if let Some(call) = self.calls.get_mut(task) {
-            call.note(line);
-            out.update(
-                sid,
-                json!({"sessionUpdate": "tool_call_update", "toolCallId": task, "content": call.content()}),
-            );
-        }
-    }
-
-    /// Subagent activity, summarised under its root `task` call: start,
-    /// status changes, tool titles, failures and the final report. Child
-    /// text and reasoning streams are not forwarded.
-    fn child(&mut self, out: &Out, sid: &str, agent: Option<(&str, &str)>, event: EngineEvent) {
-        let task_of = |v: &Self, id: &str| v.child_task.get(id).cloned();
-        match event {
-            EngineEvent::AgentStarted {
-                agent: record,
-                execution,
-                breadcrumb,
-                task_call_id,
-            } => {
-                let parent = record.parent_id.clone().unwrap_or_else(|| "root".into());
-                let task = if parent == "root" {
-                    task_call_id
-                } else {
-                    task_of(self, &parent)
-                };
-                let Some(task) = task else { return };
-                self.child_task
-                    .insert(record.agent_id.clone(), task.clone());
-                let line = format!(
-                    "▸ {breadcrumb} started ({}{}){}",
-                    record.model.as_deref().unwrap_or("default model"),
-                    if execution.background {
-                        ", background"
-                    } else {
-                        ""
-                    },
-                    if parent == "root" {
-                        String::new()
-                    } else {
-                        format!(
-                            ": {}",
-                            clip(execution.task.lines().next().unwrap_or(""), 80)
-                        )
-                    }
-                );
-                self.child_note(out, sid, &task, line);
-            }
-            EngineEvent::AgentStatus {
-                agent_id,
-                status,
-                breadcrumb,
-                ..
-            } => {
-                if agent_id == "root" || self.status.get(&agent_id) == Some(&status) {
-                    return;
-                }
-                self.status.insert(agent_id.clone(), status.clone());
-                if let Some(task) = task_of(self, &agent_id) {
-                    let shown = match status.strip_prefix("queued:") {
-                        Some(n) => format!("queued ({n})"),
-                        None => status,
-                    };
-                    self.child_note(out, sid, &task, format!("{breadcrumb}: {shown}"));
-                }
-            }
-            EngineEvent::AgentFinished {
-                agent_id,
-                status,
-                report,
-                breadcrumb,
-                ..
-            } => {
-                if let Some(task) = task_of(self, &agent_id) {
-                    let line = format!(
-                        "■ {breadcrumb} {status}: {}",
-                        clip(report.trim().lines().next().unwrap_or(""), 200)
-                    );
-                    self.child_note(out, sid, &task, line);
-                }
-            }
-            EngineEvent::AgentEvent {
-                agent_id,
-                breadcrumb,
-                event,
-            } => self.child(out, sid, Some((&agent_id, &breadcrumb)), *event),
-            EngineEvent::Context { meter } if agent.is_some() => {
-                let (id, breadcrumb) = agent.unwrap();
-                if let Some(task) = task_of(self, id) {
-                    // A child's context belongs to its task, never to the
-                    // session-wide usage_update meter owned by the root.
-                    out.update(
-                        sid,
-                        json!({
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": task,
-                            "_meta": {"cockpit-code": {"contextMeter": {
-                                "agentId": id, "breadcrumb": breadcrumb, "meter": meter
-                            }}}
-                        }),
-                    );
-                }
-            }
-            EngineEvent::ToolStart { call } if agent.is_some() => {
-                let (id, crumb) = agent.unwrap();
-                if let Some(task) = task_of(self, id) {
-                    let line = format!(
-                        "{crumb} › {}",
-                        mapping::tool_title(&call.name, &call.arguments, None)
-                    );
-                    self.child_note(out, sid, &task, line);
-                }
-            }
-            EngineEvent::ToolEnd {
-                name,
-                is_error: true,
-                output,
-                ..
-            } if agent.is_some() => {
-                let (id, crumb) = agent.unwrap();
-                if let Some(task) = task_of(self, id) {
-                    let line = format!(
-                        "{crumb} ✗ {name}: {}",
-                        clip(output.lines().next().unwrap_or(""), 120)
-                    );
-                    self.child_note(out, sid, &task, line);
-                }
-            }
-            EngineEvent::SafetyReview {
-                phase,
-                verdict,
-                model,
-                ..
-            } if agent.is_some() && phase != "started" => {
-                let (id, crumb) = agent.unwrap();
-                if let Some(task) = task_of(self, id) {
-                    let line = format!(
-                        "{crumb} safety review ({model}): {}",
-                        verdict.as_deref().unwrap_or("error")
-                    );
-                    self.child_note(out, sid, &task, line);
-                }
-            }
-            EngineEvent::Error { error } if agent.is_some() => {
-                let (id, crumb) = agent.unwrap();
-                if let Some(task) = task_of(self, id) {
-                    self.child_note(
-                        out,
-                        sid,
-                        &task,
-                        format!("{crumb} error: {}", clip(&error.message, 200)),
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
