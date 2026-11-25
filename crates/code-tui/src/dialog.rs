@@ -96,7 +96,7 @@ pub enum Outcome {
 }
 
 pub struct Dialog {
-    pub title: String,
+    title: String,
     pub body: Body,
     pub options: Vec<DialogOption>,
     pub selected: usize,
@@ -126,6 +126,19 @@ pub struct Dialog {
     nudged: bool,
 }
 
+/// `title` becomes `first` (taken from `title` while empty) and how many
+/// prompts wait behind it.
+pub(crate) fn retitle(title: &mut String, first: &mut String, waiting: usize) {
+    if first.is_empty() {
+        *first = title.clone();
+    }
+    *title = if waiting > 0 {
+        format!("{first} · {waiting} more waiting")
+    } else {
+        first.clone()
+    };
+}
+
 /// The pause that ends a typing burst which ran into a new dialog.
 const TYPE_AHEAD: Duration = Duration::from_millis(400);
 
@@ -147,6 +160,18 @@ impl Dialog {
             guard: Instant::now() + TYPE_AHEAD,
             armed: true,
             nudged: false,
+        }
+    }
+    /// A prompt dialog's title says how many prompts wait behind it.
+    /// `first` keeps the prompt's own title across renders (the caller
+    /// clears it for a new prompt; empty: this dialog's title).
+    pub fn show_waiting(&mut self, first: &mut String, waiting: usize) {
+        retitle(&mut self.title, first, waiting);
+    }
+    /// A paste goes into the text field (one line).
+    pub fn paste(&mut self, text: &str) {
+        if let Some((_, buf)) = &mut self.text {
+            buf.insert(&text.replace('\n', " "));
         }
     }
     /// Typing keys (hotkeys, Enter) work only after an explicit focus step:

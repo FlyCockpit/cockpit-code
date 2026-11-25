@@ -218,7 +218,7 @@ impl App {
         let all = self
             .engine
             .agent_rows(agent_filters(None, None, None, None, ""));
-        let mut models: Vec<String> = all
+        let models: Vec<String> = all
             .as_ref()
             .map(|rows| {
                 rows.iter()
@@ -226,9 +226,7 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        models.sort();
-        models.dedup();
-        v.models = models;
+        v.models_seen(models);
         let (state, context, subtree, model, query) = v.filters();
         let rows = self
             .engine
@@ -373,8 +371,7 @@ impl App {
                     result,
                 } => {
                     if let Overlay::Agents(v) = &mut self.overlay {
-                        v.asking = None;
-                        v.answer = Some((id, question, result));
+                        v.answered(id, question, result);
                     } else if let Err(e) = result {
                         self.hint(format!("ask {}: {e}", self.tree.label(&id)));
                     } else {
@@ -596,8 +593,7 @@ impl App {
                 let q = text.unwrap_or_else(|| STATUS_QUESTION.into());
                 self.engine.ask_agent(&agent, &q, self.agent_done.0.clone());
                 if let Some(Overlay::Agents(v)) = &mut self.overlay_back {
-                    v.asking = Some(agent.clone());
-                    v.select(&agent);
+                    v.asking(&agent);
                 }
                 self.hint(format!("asking {}…", self.tree.label(&agent)));
             }
@@ -635,12 +631,9 @@ impl App {
                             .find(|d| d.id == did)
                             .map(|d| d.agent)
                             .unwrap_or_else(|| "root".into());
-                        let mut chat = crate::forkchat::ForkChat::with_summary(
-                            self.tree.label(&agent),
-                            vec![],
-                        );
-                        chat.side = true;
-                        chat.fork = Some(fork);
+                        let mut chat =
+                            crate::forkchat::ForkChat::side_chat(self.tree.label(&agent));
+                        chat.connect(Ok(fork));
                         self.overlay_back = None;
                         self.overlay = Overlay::ForkChat(Box::new(chat));
                         return;

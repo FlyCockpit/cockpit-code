@@ -72,8 +72,8 @@ enum Row {
 }
 
 pub struct QDialog {
-    pub title: String,
-    pub calls: Vec<Call>,
+    title: String,
+    calls: Vec<Call>,
     /// The call of each item.
     item_call: Vec<usize>,
     pub items: Vec<QItem>,
@@ -122,6 +122,19 @@ impl QDialog {
 
     pub fn has_call(&self, id: &str) -> bool {
         self.calls.iter().any(|c| c.id == id)
+    }
+
+    /// The ids of the calls this dialog answers.
+    pub fn call_ids(&self) -> Vec<String> {
+        self.calls.iter().map(|c| c.id.clone()).collect()
+    }
+
+    /// The title says how many prompts wait behind this dialog; `prompts`
+    /// counts every waiting prompt, these calls among them. `first` as
+    /// for [`crate::dialog::Dialog::show_waiting`].
+    pub fn show_waiting(&mut self, first: &mut String, prompts: usize) {
+        let waiting = prompts.saturating_sub(self.calls.len());
+        crate::dialog::retitle(&mut self.title, first, waiting);
     }
 
     fn call(&self) -> &Call {

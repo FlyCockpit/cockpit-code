@@ -513,9 +513,9 @@ pub struct CriteriaView {
     pub contract: ContractView,
     /// The goal's one-line state, for root under `/goal`.
     /// The goal marker line and its status-line style.
-    pub goal_line: Option<(String, Style)>,
+    goal_line: Option<(String, Style)>,
     /// `e` edits (root with an editable goal).
-    pub editable: bool,
+    editable: bool,
     /// Selected criterion (index into `ids`).
     sel: usize,
     ids: Vec<String>,
@@ -548,6 +548,16 @@ impl CriteriaView {
         };
         v.set_contract(contract);
         v
+    }
+    /// Root's goal heads the view (`head` gives its marker line and
+    /// style); `e` edits it when the goal allows.
+    pub fn show_goal(
+        &mut self,
+        goal: Option<&crate::engine::GoalView>,
+        head: impl Fn(&crate::engine::GoalView) -> (String, Style),
+    ) {
+        self.goal_line = goal.map(head);
+        self.editable = goal.is_some_and(|g| g.editable());
     }
     /// A live update: the selection stays on its criterion.
     pub fn set_contract(&mut self, contract: ContractView) {
@@ -901,7 +911,7 @@ pub struct ContractEditor {
     editing: Option<(Field, TextBuf)>,
     /// A just-added item: dropped again when its first edit is cancelled.
     added: bool,
-    pub message: Option<String>,
+    message: Option<String>,
     top: usize,
     view: usize,
     len: usize,
@@ -912,7 +922,14 @@ pub struct ContractEditor {
 }
 
 impl ContractEditor {
-    pub fn new(title: impl Into<String>, verb: &'static str, draft: ContractDraft) -> Self {
+    /// `message` shows under the form until the next key (why it opened
+    /// again: an editor or save error).
+    pub fn new(
+        title: impl Into<String>,
+        verb: &'static str,
+        draft: ContractDraft,
+        message: Option<String>,
+    ) -> Self {
         Self {
             title: title.into(),
             verb,
@@ -921,7 +938,7 @@ impl ContractEditor {
             sel: 0,
             editing: None,
             added: false,
-            message: None,
+            message,
             top: 0,
             view: 1,
             len: 0,

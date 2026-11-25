@@ -67,18 +67,9 @@ pub fn render_md(src: &str, width: usize, buttons: bool) -> Md {
         ..Emitter::default()
     };
     for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
-        if let Event::Start(Tag::Table(_)) = &event {
-            emitter.tables.push(range);
-        }
-        emitter.handle(event);
+        emitter.handle_at(event, range);
     }
-    let tables = std::mem::take(&mut emitter.tables);
-    let codes = std::mem::take(&mut emitter.codes);
-    Md {
-        rows: emitter.finish(),
-        codes,
-        tables,
-    }
+    emitter.finish()
 }
 
 /// For each list in document order, the display width of its largest
@@ -222,6 +213,14 @@ struct TableRow {
 }
 
 impl Emitter {
+    /// `event` at source `range` (a table's range backs its copy button).
+    fn handle_at(&mut self, event: Event, range: std::ops::Range<usize>) {
+        if let Event::Start(Tag::Table(_)) = &event {
+            self.tables.push(range);
+        }
+        self.handle(event);
+    }
+
     fn handle(&mut self, event: Event) {
         match event {
             Event::Start(tag) => self.start(tag),
@@ -749,12 +748,18 @@ impl Emitter {
         }
     }
 
-    fn finish(mut self) -> Vec<Row> {
+    fn finish(mut self) -> Md {
+        let tables = std::mem::take(&mut self.tables);
+        let codes = std::mem::take(&mut self.codes);
         self.flush_line();
         while matches!(self.lines.last(), Some((l, _)) if l.spans.is_empty()) {
             self.lines.pop();
         }
-        self.lines
+        Md {
+            rows: self.lines,
+            codes,
+            tables,
+        }
     }
 }
 

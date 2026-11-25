@@ -18,21 +18,25 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 pub enum Action {
     None,
     Close,
-    Send(String),
+    /// Send `text` to the fork (`None`: the chat is not connected).
+    Send {
+        fork: Option<String>,
+        text: String,
+    },
 }
 
 pub struct ForkChat {
     pub asker: String,
     /// A `/btw` side chat: no question, never closes by itself.
-    pub side: bool,
+    side: bool,
     /// The fork's live status (`queued:N`, `running`; empty when idle).
-    pub status: String,
+    status: String,
     /// The fork answered (or the question was answered): a read-only record.
-    pub closed: bool,
+    closed: bool,
     /// The questions, one line each.
     pub summary: Vec<String>,
     /// The engine's fork id once open.
-    pub fork: Option<String>,
+    fork: Option<String>,
     pub transcript: Transcript,
     pub input: TextBuf,
     /// Rows scrolled up from the bottom.
@@ -61,6 +65,92 @@ impl ForkChat {
             transcript: Transcript::default(),
             input: TextBuf::default(),
             back: 0,
+        }
+    }
+
+    /// A `/btw` side chat of `asker`.
+    pub fn side_chat(asker: String) -> Self {
+        Self {
+            side: true,
+            ..Self::with_summary(asker, vec![])
+        }
+    }
+
+    /// A fork reopened from its "answered via fork" row: a read-only record.
+    pub fn reopened(asker: String, summary: Vec<String>) -> Self {
+        Self {
+            closed: true,
+            ..Self::with_summary(asker, summary)
+        }
+    }
+
+    /// The engine opened the chat's fork, or failed to (the error shows).
+    pub fn connect(&mut self, opened: Result<String, String>) {
+        match opened {
+            Ok(fork) => self.fork = Some(fork),
+            Err(e) => self.notice(Level::Error, e),
+        }
+    }
+
+    /// Whether this chat shows the engine's fork `fork`.
+    pub fn shows(&self, fork: &str) -> bool {
+        self.fork.as_deref() == Some(fork)
+    }
+
+    /// A live event of the fork (`kind` as the engine names it). True
+    /// when it closed the chat just now (the fork answered).
+    pub fn event(
+        &mut self,
+        kind: &str,
+        text: String,
+        messages: Vec<ForkChatMessage>,
+        call: Option<ToolCall>,
+        result: Option<ToolResultData>,
+    ) -> bool {
+        match kind {
+            "opened" => self.load(messages),
+            "tool_start" => self.tool_start(call),
+            "tool" => {
+                if let (Some(call), Some(result)) = (call, result) {
+                    self.tool(call, result);
+                }
+            }
+            "user" | "assistant" => self.message(kind, text),
+            "status" => self.status = text,
+            "idle" => self.status.clear(),
+            "error" => {
+                self.status.clear();
+                self.notice(Level::Error, text);
+            }
+            "closed" => {
+                let reopened = self.closed;
+                self.status.clear();
+                self.closed = true;
+                return !reopened;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Pasted text goes into the input.
+    pub fn paste(&mut self, text: &str) {
+        self.input.insert(text);
+    }
+
+    /// The engine did not take `text`: it goes back into the input, with
+    /// the error.
+    pub fn send_failed(&mut self, text: &str, error: String) {
+        self.input.insert(text);
+        self.notice(Level::Error, error);
+    }
+
+    /// What the hint says when the user closes the chat.
+    pub fn close_hint(&self) -> &'static str {
+        if self.side {
+            "side chat closed · /btw reopens it"
+        } else {
+            "fork chat closed · the question stays pending · /answer"
         }
     }
 
@@ -128,7 +218,10 @@ impl ForkChat {
                 let text = self.input.take_text();
                 if !text.trim().is_empty() {
                     self.back = 0;
-                    return Action::Send(text);
+                    return Action::Send {
+                        fork: self.fork.clone(),
+                        text,
+                    };
                 }
             }
             KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),

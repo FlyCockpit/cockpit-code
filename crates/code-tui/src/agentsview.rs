@@ -76,7 +76,7 @@ const ACT_STOP: u8 = 13;
 pub struct AgentsView {
     pub rows: Vec<AgentRow>,
     /// Models seen in the unfiltered tree (the model filter cycles them).
-    pub models: Vec<String>,
+    models: Vec<String>,
     state: usize,
     context: usize,
     /// Only this agent and its descendants.
@@ -91,9 +91,9 @@ pub struct AgentsView {
     view: usize,
     pinned: bool,
     /// The latest status answer: (agent, question, answer or error).
-    pub answer: Option<(String, String, Result<String, String>)>,
+    answer: Option<(String, String, Result<String, String>)>,
     /// An ask in flight: the agent.
-    pub asking: Option<String>,
+    asking: Option<String>,
     detail_top: usize,
 }
 
@@ -154,6 +154,28 @@ impl AgentsView {
                 .map(String::as_str),
             &self.query,
         )
+    }
+
+    /// The models seen in the unfiltered tree, in any order and repeated:
+    /// the model filter cycles them sorted, once each.
+    pub fn models_seen(&mut self, models: impl IntoIterator<Item = String>) {
+        let mut models: Vec<String> = models.into_iter().collect();
+        models.sort();
+        models.dedup();
+        self.models = models;
+    }
+
+    /// A status ask of `agent` went out: its row is selected and shows it
+    /// in flight.
+    pub fn asking(&mut self, agent: &str) {
+        self.asking = Some(agent.to_string());
+        self.select(agent);
+    }
+
+    /// The ask of `agent` finished: its row shows the answer (or error).
+    pub fn answered(&mut self, agent: String, question: String, result: Result<String, String>) {
+        self.asking = None;
+        self.answer = Some((agent, question, result));
     }
 
     /// New rows (already filtered by the engine), arranged as a tree.
@@ -811,8 +833,12 @@ impl AgentsView {
         );
     }
 
-    /// The detail pane's scrollbar or wheel.
-    pub fn set_detail_offset(&mut self, top: usize) {
-        self.detail_top = top;
+    /// A scrollbar or the wheel set the top row of pane `id` (the detail
+    /// pane is `OverlayList`, the rows the overlay's own).
+    pub fn set_scroll(&mut self, id: &ScrollId, top: usize) {
+        match id {
+            ScrollId::OverlayList => self.detail_top = top,
+            _ => self.set_offset(top),
+        }
     }
 }

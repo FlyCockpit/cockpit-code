@@ -108,7 +108,7 @@ fn status(cwd: &Path) -> Option<GitState> {
 /// The background refresher: at most one `git status` in flight.
 pub struct GitWatch {
     cwd: PathBuf,
-    pub state: Option<GitState>,
+    state: Option<GitState>,
     rx: Option<mpsc::Receiver<Option<GitState>>>,
     last: Option<Instant>,
     /// Not a repository (or no git): stop asking.
@@ -126,6 +126,12 @@ impl GitWatch {
             off: false,
             want: true,
         }
+    }
+
+    /// The status-line segment, once known: its label and whether the
+    /// tree is dirty.
+    pub fn label(&self) -> Option<(String, bool)> {
+        self.state.as_ref().map(|g| (g.label(), g.dirty()))
     }
 
     /// Ask for a refresh (after a turn or a file-changing tool).

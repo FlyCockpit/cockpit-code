@@ -116,8 +116,7 @@ impl App {
             };
             v.set_contract(contract);
             if v.agent == "root" {
-                v.goal_line = self.goal.as_ref().map(|g| (goal_line(g), goal_style(g)));
-                v.editable = self.goal.as_ref().is_some_and(|g| g.editable());
+                v.show_goal(self.goal.as_ref(), |g| (goal_line(g), goal_style(g)));
             }
         }
     }
@@ -578,11 +577,10 @@ impl App {
         draft: ContractDraft,
         message: Option<String>,
     ) {
-        let mut ed = ContractEditor::new(title, verb, draft);
+        let mut ed = ContractEditor::new(title, verb, draft, message);
         if matches!(purpose, EditPurpose::Pivot(_)) {
             ed = ed.without_steps();
         }
-        ed.message = message;
         self.overlay = Overlay::Contract(Box::new(ed), purpose);
     }
 
@@ -695,8 +693,7 @@ impl App {
         };
         let mut v = CriteriaView::new(agent.clone(), label, contract);
         if agent == "root" {
-            v.goal_line = self.goal.as_ref().map(|g| (goal_line(g), goal_style(g)));
-            v.editable = self.goal.as_ref().is_some_and(|g| g.editable());
+            v.show_goal(self.goal.as_ref(), |g| (goal_line(g), goal_style(g)));
         }
         self.overlay = Overlay::Criteria(Box::new(v));
     }
