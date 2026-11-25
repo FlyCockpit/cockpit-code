@@ -2,21 +2,11 @@
 //! subtree growth, finalize progress, stop and status-ask outcomes,
 //! the compaction suggestion, and the wake header.
 use super::App;
+use super::panels::finalize_plan_card;
 use crate::agents::Tree;
 use crate::engine::TreeRow;
 use crate::transcript::{Card, CardPart, Tone, Transcript};
 use crate::wrap::truncate;
-
-/// Live wrap-up progress of one `agents finalize` request.
-pub(super) struct Finalizing {
-    /// Who asked (its transcript holds the row).
-    pub caller: String,
-    pub target: String,
-    /// Deepest first, as the engine orders them.
-    pub agents: Vec<String>,
-    pub wrapping: Vec<String>,
-    pub done: Vec<String>,
-}
 
 fn first_line(text: &str, n: usize) -> String {
     truncate(
@@ -110,17 +100,7 @@ pub(super) fn tree_card(tree: &Tree, row: &TreeRow) -> Card {
                 body: vec![CardPart::Md(md)],
             }
         }
-        TreeRow::FinalizeRequested { target, agents } => finalize_card(
-            tree,
-            &Finalizing {
-                caller: String::new(),
-                target: target.clone(),
-                agents: agents.clone(),
-                wrapping: vec![],
-                done: vec![],
-            },
-            false,
-        ),
+        TreeRow::FinalizeRequested { target, agents } => finalize_plan_card(tree, target, agents),
         TreeRow::FinalTurn => Card {
             key: "final-turn".into(),
             icon: "◇".into(),
@@ -184,74 +164,6 @@ pub(super) fn tree_card(tree: &Tree, row: &TreeRow) -> Card {
     }
 }
 
-/// The finalize progress row: who is wrapping up, bottom-up.
-pub(super) fn finalize_card(tree: &Tree, f: &Finalizing, live: bool) -> Card {
-    let n = f.agents.len();
-    let done = f.done.len();
-    let wrapping: Vec<String> = f
-        .wrapping
-        .iter()
-        .filter(|a| !f.done.contains(a))
-        .map(|a| tree.label(a))
-        .collect();
-    let head = if !live {
-        format!(
-            "finalize {} · {n} agent{} wrap up, deepest first",
-            tree.label(&f.target),
-            if n == 1 { "" } else { "s" }
-        )
-    } else if done >= n && n == 1 {
-        format!(
-            "finalized {} · its final report is in",
-            tree.label(&f.target)
-        )
-    } else if done >= n && n > 0 {
-        format!("finalized {} · all {n} reported", tree.label(&f.target))
-    } else if wrapping.is_empty() {
-        format!(
-            "finalizing {} · {done}/{n} reported · waiting for in-flight calls",
-            tree.label(&f.target)
-        )
-    } else {
-        format!(
-            "finalizing {} · {done}/{n} reported · wrapping up: {}",
-            tree.label(&f.target),
-            wrapping.join(", ")
-        )
-    };
-    let mut md = String::from(
-        "Each agent finishes its current call, then gets one last turn with tools disabled to write its report; parents go after all their children reported.\n\n",
-    );
-    for a in &f.agents {
-        let state = if f.done.contains(a) {
-            "✓ reported"
-        } else if f.wrapping.contains(a) {
-            "◇ final turn"
-        } else if live {
-            "◌ waiting"
-        } else {
-            "·"
-        };
-        md.push_str(&format!("- {state} · **{}**\n", tree.label(a)));
-    }
-    Card {
-        key: format!("finalize:{}", f.target),
-        icon: if live && done >= n && n > 0 {
-            "✓"
-        } else {
-            "◇"
-        }
-        .into(),
-        tone: if live && done >= n && n > 0 {
-            Tone::Ok
-        } else {
-            Tone::Warn
-        },
-        head,
-        body: vec![CardPart::Md(md)],
-    }
-}
-
 /// The root compaction suggestion, once per crossing.
 pub(super) fn compact_card(pct: u64, used: u64, window: u64) -> Card {
     use crate::picker::fmt_tokens;
@@ -291,16 +203,7 @@ impl App {
                 }
             }
             TreeRow::FinalizeRequested { target, agents } => {
-                let f = Finalizing {
-                    caller: agent.clone(),
-                    target: target.clone(),
-                    agents: agents.clone(),
-                    wrapping: vec![],
-                    done: vec![],
-                };
-                let card = finalize_card(&self.tree, &f, true);
-                self.finalizing.retain(|x| x.target != *target);
-                self.finalizing.push(f);
+                let card = self.finalize_started(&agent, target, agents);
                 if let Some(tr) = self.transcript_of(&agent) {
                     tr.card(card);
                 }
@@ -311,20 +214,7 @@ impl App {
                 if let Some(tr) = self.transcript_of(&agent) {
                     tr.card(card);
                 }
-                let mut updates = vec![];
-                for f in &mut self.finalizing {
-                    if !f.agents.contains(&agent) {
-                        continue;
-                    }
-                    if !f.wrapping.contains(&agent) {
-                        f.wrapping.push(agent.clone());
-                    }
-                    if finished && !f.done.contains(&agent) {
-                        f.done.push(agent.clone());
-                    }
-                    updates.push((f.caller.clone(), finalize_card(&self.tree, f, true)));
-                }
-                for (caller, card) in updates {
+                for (caller, card) in self.finalize_progress(&agent, finished) {
                     if let Some(tr) = self.transcript_of(&caller) {
                         tr.card(card);
                     }

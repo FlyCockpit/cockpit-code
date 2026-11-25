@@ -18,7 +18,7 @@
 //! (who asked, prompt, share mode, status, the user's note).
 use super::*;
 use crate::engine::{TermCmd, TermInfo, TermMsg, TermRx, TermTx};
-use crate::termview::{TermSel, TermView, is_leave_key, key_bytes};
+use crate::termview::{TermView, is_leave_key, key_bytes};
 use crate::transcript::{Card, CardPart, Tone};
 use crate::ui::TermAct;
 use ratatui::text::Text;
@@ -52,8 +52,111 @@ enum TermDrag {
     },
 }
 
+/// One sidebar tab: the engine's metadata for the terminal, its screen,
+/// and what its close row will report.
+struct Tab {
+    info: TermInfo,
+    screen: TermView,
+    report: CloseReport,
+}
+
+/// What a metadata update changed (see `CloseReport::update`).
+struct InfoChange {
+    /// Output → status only (the caller drops the local selection).
+    downgraded: bool,
+    /// A running private shell exited by itself.
+    exited: bool,
+}
+
+/// What the close row of a terminal reports, gathered while it is open:
+/// who closed it, the last share mode and staged size, a downgrade, and
+/// a shell that exited by itself (the close hint follows shortly).
+struct CloseReport {
+    /// The user closed it from this UI (else: cancel, shutdown, exit).
+    by_user: bool,
+    /// The last share mode and staged size seen before close.
+    last_output: bool,
+    last_staged: usize,
+    /// The user downgraded output → status.
+    made_private: bool,
+    /// When the shell exited by itself.
+    exited_at: Option<Instant>,
+}
+
+impl CloseReport {
+    fn new(info: &TermInfo) -> Self {
+        Self {
+            by_user: false,
+            last_output: info.share_output,
+            last_staged: info.staged,
+            made_private: false,
+            exited_at: None,
+        }
+    }
+
+    /// The metadata changes from `prev` to `info` (not a private close,
+    /// which removes the tab).
+    fn update(&mut self, prev: &TermInfo, info: &TermInfo) -> InfoChange {
+        let downgraded = prev.share_output && !info.share_output && info.status != "closed";
+        if downgraded {
+            self.made_private = true;
+        }
+        if info.status != "closed" {
+            self.last_output = info.share_output;
+            self.last_staged = info.staged;
+        }
+        // (A close of a running shell reports exited just before closed.)
+        let exited =
+            info.user && !self.by_user && prev.status == "running" && info.status == "exited";
+        InfoChange { downgraded, exited }
+    }
+
+    /// Start the wait after an exit `update` reported, once its card and
+    /// focus are handled: a cancel or shutdown reports exited just before
+    /// closed, so the user is told only if it is still waiting a moment later.
+    fn exit_seen(&mut self) {
+        self.exited_at = Some(Instant::now());
+    }
+
+    /// The shell exited by itself a moment ago and the user was not told yet.
+    fn exit_due(&self) -> bool {
+        self.exited_at
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(400))
+    }
+
+    /// Take the exit notice: false when the user closed it meanwhile.
+    fn take_exit(&mut self) -> bool {
+        self.exited_at = None;
+        !self.by_user
+    }
+
+    /// The user asked to close it from this UI.
+    fn close_by_user(&mut self) {
+        self.by_user = true;
+    }
+
+    fn closed_by_user(&self) -> bool {
+        self.by_user
+    }
+
+    /// What the agent got at close.
+    fn shared(&self) -> String {
+        if !self.by_user {
+            "output not shared".to_string()
+        } else if self.last_staged > 0 {
+            format!("excerpt shared ({})", fmt_size(self.last_staged))
+        } else if self.last_output {
+            "output shared (tail)".to_string()
+        } else if self.made_private {
+            "output not shared (made private)".to_string()
+        } else {
+            "output not shared".to_string()
+        }
+    }
+}
+
 pub(super) struct Terms {
-    views: Vec<TermView>,
+    views: Vec<Tab>,
     active: usize,
     pub show: bool,
     pub focus: TermFocus,
@@ -153,15 +256,30 @@ fn fmt_size(n: usize) -> String {
 }
 
 impl App {
-    pub fn term_events(&mut self) -> &mut Option<TermRx> {
-        &mut self.terms.rx
+    /// Handle one more queued terminal message without waiting; false
+    /// when none is queued (or the channel closed).
+    pub fn next_term_msg(&mut self) -> bool {
+        let Some(rx) = &mut self.terms.rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(msg) => {
+                self.on_term_msg(Some(msg));
+                true
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+            Err(_) => {
+                self.on_term_msg(None);
+                false
+            }
+        }
     }
 
     /// A new or switched-to session: drop every view (purging private
     /// screens), subscribe, then pick up live terminals.
     pub(super) fn terms_reset(&mut self) {
         for v in &mut self.terms.views {
-            v.purge();
+            v.screen.purge();
         }
         let width = self.terms.width;
         self.terms = Terms {
@@ -196,36 +314,40 @@ impl App {
             self.term_remove(i);
         }
         let (rows, cols) = self.term_screen_size();
-        let mut view = TermView::new(info, rows, cols);
+        let mut view = Tab {
+            report: CloseReport::new(&info),
+            info,
+            screen: TermView::new(rows, cols),
+        };
         let id = view.info.id.clone();
         if view.info.user {
             if let Ok(s) = self.engine.terminal_snapshot(&id) {
-                view.reset(s.offset, &s.bytes, s.truncated);
+                view.screen.reset(s.offset, &s.bytes, s.truncated);
             }
         } else {
             Self::job_catch_up(&self.engine, &mut view, true);
         }
-        view.unread = false;
+        view.screen.seen();
         self.terms.views.push(view);
         self.terms.views.len() - 1
     }
 
     /// Fill a job view from its output log after a gap (or from the start,
     /// keeping at most the last 256 KiB).
-    fn job_catch_up(engine: &Engine, view: &mut TermView, fresh: bool) {
+    fn job_catch_up(engine: &Engine, view: &mut Tab, fresh: bool) {
         let id = view.info.id.clone();
-        let mut offset = view.next;
+        let mut offset = view.screen.next_offset();
         if fresh && let Ok(first) = engine.terminal_job_page(&id, 0) {
             let total = first.total;
             offset = total.saturating_sub(256 * 1024);
             if offset == 0 {
-                view.reset(0, &first.bytes, false);
+                view.screen.reset(0, &first.bytes, false);
                 offset = first.next;
                 if first.eof {
                     return;
                 }
             } else {
-                view.reset(offset, &[], true);
+                view.screen.reset(offset, &[], true);
             }
         }
         for _ in 0..64 {
@@ -235,8 +357,7 @@ impl App {
             if page.next <= offset {
                 return;
             }
-            view.feed(offset, &page.bytes);
-            view.next = page.next;
+            view.screen.feed_page(offset, &page.bytes, page.next);
             offset = page.next;
             if page.eof {
                 return;
@@ -246,7 +367,7 @@ impl App {
 
     fn term_remove(&mut self, i: usize) {
         let mut v = self.terms.views.remove(i);
-        v.purge();
+        v.screen.purge();
         drop(v);
         if self.terms.active >= i && self.terms.active > 0 {
             self.terms.active -= 1;
@@ -272,14 +393,14 @@ impl App {
                     // Unknown yet: the metadata's snapshot covers it.
                     return;
                 };
-                let ok = self.terms.views[i].feed(offset, &bytes);
+                let ok = self.terms.views[i].screen.feed(offset, &bytes);
                 drop(bytes);
                 if !ok {
                     self.term_resync(i);
                 }
                 if self.terms.visible() {
                     if i == self.terms.active {
-                        self.terms.views[i].unread = false;
+                        self.terms.views[i].screen.seen();
                     }
                     self.dirty = true;
                 }
@@ -303,9 +424,9 @@ impl App {
             }
             match self.engine.terminal_snapshot(&view.info.id) {
                 Ok(s) => {
-                    view.reset(s.offset, &s.bytes, true);
+                    view.screen.reset(s.offset, &s.bytes, true);
                 }
-                Err(_) => view.lost = true,
+                Err(_) => view.screen.mark_lost(),
             }
         } else {
             Self::job_catch_up(&self.engine, view, false);
@@ -323,54 +444,37 @@ impl App {
             }
             return self.term_opened(info);
         };
-        let prev = self.terms.views[i].info.clone();
         if info.user && info.status == "closed" {
             return self.term_closed(i, info);
         }
         let view = &mut self.terms.views[i];
-        // More private: drop the local selection (the engine revoked any
-        // staged excerpt).
-        let downgraded = prev.share_output && !info.share_output && info.status != "closed";
-        if downgraded {
-            view.sel = None;
-            view.made_private = true;
-            self.terms.kbd_sel = false;
-        }
-        if info.status != "closed" {
-            view.last_output = info.share_output;
-            view.last_staged = info.staged;
-        }
-        // (A close of a running shell reports exited just before closed.)
-        let exited =
-            info.user && !view.closing && prev.status == "running" && info.status == "exited";
+        let change = view.report.update(&view.info, &info);
         view.info = info;
-        if downgraded {
+        if change.downgraded {
+            // More private: drop the local selection (the engine revoked
+            // any staged excerpt).
+            view.screen.clear_selection();
+            self.terms.kbd_sel = false;
             let mut card = open_card(&view.info);
             card.head.push_str(" · made private by you");
             let agent = view.info.agent.clone();
             self.term_card(&agent, card);
         }
-        let view = &mut self.terms.views[i];
-        if exited {
+        if change.exited {
             if self.terms.focus == TermFocus::Typing && i == self.terms.active {
                 self.terms.focus = TermFocus::Panel;
             }
-            // A cancel or shutdown reports exited just before closed: tell
-            // the user only once it is still waiting a moment later.
-            view.exited_at = Some(Instant::now());
+            self.terms.views[i].report.exit_seen();
         }
     }
 
     /// Every tick: a shell that exited by itself waits for the user's close.
     pub(super) fn term_tick(&mut self) -> bool {
-        let Some(view) = self.terms.views.iter_mut().find(|v| {
-            v.exited_at
-                .is_some_and(|t| t.elapsed() > Duration::from_millis(400))
-        }) else {
+        let Some(view) = self.terms.views.iter_mut().find(|v| v.report.exit_due()) else {
             return false;
         };
-        view.exited_at = None;
-        if view.info.status != "exited" || view.closing {
+        let waiting = view.report.take_exit();
+        if view.info.status != "exited" || !waiting {
             return false;
         }
         let crumb = view.info.breadcrumb.clone();
@@ -424,19 +528,9 @@ impl App {
 
     fn term_closed(&mut self, i: usize, info: TermInfo) {
         let view = &self.terms.views[i];
-        let by_user = view.closing;
+        let by_user = view.report.closed_by_user();
         let note = self.terms.notes.remove(&info.id).flatten();
-        let shared = if !by_user {
-            "output not shared".to_string()
-        } else if view.last_staged > 0 {
-            format!("excerpt shared ({})", fmt_size(view.last_staged))
-        } else if view.last_output {
-            "output shared (tail)".to_string()
-        } else if view.made_private {
-            "output not shared (made private)".to_string()
-        } else {
-            "output not shared".to_string()
-        };
+        let shared = view.report.shared();
         let status = match info.exit {
             Some(code) => format!("exit {code}"),
             None if by_user => "closed".to_string(),
@@ -543,8 +637,8 @@ impl App {
                     self.terms.focus = TermFocus::Panel;
                     return true;
                 }
-                if let Some(bytes) = key_bytes(key, view.app_cursor()) {
-                    view.scroll_to(0);
+                if let Some(bytes) = key_bytes(key, view.screen.app_cursor()) {
+                    view.screen.scroll_to(0);
                     let chars = String::from_utf8_lossy(&bytes).into_owned();
                     let id = view.info.id.clone();
                     self.terms.send(TermCmd::Input(id, chars));
@@ -563,18 +657,9 @@ impl App {
         }
         if self.terms.kbd_sel {
             let view = &mut self.terms.views[self.terms.active];
-            let last = view.last_abs();
             match key.code {
                 KeyCode::Up | KeyCode::Down => {
-                    if let Some(s) = &mut view.sel {
-                        s.focus = if key.code == KeyCode::Up {
-                            s.focus.saturating_sub(1)
-                        } else {
-                            (s.focus + 1).min(last)
-                        };
-                        let f = s.focus;
-                        view.reveal(f);
-                    }
+                    view.screen.extend_selection(key.code == KeyCode::Up)
                 }
                 KeyCode::Enter | KeyCode::Char('s') => {
                     self.terms.kbd_sel = false;
@@ -582,7 +667,7 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.terms.kbd_sel = false;
-                    view.sel = None;
+                    view.screen.clear_selection();
                 }
                 _ => {}
             }
@@ -592,7 +677,7 @@ impl App {
         match key.code {
             _ if is_leave_key(&key) => self.terms.focus = TermFocus::None,
             KeyCode::Esc => {
-                if self.terms.views[self.terms.active].sel.take().is_none() {
+                if !self.terms.views[self.terms.active].screen.clear_selection() {
                     self.terms.focus = TermFocus::None;
                 }
             }
@@ -618,15 +703,10 @@ impl App {
                 let view = &mut self.terms.views[self.terms.active];
                 if !view.info.user {
                     self.hint("tty job output is already visible to the agent");
-                } else if view.sel.is_some() {
+                } else if view.screen.has_selection() {
                     self.term_act(TermAct::Share);
                 } else {
-                    let row = view.cursor_abs();
-                    view.sel = Some(TermSel {
-                        anchor: row,
-                        focus: row,
-                    });
-                    view.reveal(row);
+                    view.screen.select_cursor_row();
                     self.terms.kbd_sel = true;
                 }
             }
@@ -647,9 +727,9 @@ impl App {
                     KeyCode::Up => -1,
                     _ => 1,
                 };
-                self.terms.views[self.terms.active].scroll_by(delta);
+                self.terms.views[self.terms.active].screen.scroll_by(delta);
             }
-            KeyCode::End => self.terms.views[self.terms.active].scroll_to(0),
+            KeyCode::End => self.terms.views[self.terms.active].screen.scroll_to(0),
             _ => {}
         }
         true
@@ -659,7 +739,7 @@ impl App {
         if i < self.terms.views.len() {
             self.terms.active = i;
             self.terms.kbd_sel = false;
-            self.terms.views[i].unread = false;
+            self.terms.views[i].screen.seen();
         }
     }
 
@@ -673,7 +753,7 @@ impl App {
             return true;
         }
         let body = text.replace('\n', "\r");
-        let chars = if view.bracketed_paste() {
+        let chars = if view.screen.bracketed_paste() {
             format!("\x1b[200~{body}\x1b[201~")
         } else {
             body
@@ -713,7 +793,7 @@ impl App {
                 }
                 match self.engine.terminal_make_private(&id) {
                     Ok(()) => {
-                        self.terms.views[i].sel = None;
+                        self.terms.views[i].screen.clear_selection();
                         self.hint("status only: the agent gets the exit status and your note");
                     }
                     Err(e) => self.hint(e),
@@ -723,7 +803,7 @@ impl App {
                 if !user {
                     return;
                 }
-                let Some(text) = self.terms.views[i].selection_text() else {
+                let Some(text) = self.terms.views[i].screen.selection_text() else {
                     return self.hint("select rows first: drag over them, or s then ↑↓");
                 };
                 if text.len() > SHARE_CAP {
@@ -740,7 +820,7 @@ impl App {
                 }
                 match self.engine.terminal_stage(&id, None) {
                     Ok(()) => {
-                        self.terms.views[i].sel = None;
+                        self.terms.views[i].screen.clear_selection();
                         self.hint("excerpt revoked");
                     }
                     Err(e) => self.hint(e),
@@ -824,7 +904,7 @@ impl App {
         if note.as_ref().is_some_and(|n| n.len() > 8192) {
             return self.hint("the note is over 8 KiB");
         }
-        self.terms.views[i].closing = true;
+        self.terms.views[i].report.close_by_user();
         self.terms.notes.insert(id.to_string(), note.clone());
         self.terms.send(TermCmd::Close(id.to_string(), note));
         self.hint("closing the terminal…");
@@ -849,7 +929,7 @@ impl App {
                     if let TermDrag::Select { moved: false, .. } = drag
                         && let Some(v) = self.terms.views.get_mut(self.terms.active)
                     {
-                        v.sel = None;
+                        v.screen.clear_selection();
                     } else if let TermDrag::Select { .. } = drag {
                         self.terms.focus = TermFocus::Panel;
                         self.hint("s stages the selected rows for sharing · esc clears");
@@ -878,19 +958,19 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 let view = &mut self.terms.views[self.terms.active];
-                if in_body && view.alternate() && view.info.alive() {
+                if in_body && view.screen.alternate() && view.info.alive() {
                     // Full-screen programs (less, vim) scroll by arrow keys.
                     let key = KeyEvent::new(
                         if up { KeyCode::Up } else { KeyCode::Down },
                         KeyModifiers::NONE,
                     );
-                    if let Some(bytes) = key_bytes(key, view.app_cursor()) {
+                    if let Some(bytes) = key_bytes(key, view.screen.app_cursor()) {
                         let chars = String::from_utf8_lossy(&bytes).repeat(3);
                         let id = view.info.id.clone();
                         self.terms.send(TermCmd::Input(id, chars));
                     }
                 } else {
-                    view.scroll_by(if up { -3 } else { 3 });
+                    view.screen.scroll_by(if up { -3 } else { 3 });
                 }
                 true
             }
@@ -903,8 +983,8 @@ impl App {
                     Some(Target::Term(TermAct::Body)) => {
                         let row = y - b.y;
                         let view = &mut self.terms.views[self.terms.active];
-                        let abs = view.abs_row(row);
-                        view.sel = None;
+                        let abs = view.screen.abs_row(row);
+                        view.screen.clear_selection();
                         self.terms.kbd_sel = false;
                         self.terms.drag = Some(TermDrag::Select {
                             anchor: abs,
@@ -939,13 +1019,13 @@ impl App {
                 let view = &mut self.terms.views[self.terms.active];
                 // Past an edge the view scrolls along.
                 if y < b.y {
-                    view.scroll_by(-1);
+                    view.screen.scroll_by(-1);
                 } else if y >= b.bottom() {
-                    view.scroll_by(1);
+                    view.screen.scroll_by(1);
                 }
                 let row = y.clamp(b.y, b.bottom().saturating_sub(1)) - b.y;
-                let focus = view.abs_row(row);
-                view.sel = Some(TermSel { anchor, focus });
+                let focus = view.screen.abs_row(row);
+                view.screen.select(anchor, focus);
                 self.terms.drag = Some(TermDrag::Select {
                     anchor,
                     moved: true,
@@ -956,8 +1036,8 @@ impl App {
 
     pub(super) fn term_set_scroll(&mut self, off: usize) {
         if let Some(v) = self.terms.views.get_mut(self.terms.active) {
-            let (len, _) = v.scroll_state();
-            v.scroll_to(len.saturating_sub(off));
+            let (len, _) = v.screen.scroll_state();
+            v.screen.scroll_to(len.saturating_sub(off));
         }
     }
 
@@ -1103,7 +1183,7 @@ impl App {
                     .fg(t.surface)
                     .bg(if v.info.user { t.green } else { t.yellow })
                     .add_modifier(Modifier::BOLD)
-            } else if v.unread {
+            } else if v.screen.unread() {
                 Style::default().fg(t.ink).add_modifier(Modifier::BOLD)
             } else {
                 t.muted()
@@ -1281,7 +1361,7 @@ impl App {
             if info.share_output {
                 chips.push((" make private ", TermAct::Private));
             }
-            if view.sel.is_some() {
+            if view.screen.has_selection() {
                 chips.push((" share selection ", TermAct::Share));
             }
             if info.staged > 0 {
@@ -1370,17 +1450,18 @@ impl App {
         let typing = self.terms.focus == TermFocus::Typing;
         let tx = self.terms.tx.clone();
         let view = &mut self.terms.views[self.terms.active];
-        view.set_size(screen.height, screen.width);
+        view.screen.set_size(screen.height, screen.width);
         let want = (screen.width, screen.height);
-        if view.pty_size != Some(want) && view.info.alive() {
-            view.pty_size = Some(want);
-            if let Some(tx) = tx {
-                let _ = tx.send(TermCmd::Resize(view.info.id.clone(), want.0, want.1));
-            }
+        if view.info.alive()
+            && view.screen.resize_pty(want)
+            && let Some(tx) = tx
+        {
+            let _ = tx.send(TermCmd::Resize(view.info.id.clone(), want.0, want.1));
         }
-        view.unread = false;
-        view.render(frame.buffer_mut(), screen, typing, t.select_bg);
-        if view.lost {
+        view.screen.seen();
+        view.screen
+            .render(frame.buffer_mut(), screen, typing, t.select_bg);
+        if view.screen.lost() {
             let note = " earlier output not kept ";
             let nx = screen.right().saturating_sub(note.width() as u16);
             frame.render_widget(
@@ -1393,7 +1474,7 @@ impl App {
                 },
             );
         }
-        let (len, back) = view.scroll_state();
+        let (len, back) = view.screen.scroll_state();
         if back > 0 {
             let note = format!(" ↑ {back} rows back ");
             let nw = note.width() as u16;
@@ -1410,7 +1491,7 @@ impl App {
                 },
             );
         }
-        let cursor = if typing { view.cursor() } else { None };
+        let cursor = if typing { view.screen.cursor() } else { None };
         self.hits.add(screen, Target::Term(TermAct::Body));
         ui::scrollbar(
             frame.buffer_mut(),
@@ -1489,5 +1570,52 @@ fn open_card(info: &TermInfo) -> Card {
             mode_text(info)
         ),
         body: vec![CardPart::Md(md)],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(share_output: bool, staged: usize, status: &str) -> TermInfo {
+        TermInfo {
+            id: "t1".into(),
+            user: true,
+            agent: "root".into(),
+            breadcrumb: "root".into(),
+            cwd: "/".into(),
+            prompt: None,
+            command: None,
+            share_output,
+            staged,
+            whenever: false,
+            status: status.into(),
+            exit: None,
+        }
+    }
+
+    #[test]
+    fn close_report_tracks_downgrade_exit_and_share() {
+        let shared = info(true, 0, "running");
+        let mut r = CloseReport::new(&shared);
+        let private = info(false, 0, "running");
+        let change = r.update(&shared, &private);
+        assert!(change.downgraded && !change.exited);
+        let exited = info(false, 0, "exited");
+        let change = r.update(&private, &exited);
+        assert!(!change.downgraded && change.exited);
+        assert!(!r.exit_due());
+        r.exit_seen();
+        assert!(!r.exit_due());
+        assert!(r.take_exit());
+        assert_eq!(r.shared(), "output not shared");
+        r.close_by_user();
+        assert!(r.closed_by_user());
+        assert!(!r.take_exit());
+        assert_eq!(r.shared(), "output not shared (made private)");
+        // A close by the user never reports exited.
+        let change = r.update(&private, &info(false, 2048, "exited"));
+        assert!(!change.exited);
+        assert_eq!(r.shared(), "excerpt shared (2.0 KiB)");
     }
 }

@@ -292,43 +292,43 @@ async fn event_loop(app: &mut app::App, typed: &[u8]) -> Result<(), String> {
     let mut title = String::new();
     let mut early = Some(typed);
     loop {
-        if let Some(req) = app.editor.take() {
+        if app.wants_editor() {
             // The editor owns the terminal: stop reading input first.
             drop(input.take());
-            let result = external_edit(app.mouse, req.text.clone()).await;
-            input = Some(EventStream::new());
-            let _ = terminal.clear();
-            block_cursor = false;
-            app.editor_done(req, result);
+            let mouse = app.mouse;
+            let (input, terminal, block_cursor) = (&mut input, &mut terminal, &mut block_cursor);
+            // The terminal is restored before the result is applied.
+            app.run_editor(|text| async move {
+                let result = external_edit(mouse, text).await;
+                *input = Some(EventStream::new());
+                let _ = terminal.clear();
+                *block_cursor = false;
+                result
+            })
+            .await;
         }
         let want_title = app.window_title();
         if want_title != title {
             title = want_title;
             let _ = execute!(io::stdout(), SetTitle(&title));
         }
-        if app.mouse_changed {
-            app.mouse_changed = false;
-            let _ = if app.mouse {
+        if let Some(mouse) = app.take_mouse_change() {
+            let _ = if mouse {
                 execute!(io::stdout(), EnableMouseCapture)
             } else {
                 execute!(io::stdout(), DisableMouseCapture)
             };
         }
-        if app.dirty {
-            app.dirty = false;
-            terminal.draw(|f| app.draw(f)).map_err(|e| e.to_string())?;
-            links::emit(&app.links);
-            if app.block_cursor() != block_cursor {
-                block_cursor = app.block_cursor();
-                let _ = execute!(
-                    io::stdout(),
-                    if block_cursor {
-                        SetCursorStyle::SteadyBlock
-                    } else {
-                        SetCursorStyle::DefaultUserShape
-                    }
-                );
-            }
+        if app.redraw(&mut terminal)? && app.block_cursor() != block_cursor {
+            block_cursor = app.block_cursor();
+            let _ = execute!(
+                io::stdout(),
+                if block_cursor {
+                    SetCursorStyle::SteadyBlock
+                } else {
+                    SetCursorStyle::DefaultUserShape
+                }
+            );
         }
         if app.quit {
             break;
@@ -352,32 +352,14 @@ async fn event_loop(app: &mut app::App, typed: &[u8]) -> Result<(), String> {
             ev = app::recv(engine_rx) => {
                 app.on_engine(ev);
                 // Coalesce bursts of stream deltas into one frame.
-                drain_burst(|| {
-                    let Some(rx) = app.events() else { return false };
-                    match rx.try_recv() {
-                        Ok(ev) => { app.on_engine(Some(ev)); true }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
-                        Err(_) => { app.on_engine(None); false }
-                    }
-                });
+                drain_burst(|| app.next_engine_event());
             },
             msg = app::recv_term(term_rx) => {
                 app.on_term_msg(msg);
-                drain_burst(|| {
-                    let Some(rx) = app.term_events() else { return false };
-                    match rx.try_recv() {
-                        Ok(msg) => { app.on_term_msg(Some(msg)); true }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
-                        Err(_) => { app.on_term_msg(None); false }
-                    }
-                });
+                drain_burst(|| app.next_term_msg());
             },
             _ = tick.tick() => {
-                app.tick += 1;
-                if app.on_tick() || app.animating() || app.has_hint() {
-                    app.dirty = true;
-                }
-                app.attention_tick();
+                app.on_timer();
                 if let Some(signal) = app.take_signal() {
                     use std::io::Write;
                     let mut out = io::stdout();
