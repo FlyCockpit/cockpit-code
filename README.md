@@ -40,10 +40,12 @@ Cockpit Code is a Rust workspace. One in-process agent engine (`code-engine`) ha
 ```sh
 # 0. Install the binary (see Installation)
 
-# 1. Scaffold config: a provider template that reads its key from an env var
-cockpit-code init --provider anthropic --key-env ANTHROPIC_API_KEY
+# 1. Scaffold config: the anthropic provider, which reads its key from $ANTHROPIC_API_KEY,
+#    with one model that also becomes the default
+cockpit-code init --provider anthropic --key-env ANTHROPIC_API_KEY \
+  --default-model anthropic/claude-opus-5-5
 
-# 2. Add a model to the provider file (see Configuration), then check that it loads
+# 2. Set the key, then check that the config loads
 export ANTHROPIC_API_KEY=...
 cockpit-code doctor
 
@@ -52,7 +54,7 @@ cockpit-code                          # interactive TUI
 cockpit-code -p "fix the failing test" # headless, one task
 ```
 
-`init` provider templates are `openrouter`, `openrouter-anthropic`, `openai`, `openai-chat`, `anthropic` and `command`. Repeat `--provider` to add several. Other useful flags are `--default-model provider/model`, `--default-mode manual|auto|unattended|yolo` and `--safety-model provider/model`. Existing files are kept unless you pass `--force`. `init` never writes a secret. It only writes a `${VAR}` reference.
+`init` provider templates are `openrouter`, `openrouter-anthropic`, `openai`, `openai-chat`, `anthropic` and `command`. Repeat `--provider` to add several. Each template is written to `providers/<template>.json`, so the template name is also the provider id. `--default-model <provider>/<model>` adds the model to that provider's file and sets it as `defaultModel` in `config.json`; the provider must be one you pass with `--provider` in the same command. The model part is the provider's own model id and may itself contain a slash: `--default-model openrouter/anthropic/claude-haiku-5.5` adds the model key `anthropic/claude-haiku-5.5` to `providers/openrouter.json`. The model entry `init` writes is a starter (text only, 8192 output tokens); see [Providers and models](crates/code-engine/skills/cockpit-code-config/references/providers.md) to fill in real limits and capabilities. Without `--key-env`, each HTTP template reads its usual variable: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `OPENROUTER_API_KEY` (the `command` template has no key). If the variable is not set, `doctor` reports the provider as skipped. Other useful flags are `--default-mode manual|auto|unattended|yolo` and `--safety-model provider/model`. Existing files are kept unless you pass `--force`. `init` never writes a secret. It only writes a `${VAR}` reference.
 
 ## Installation
 
@@ -91,13 +93,13 @@ git clone https://github.com/FlyCockpit/cockpit-code.git
 cd cockpit-code
 
 # Install the `cockpit-code` binary into ~/.cargo/bin
-cargo install --path apps/cockpit-code
+cargo install --locked --path apps/cockpit-code
 
 # ...or just build it (binary at target/release/cockpit-code)
-cargo build --release
+cargo build --release --locked
 ```
 
-To build without the terminal UI (headless and ACP only), add `--no-default-features`, for example `cargo install --path apps/cockpit-code --no-default-features`.
+To build without the terminal UI (headless and ACP only), add `--no-default-features`, for example `cargo install --locked --path apps/cockpit-code --no-default-features`.
 
 ## Configuration
 
