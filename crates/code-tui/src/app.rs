@@ -681,6 +681,7 @@ impl App {
             vec![
                 DialogOption::new("trust", trust)
                     .key('t')
+                    .guarded()
                     .describe(trust_why),
                 DialogOption::new(
                     "decline",
@@ -1255,7 +1256,9 @@ impl App {
                 "Leave this session?",
                 Body::Markdown(body.join("\n\n")),
                 vec![
-                    DialogOption::new("go", "Stop them and switch").key('y'),
+                    DialogOption::new("go", "Stop them and switch")
+                        .key('y')
+                        .guarded(),
                     DialogOption::new("stay", "Stay").key('n'),
                 ],
             )
@@ -1318,13 +1321,17 @@ impl App {
                 DialogOption::new("fork", "Fork")
                     .key('f')
                     .describe("open a copy with no lock conflict"),
-                DialogOption::new("claim", "Claim lock").key('c').describe(
+                {
+                    let claim = DialogOption::new("claim", "Claim lock").key('c');
+                    // Taking a live holder's lock makes it read-only.
                     if info.alive == Some(false) {
-                        "take over; the holder is gone"
+                        claim.describe("take over; the holder is gone")
                     } else {
-                        "take over; the other process becomes read-only"
-                    },
-                ),
+                        claim
+                            .guarded()
+                            .describe("take over; the other process becomes read-only")
+                    }
+                },
             ],
         )
         // A dead holder on this host: claiming is the safe, likely choice.
@@ -1584,9 +1591,10 @@ impl App {
                     format!("Allow {}? · {crumb}", a.tool)
                 };
                 let mut options = vec![
-                    DialogOption::new("once", "Allow once").key('o'),
+                    DialogOption::new("once", "Allow once").key('o').guarded(),
                     DialogOption::new("session", "Allow for session")
                         .key('s')
+                        .guarded()
                         .describe(session),
                     DialogOption::new("deny", "Deny with feedback")
                         .key('d')
@@ -3453,7 +3461,7 @@ impl App {
                         short(&id)
                     )),
                     vec![
-                        DialogOption::new("delete", "Delete").key('d'),
+                        DialogOption::new("delete", "Delete").key('d').guarded(),
                         DialogOption::new("cancel", "Cancel").key('c'),
                     ],
                 )
@@ -3837,9 +3845,16 @@ impl App {
                     .map(|m| {
                         // m/a/u/y: every option has its key, like the safety row.
                         let key = m.as_str().chars().next().unwrap_or(' ');
-                        DialogOption::new(m.as_str(), m.as_str())
+                        let option = DialogOption::new(m.as_str(), m.as_str())
                             .key(key)
-                            .describe(m.describe())
+                            .describe(m.describe());
+                        // Modes that run tool calls without asking the user
+                        // (auto lets the safety model approve them).
+                        if matches!(m, Mode::Auto | Mode::Unattended | Mode::Yolo) {
+                            option.guarded()
+                        } else {
+                            option
+                        }
                     })
                     .collect();
                 let safety = self
@@ -4030,7 +4045,7 @@ impl App {
                     "Quit cockpit-code?",
                     Body::Markdown(body.join("\n")),
                     vec![
-                        DialogOption::new("quit", "Quit").key('y'),
+                        DialogOption::new("quit", "Quit").key('y').guarded(),
                         DialogOption::new("stay", "Stay").key('n'),
                     ],
                 );
@@ -4603,6 +4618,7 @@ impl App {
                     DialogOption::new("keep", format!("Keep {cur}")).key('k'),
                     DialogOption::new("compact", format!("Compact with {cur}, then switch"))
                         .key('c')
+                        .guarded()
                         .describe("the summary uses the warm cache; the new model starts small"),
                     DialogOption::new("switch", "Switch anyway").key('s'),
                 ],
@@ -4919,6 +4935,8 @@ const HELP: &str = "**Keys**
 - **Scrollbars** page on a track click and drag by the thumb.
 - **Clipboard**: over SSH copies use OSC 52 (plain text only; rich copies fall back to markdown or HTML source); inside tmux enable `set -g set-clipboard on`.
 
+**Dialogs**: ↑↓ move (j/k are just letters), enter or a click chooses, an option's key or number chooses it. Options that destroy or approve something (compact, delete, allow, approve, apply, quit and the like) show `alt+<key>`: typed letters never choose them, only alt+key, or ↑↓ onto them + enter (alt+enter from their text field). Question dialogs submit with alt+s / ctrl+s, or ↓ to Submit + enter. Keys typed in the moment a dialog opens are ignored.
+
 While a child's transcript is open, the composer sends it a steering message (delivered at its next turn boundary).
 
 **Attention**: when an approval, question, proposal, roadblock or trust prompt starts waiting, or a turn finishes, the terminal bell rings (tmux flags the window) and the window title gets a `●` marker until you come back; `attention: desktop` in config.json also sends an OSC 9 / OSC 777 desktop notification, `attention: off` disables it.
@@ -4995,6 +5013,181 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Opens a dialog with `open` for many seeds and types random prose
+    /// into it: no guarded option is ever chosen. Its guarded options.
+    fn guarded_and_safe(app: &mut App, open: impl Fn(&mut App)) -> Vec<String> {
+        let mut ids = vec![];
+        for seed in 0..40 {
+            app.overlay = Overlay::None;
+            open(app);
+            let Overlay::Dialog(d, _) = &mut app.overlay else {
+                panic!("no dialog open");
+            };
+            ids = d
+                .options
+                .iter()
+                .filter(|o| o.guarded)
+                .map(|o| o.id.clone())
+                .collect();
+            let mut rng = crate::dialog::tests::Rng::new(seed);
+            crate::dialog::tests::assert_prose_is_safe(d, &mut rng, 80);
+        }
+        ids
+    }
+
+    fn approval(agent: &str) -> crate::engine::ApprovalView {
+        crate::engine::ApprovalView {
+            call_id: "call".into(),
+            parent_call_id: None,
+            id: "approval".into(),
+            agent: agent.into(),
+            job: None,
+            tool: "bash".into(),
+            breadcrumb: agent.into(),
+            target: None,
+            diff: None,
+            command: Some("rm -rf build".into()),
+            reason: "cleanup".into(),
+            grant_key: None,
+            verdict: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_prose_chooses_no_destructive_or_approving_option() {
+        let (_dir, mut app) = app();
+        // Tool approvals (root's and a child's, with Jump to agent).
+        for agent in ["root", "child"] {
+            let ids = guarded_and_safe(&mut app, |app| {
+                app.prompts.clear();
+                app.prompts.push_back(Prompt::Approval(approval(agent)));
+                app.next_prompt();
+            });
+            assert_eq!(ids, ["once", "session"], "{agent}");
+        }
+        for (tampered, deleted, library) in [
+            (true, true, false),
+            (false, false, false),
+            (false, false, true),
+        ] {
+            let ids = guarded_and_safe(&mut app, |app| {
+                app.guidance_dialog(&crate::engine::GuidanceView {
+                    id: "guidance".into(),
+                    path: app.engine.cwd().join("REVIEW.md"),
+                    sha256: "abc".into(),
+                    content: "be strict".into(),
+                    tampered,
+                    deleted,
+                    library,
+                })
+            });
+            assert_eq!(ids, ["trust"]);
+        }
+        // Claiming a live (or unknown) holder's lock; a dead one's is safe.
+        for (alive, guarded) in [(Some(true), true), (None, true), (Some(false), false)] {
+            let ids = guarded_and_safe(&mut app, |app| {
+                app.lock_dialog(LockInfo {
+                    session_id: "s".into(),
+                    title: "t".into(),
+                    pid: 1,
+                    host: "h".into(),
+                    age: "1m".into(),
+                    alive,
+                })
+            });
+            assert_eq!(ids == ["claim"], guarded, "{alive:?}");
+            assert!(guarded || ids.is_empty());
+        }
+        let ids = guarded_and_safe(&mut app, |app| app.command("permissions", ""));
+        assert_eq!(ids, ["auto", "unattended", "yolo"]);
+        let ids = guarded_and_safe(&mut app, |app| app.exclusive_ask_safety("m".into()));
+        assert!(ids.is_empty());
+        let ids = guarded_and_safe(&mut app, |app| app.exclusive_ask_block("m".into(), None));
+        assert!(ids.is_empty());
+        let ids = guarded_and_safe(&mut app, |app| {
+            app.running = true;
+            app.command("quit", "");
+        });
+        assert_eq!(ids, ["quit"]);
+        app.running = false;
+        let ids = guarded_and_safe(&mut app, |app| {
+            app.scope_dialog(&crate::engine::ScopeView {
+                id: "scope".into(),
+                requester: "child".into(),
+                owner: "root".into(),
+                path: app.engine.cwd().join("src/lib.rs"),
+                tool: "write".into(),
+                args: serde_json::json!({"path":"src/lib.rs", "content":"x"}),
+                status: "pending".into(),
+                wait: true,
+                escalation: None,
+                reason: None,
+                output: None,
+            })
+        });
+        assert_eq!(ids, ["apply", "grant"]);
+        let ids = guarded_and_safe(&mut app, |app| {
+            app.goal_prompt_dialog(&GoalPrompt::Draft(crate::engine::ContractView::default()))
+        });
+        assert_eq!(ids, ["approve", "cancel"]);
+        let ids = guarded_and_safe(&mut app, |app| {
+            app.goal_prompt_dialog(&GoalPrompt::Proposal {
+                agent: "root".into(),
+                proposal: crate::engine::ProposalView {
+                    id: "proposal".into(),
+                    criterion_id: "c1".into(),
+                    change: "new text".into(),
+                    reason: "because".into(),
+                    ..Default::default()
+                },
+            })
+        });
+        assert_eq!(ids, ["accept", "edit"]);
+        let ids = guarded_and_safe(&mut app, |app| {
+            app.goal_prompt_dialog(&GoalPrompt::Roadblock {
+                agent: "root".into(),
+                roadblock: Default::default(),
+            })
+        });
+        assert_eq!(ids, ["pivot", "override", "stop"]);
+        let ids = guarded_and_safe(&mut app, |app| app.stop_dialog("child"));
+        assert_eq!(ids, ["stop"]);
+        let ids = guarded_and_safe(&mut app, |app| app.finalize_dialog("child"));
+        assert_eq!(ids, ["finalize"]);
+        // Asking sends a question: the prefilled field's Enter only hints.
+        let ids = guarded_and_safe(&mut app, |app| app.ask_dialog("child"));
+        assert_eq!(ids, ["ask"]);
+    }
+
+    #[tokio::test]
+    async fn job_and_enter_in_a_tool_approval_allow_nothing() {
+        let (_dir, mut app) = app();
+        app.prompts.push_back(Prompt::Approval(approval("root")));
+        app.next_prompt();
+        let Overlay::Dialog(d, _) = &mut app.overlay else {
+            panic!("no dialog open");
+        };
+        // After the opening grace.
+        let open = Instant::now();
+        for (i, c) in "job".chars().enumerate() {
+            let at = open + Duration::from_millis(1000 + 50 * i as u64);
+            assert!(matches!(
+                d.key_at(key(KeyCode::Char(c)), at),
+                crate::dialog::Outcome::Pending
+            ));
+        }
+        assert!(matches!(
+            d.key_at(key(KeyCode::Enter), open + Duration::from_millis(1200)),
+            crate::dialog::Outcome::Pending
+        ));
+        // Through the app too: the dialog stays and nothing is answered.
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.overlay,
+            Overlay::Dialog(_, DialogPurpose::Approval(_))
+        ));
     }
 
     #[test]
