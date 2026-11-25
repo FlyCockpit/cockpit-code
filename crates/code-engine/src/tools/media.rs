@@ -91,12 +91,7 @@ async fn run(
         .as_ref()
         .and_then(|id| state.control.job_record(id).ok())
         .is_some_and(|job| job.kind == "script")
-        || (state.script_depth > 0
-            && state
-                .tools
-                .foreground
-                .as_ref()
-                .is_some_and(|f| f.is_background()))
+        || (state.script_depth > 0 && state.tools.in_background())
     {
         bail!(
             "media inputs require a foreground tool or foreground script so their payload can reach the model"
@@ -116,7 +111,7 @@ async fn run(
     let assets = state.control.journal.lock().unwrap().dir.join("assets");
     let mut source_attachment = None;
     let target = if let Some(raw) = args["path"].as_str() {
-        Some(state.tools.resolver.resolve(raw)?)
+        Some(state.tools.resolve_path(raw)?)
     } else if let Some(id) = args["attachment"].as_str() {
         let mut found = std::collections::BTreeMap::new();
         for event in state.history() {
@@ -182,7 +177,7 @@ async fn run(
         ));
     }
     let bytes = if let Some(path) = target {
-        state.tools.resolver.validate(&path)?;
+        state.tools.validate_path(&path)?;
         let a = source_attachment;
         tokio::task::spawn_blocking(move || {
             if let Some(a) = a {

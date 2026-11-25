@@ -32,31 +32,33 @@ pub struct ModelSteering {
     pub reminder: Option<String>,
     pub reminder_turns: u64,
 }
+/// A model's frozen tool surface: native tools, then the callable catalog.
+pub(crate) type Surface = (Vec<tools::ToolDefinition>, Vec<tools::ToolDefinition>);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrozenContext {
     #[serde(default)]
-    pub tool_model: Option<String>,
+    tool_model: Option<String>,
     #[serde(default)]
-    pub tool_overrides: BTreeMap<String, crate::tool_names::Overrides>,
+    tool_overrides: BTreeMap<String, crate::tool_names::Overrides>,
     #[serde(default)]
-    pub model_steering: BTreeMap<String, ModelSteering>,
+    model_steering: BTreeMap<String, ModelSteering>,
     #[serde(default)]
     pub role_insert_at: Option<usize>,
     pub cwd: PathBuf,
-    pub shared_prompt: String,
-    pub role_prompt: String,
+    shared_prompt: String,
+    role_prompt: String,
     #[serde(default)]
-    pub offered_tools: Option<Vec<tools::ToolDefinition>>,
+    offered_tools: Option<Vec<tools::ToolDefinition>>,
     #[serde(default)]
-    pub model_tools: BTreeMap<String, Vec<tools::ToolDefinition>>,
+    model_tools: BTreeMap<String, Vec<tools::ToolDefinition>>,
     /// Callable catalog, frozen separately from native advertisement.
     #[serde(default)]
-    pub offered_catalog: Option<Vec<tools::ToolDefinition>>,
+    offered_catalog: Option<Vec<tools::ToolDefinition>>,
     #[serde(default)]
-    pub model_catalogs: BTreeMap<String, Vec<tools::ToolDefinition>>,
+    model_catalogs: BTreeMap<String, Vec<tools::ToolDefinition>>,
     #[serde(default)]
-    pub tool_profiles: BTreeMap<String, code_config::tools::Profile>,
+    tool_profiles: BTreeMap<String, code_config::tools::Profile>,
     #[serde(default)]
     pub base_and_global: String,
     #[serde(default)]
@@ -64,7 +66,7 @@ pub struct FrozenContext {
     #[serde(default)]
     pub global_hashes: BTreeMap<PathBuf, Option<String>>,
     pub skills: Vec<Skill>,
-    pub source_hashes: BTreeMap<PathBuf, Option<String>>,
+    source_hashes: BTreeMap<PathBuf, Option<String>>,
 }
 impl FrozenContext {
     pub(crate) fn capture(
@@ -179,8 +181,7 @@ impl FrozenContext {
         })
     }
     pub(crate) fn prompt(&self, model: &str) -> String {
-        let names =
-            crate::tool_names::names(&crate::tool_names::frozen(&self.tool_overrides, model));
+        let names = crate::tool_names::names(&self.overrides(model));
         let shared_prompt = self
             .shared_prompt
             .replace(SKILL_HEADER, &names.rewrite(SKILL_HEADER));
@@ -207,9 +208,7 @@ impl FrozenContext {
                 self.shared_prompt, self.role_prompt
             )
         };
-        if crate::tool_profiles::selected(&self.tool_profiles, model)
-            == code_config::tools::Profile::Core
-        {
+        if self.tool_profile(model) == code_config::tools::Profile::Core {
             format!("{prompt}\n{}\n", names.rewrite(crate::tool_profiles::HINT))
         } else {
             prompt
@@ -266,6 +265,147 @@ impl FrozenContext {
             hashes.insert(path, value);
         }
         Ok(hashes)
+    }
+    /// Native tools frozen for `model`, else the tools first offered.
+    pub(crate) fn tools(&self, model: Option<&str>) -> Option<&Vec<tools::ToolDefinition>> {
+        model
+            .and_then(|model| self.native_tools(model))
+            .or(self.offered_tools.as_ref())
+    }
+    /// Native tools frozen for exactly `model`.
+    pub(crate) fn native_tools(&self, model: &str) -> Option<&Vec<tools::ToolDefinition>> {
+        self.model_tools.get(model)
+    }
+    /// The callable catalog frozen for `model`, including extensions omitted from native tools.
+    pub(crate) fn catalog(&self, model: &str) -> Option<&Vec<tools::ToolDefinition>> {
+        self.model_catalogs.get(model)
+    }
+    pub(crate) fn has_model(&self, model: &str) -> bool {
+        self.model_tools.contains_key(model)
+    }
+    pub(crate) fn tool_profile(&self, model: &str) -> code_config::tools::Profile {
+        crate::tool_profiles::selected(&self.tool_profiles, model)
+    }
+    pub(crate) fn overrides(&self, model: &str) -> crate::tool_names::Overrides {
+        crate::tool_names::frozen(&self.tool_overrides, model)
+    }
+    pub(crate) fn steering(&self, model: &str) -> Option<&ModelSteering> {
+        self.model_steering.get(model)
+    }
+    pub(crate) fn skill(&self, name: &str) -> Option<&Skill> {
+        self.skills.iter().find(|s| s.name == name)
+    }
+    /// Some frozen tool surface includes the interactive user terminal.
+    pub(crate) fn offers_user_terminal(&self) -> bool {
+        self.model_catalogs
+            .values()
+            .chain(self.model_tools.values())
+            .chain(self.offered_catalog.iter())
+            .chain(self.offered_tools.iter())
+            .flatten()
+            .any(|d| d.schema["x-cockpit-user-terminal"] == true)
+    }
+    /// The shared prompt or this role's instructions already say `text`.
+    pub(crate) fn prompt_contains(&self, text: &str) -> bool {
+        self.shared_prompt.contains(text) || self.role_prompt.contains(text)
+    }
+    /// The shared prompt sources already say `text`.
+    pub(crate) fn sources_contain(&self, text: &str) -> bool {
+        self.shared_prompt.contains(text)
+    }
+    /// The same prompt sources for another role, whose tool surfaces are frozen afresh.
+    pub(crate) fn for_role(mut self, role: String) -> Self {
+        self.role_prompt = role;
+        self.offered_tools = None;
+        self.model_tools.clear();
+        self.offered_catalog = None;
+        self.model_catalogs.clear();
+        self
+    }
+    /// Freezes the tools first offered to `model`: `build(context, overrides)` returns the
+    /// native tools and the callable catalog.
+    pub(crate) fn freeze_offered(
+        &mut self,
+        model: Option<String>,
+        build: impl FnOnce(&Self, &crate::tool_names::Overrides) -> Result<Surface, EngineError>,
+    ) -> Result<(), EngineError> {
+        self.tool_model = model;
+        let overrides = self.overrides(self.tool_model.as_deref().unwrap_or(""));
+        let (tools, catalog) = build(self, &overrides)?;
+        self.offered_tools = Some(tools);
+        self.offered_catalog = Some(catalog);
+        Ok(())
+    }
+    /// No per-model tool surface has been frozen yet.
+    pub(crate) fn needs_model_surfaces(&self) -> bool {
+        self.model_tools.is_empty()
+    }
+    /// Freezes `model`'s surface: `build(overrides, profile)` returns its native tools and
+    /// callable catalog.
+    pub(crate) fn freeze_model(
+        &mut self,
+        model: String,
+        build: impl FnOnce(
+            &crate::tool_names::Overrides,
+            code_config::tools::Profile,
+        ) -> Result<Surface, EngineError>,
+    ) -> Result<(), EngineError> {
+        self.freeze_surface(model, build).map(drop)
+    }
+    /// Like [`Self::freeze_model`] for a model discovered later, which also keeps its tool names.
+    pub(crate) fn freeze_new_model(
+        &mut self,
+        model: String,
+        build: impl FnOnce(
+            &crate::tool_names::Overrides,
+            code_config::tools::Profile,
+        ) -> Result<Surface, EngineError>,
+    ) -> Result<(), EngineError> {
+        let overrides = self.freeze_surface(model.clone(), build)?;
+        self.tool_overrides.insert(model, overrides);
+        Ok(())
+    }
+    fn freeze_surface(
+        &mut self,
+        model: String,
+        build: impl FnOnce(
+            &crate::tool_names::Overrides,
+            code_config::tools::Profile,
+        ) -> Result<Surface, EngineError>,
+    ) -> Result<crate::tool_names::Overrides, EngineError> {
+        let overrides = self.overrides(&model);
+        let (native, catalog) = build(&overrides, self.tool_profile(&model))?;
+        self.model_catalogs.insert(model.clone(), catalog);
+        self.model_tools.insert(model, native);
+        Ok(overrides)
+    }
+    /// The model the session started with keeps exactly the tools it was offered.
+    pub(crate) fn freeze_offered_model(&mut self) -> Result<(), EngineError> {
+        if let (Some(id), Some(defs)) = (&self.tool_model, &self.offered_tools) {
+            self.model_tools.insert(id.clone(), defs.clone());
+            self.model_catalogs.insert(
+                id.clone(),
+                self.offered_catalog
+                    .clone()
+                    .ok_or_else(|| EngineError::bad("frozen tool catalog missing"))?,
+            );
+        }
+        Ok(())
+    }
+    /// Calls `remember` with each source file whose bytes still match the frozen hash;
+    /// returns the frozen hashes as the first observation.
+    pub(crate) fn observe_sources(
+        &self,
+        mut remember: impl FnMut(&Path, &[u8]),
+    ) -> BTreeMap<PathBuf, Option<String>> {
+        for path in self.source_hashes.keys().filter(|p| p.is_file()) {
+            if let Ok(bytes) = std::fs::read(path)
+                && self.source_hashes.get(path).and_then(|h| h.as_ref()) == Some(&digest(&bytes))
+            {
+                remember(path, &bytes);
+            }
+        }
+        self.source_hashes.clone()
     }
     pub(crate) fn search(&self, query: &str) -> Vec<&Skill> {
         let query = query.to_lowercase();

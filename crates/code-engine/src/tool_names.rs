@@ -187,7 +187,7 @@ impl State {
         self.context_state
             .frozen
             .as_ref()
-            .map(|c| frozen(&c.tool_overrides, &id))
+            .map(|c| c.overrides(&id))
             .unwrap_or_else(|| self.store.tool_overrides(&id))
     }
     pub(crate) fn tool_names(&self) -> Names {
@@ -226,7 +226,7 @@ impl Control {
             })
         });
         if let Some(context) = context {
-            return names(&frozen(&context.tool_overrides, id));
+            return names(&context.overrides(id));
         }
         names(&config.tool_overrides(id))
     }

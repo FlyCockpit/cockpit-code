@@ -1303,16 +1303,7 @@ async fn launch_child(
     let cwd = execution.cwd.clone();
     let remaining = execution.remaining_depth;
     let background = execution.background;
-    if let Some(foreground) = &state.tools.foreground
-        && foreground
-            .canonical
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|call| call.name == "task")
-    {
-        *foreground.child.lock().unwrap() = Some(id.clone());
-    }
+    state.tools.launched_child(&id);
     let token = cancel.child_token();
     let barrier = Arc::new(CommitBarrier::default());
     let child = Arc::new(AgentRun {
@@ -1632,12 +1623,7 @@ async fn launch_child(
     }
     state.control.agent_status(&state.agent_id, "waiting")?;
     let result = child.wait_foreground(&state.control, &id, cancel).await;
-    if state
-        .tools
-        .foreground
-        .as_ref()
-        .is_none_or(|output| !output.is_background())
-    {
+    if !state.tools.in_background() {
         state.control.agent_status(&state.agent_id, "running")?;
     }
     result.map(|v| v.to_string())

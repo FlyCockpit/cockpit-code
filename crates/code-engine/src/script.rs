@@ -459,6 +459,13 @@ impl State {
             active_model: self.active_model.clone(),
         }
     }
+    /// A nested script run whose tool calls report `call_id` as their parent call.
+    fn for_script_call(&self, job_id: Option<String>, call_id: &str) -> Self {
+        let mut nested = self.for_script(job_id.clone());
+        nested.parent_call_id = Some(call_id.to_owned());
+        nested.tools = self.tools.for_script_call(job_id, call_id.to_owned());
+        nested
+    }
 }
 struct Output {
     text: String,
@@ -526,9 +533,7 @@ pub(crate) async fn execute(
             token.clone(),
             barrier.clone(),
         )?;
-        let mut nested = state.for_script(Some(job.id.clone()));
-        nested.parent_call_id = Some(call.id.clone());
-        nested.tools.parent_call_id = nested.parent_call_id.clone();
+        let nested = state.for_script_call(Some(job.id.clone()), &call.id);
         let control = state.control.clone();
         let worker = job.clone();
         // A session-owned job must not retain the launching turn's relay sender.
@@ -566,9 +571,7 @@ pub(crate) async fn execute(
         *job.task.lock().await = Some(task);
         Ok(json!({"jobId":job.id,"status":"running"}).to_string())
     } else {
-        let mut nested = state.for_script(state.job_id.clone());
-        nested.parent_call_id = Some(call.id.clone());
-        nested.tools.parent_call_id = nested.parent_call_id.clone();
+        let nested = state.for_script_call(state.job_id.clone(), &call.id);
         run(&nested, code, limits, cancel, barrier, tx, None).await
     }
 }
@@ -850,9 +853,7 @@ async fn dispatch(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("name required"))?;
             let skill = context
-                .skills
-                .iter()
-                .find(|s| s.name == skill_name)
+                .skill(skill_name)
                 .ok_or_else(|| anyhow::anyhow!("skill not found: {skill_name}"))?;
             crate::skill_commands::model_allowed(skill).map_err(|e|anyhow::anyhow!(e.message))?;
             if skill.disable_model_invocation { bail!("Skill {skill_name} is user-only (disable-model-invocation); ask the user to invoke it."); }
