@@ -175,6 +175,8 @@ impl Picker {
     fn set_catalog(&mut self, catalog: Catalog) {
         let keep = self.current().map(|m| m.id.clone());
         self.catalog = catalog;
+        // The old rows index the old catalog, which may have been longer.
+        self.rows.clear();
         self.sort = self.sort.filter(|&s| s < self.catalog.benchmarks.len());
         self.rebuild();
         if let Some(id) = keep
@@ -935,4 +937,63 @@ fn fuzzy(m: &ModelInfo, hay: &str, query: &str) -> bool {
     query
         .split_whitespace()
         .all(|word| hay.contains(word) || subseq(&label, word) || subseq(&id, word))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(provider: &str, name: &str) -> ModelInfo {
+        ModelInfo {
+            id: format!("{provider}/{name}"),
+            provider: provider.into(),
+            provider_label: provider.into(),
+            label: name.into(),
+            description: String::new(),
+            context_window: None,
+            max_output: None,
+            efforts: vec![],
+            default_effort: None,
+            input: vec!["text".into()],
+            output: vec!["text".into()],
+            tools: true,
+            benchmarks: vec![],
+            cost: None,
+            provider_enabled: true,
+            subagent_capable: true,
+            chat_capable: true,
+            subscription: false,
+            context_unknown: false,
+        }
+    }
+
+    fn catalog(models: Vec<ModelInfo>) -> Catalog {
+        Catalog {
+            models,
+            ..Catalog::default()
+        }
+    }
+
+    #[test]
+    fn a_smaller_catalog_keeps_the_selection_without_stale_rows() {
+        let mut picker = Picker::new(
+            catalog(vec![model("a", "m"), model("b", "x"), model("b", "y")]),
+            Some("b/y".into()),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            None,
+            Purpose::Use,
+            BTreeSet::new(),
+        );
+        assert_eq!(picker.current().map(|m| m.id.as_str()), Some("b/y"));
+        // b/x is gone: the row of the selected b/y is past the new catalog's end.
+        picker.discovery_updated(
+            BTreeSet::new(),
+            catalog(vec![model("a", "m"), model("b", "y")]),
+        );
+        assert_eq!(picker.current().map(|m| m.id.as_str()), Some("b/y"));
+        // Provider b's file was removed: the selection falls back to the first model.
+        picker.discovery_updated(BTreeSet::new(), catalog(vec![model("a", "m")]));
+        assert_eq!(picker.current().map(|m| m.id.as_str()), Some("a/m"));
+    }
 }
