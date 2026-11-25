@@ -125,21 +125,36 @@ fn provider(template: &str, key: Option<&str>) -> Result<Value, Box<dyn Error>> 
     }
     Ok(json!({"type":kind,"baseUrl":url,"headers":headers,"cacheTtlSecs":300,"models":{}}))
 }
-pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn Error>> {
-    // Validate everything before creating any files.
+/// Provider ids with the JSON written to `providers/<id>.json`.
+type Providers = Vec<(String, Value)>;
+/// The provider files to write, with the `--default-model`/`--safety-model`
+/// starter entries added, and those model ids. Fails before anything is written
+/// when a model names a provider this command does not create.
+fn planned_providers(args: &InitArgs) -> Result<(Providers, Vec<String>), Box<dyn Error>> {
     let mut providers = args
         .provider
         .iter()
         .map(|name| Ok((name.clone(), provider(name, args.key_env.as_deref())?)))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    for id in [&args.default_model, &args.safety_model]
-        .into_iter()
-        .flatten()
-    {
+    let mut starters = vec![];
+    for (flag, id) in [
+        ("--default-model", &args.default_model),
+        ("--safety-model", &args.safety_model),
+    ] {
+        let Some(id) = id else { continue };
         let (p, m) = id
             .split_once('/')
             .filter(|(p, m)| !p.is_empty() && !m.is_empty())
             .ok_or("model must be provider/model")?;
+        if !providers.iter().any(|(name, _)| name == p) {
+            return Err(format!(
+                "{flag} {id}: provider {p} is not created by this command; add --provider {p} (the template name is the provider id)"
+            )
+            .into());
+        }
+        if !starters.contains(id) {
+            starters.push(id.clone());
+        }
         for (name, value) in &mut providers {
             if name == p {
                 value["models"][m] = json!({"description":"Configure verified model metadata; see the config skill models.dev reference.","maxOutputTokens":8192,"capabilities":{"input":["text"],"output":["text"],"tools":true}});
@@ -149,6 +164,11 @@ pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn
             }
         }
     }
+    Ok((providers, starters))
+}
+pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn Error>> {
+    // Validate everything before creating any files.
+    let (providers, starters) = planned_providers(args)?;
     let dirs = Directories::resolve()?;
     fs::create_dir_all(dirs.config.join("providers"))?;
     fs::create_dir_all(dirs.config.join("mcps"))?;
@@ -229,10 +249,55 @@ pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn
     }
     let store = code_config::ConfigStore::load(dirs.clone())?;
     let detection = code_engine::lsp_defaults::resolve(&store.config().lsp, cwd);
+    let written = |id: &String| {
+        id.split_once('/').is_some_and(|(p, _)| {
+            created.contains(&dirs.config.join("providers").join(format!("{p}.json")))
+        })
+    };
+    let starters: Vec<&String> = starters.iter().filter(|id| written(id)).collect();
+    let mut warnings: Vec<String> = store
+        .errors()
+        .iter()
+        .map(|e| format!("skipped {e}"))
+        .collect();
+    let config = store.config();
+    for (key, requested, stored, role) in [
+        (
+            "defaultModel",
+            &args.default_model,
+            &config.default_model,
+            crate::doctor::Role::Chat,
+        ),
+        (
+            "permissions.autoModel",
+            &args.safety_model,
+            &config.permissions.auto_model,
+            crate::doctor::Role::Safety {
+                active: matches!(
+                    config.permissions.mode,
+                    code_config::PermissionMode::Auto | code_config::PermissionMode::Unattended
+                ),
+            },
+        ),
+    ] {
+        if let Some(requested) = requested
+            && stored.as_ref() != Some(requested)
+        {
+            warnings.push(format!(
+                "{key} is still {} because config.json was kept; pass --force to replace it",
+                stored.as_deref().unwrap_or("unset")
+            ));
+        }
+        if let Some(id) = stored
+            && let Some(problem) = crate::doctor::unresolved(&store, id, role)
+        {
+            warnings.push(format!("{key} {id}: {}", problem.text()));
+        }
+    }
     if json_output {
         println!(
             "{}",
-            json!({"created":created,"skipped":skipped,"lsp":detection,"next":"cockpit-code doctor","skill":args.print_skill.then(code_engine::bundled_skills::config_skill)})
+            json!({"created":created,"skipped":skipped,"warnings":warnings,"starterModels":starters,"lsp":detection,"next":"cockpit-code doctor","skill":args.print_skill.then(code_engine::bundled_skills::config_skill)})
         );
     } else {
         for path in created {
@@ -252,6 +317,14 @@ pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn
         }
         if detection.scan_truncated {
             println!("lsp: language scan capped at 100000 entries");
+        }
+        for id in &starters {
+            println!(
+                "note: {id} is a starter entry (text only, 8192 output tokens); set its real limits and capabilities (config skill, providers reference)"
+            );
+        }
+        for warning in &warnings {
+            println!("warning: {warning}");
         }
         println!("Next: cockpit-code doctor");
     }
@@ -277,5 +350,59 @@ mod tests {
         for name in ["openrouter-chat", "openai-responses", "unknown"] {
             assert!(provider(name, None).is_err());
         }
+    }
+
+    fn args(
+        providers: &[&str],
+        default_model: Option<&str>,
+        safety_model: Option<&str>,
+    ) -> InitArgs {
+        InitArgs {
+            provider: providers.iter().map(|p| p.to_string()).collect(),
+            key_env: None,
+            default_model: default_model.map(Into::into),
+            default_mode: None,
+            safety_model: safety_model.map(Into::into),
+            force: false,
+            skill_target: vec![],
+            print_skill: false,
+        }
+    }
+
+    #[test]
+    fn model_for_a_provider_not_created_here_is_refused() {
+        let err = planned_providers(&args(&["anthropic"], Some("openai/gpt-x"), None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--default-model openai/gpt-x"), "{err}");
+        assert!(err.contains("add --provider openai"), "{err}");
+        let err = planned_providers(&args(&["anthropic"], Some("anthropic/m"), Some("openai/s")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("--safety-model openai/s"), "{err}");
+        assert!(planned_providers(&args(&[], Some("anthropic/m"), None)).is_err());
+    }
+
+    #[test]
+    fn models_are_added_to_the_providers_created_here() {
+        let (providers, starters) = planned_providers(&args(
+            &["anthropic", "openrouter"],
+            Some("openrouter/anthropic/claude-haiku-5.5"),
+            Some("anthropic/claude-haiku-5.5"),
+        ))
+        .unwrap();
+        assert_eq!(
+            starters,
+            [
+                "openrouter/anthropic/claude-haiku-5.5",
+                "anthropic/claude-haiku-5.5"
+            ]
+        );
+        assert_eq!(providers[0].0, "anthropic");
+        assert_eq!(
+            providers[0].1["models"]["claude-haiku-5.5"]["thinking"],
+            "none"
+        );
+        assert!(providers[1].1["models"]["anthropic/claude-haiku-5.5"].is_object());
     }
 }

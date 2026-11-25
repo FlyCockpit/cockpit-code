@@ -1,3 +1,4 @@
+mod doctor;
 mod init;
 use clap::{Parser, Subcommand};
 use code_config::{ConfigStore, Directories, PermissionMode, ProviderType, ThinkingMode};
@@ -11,6 +12,8 @@ use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
 };
+/// Help heading for the global flags that only a session (TUI, -p, acp) uses.
+const SESSION_OPTIONS: &str = "Session options";
 #[derive(Parser)]
 #[command(
     version,
@@ -29,16 +32,17 @@ struct Args {
     #[arg(long = "attach", value_name = "FILE", requires = "prompt")]
     attachments: Vec<PathBuf>,
     /// Model to use, as provider/model (overrides the configured default).
-    #[arg(long, global = true, value_name = "PROVIDER/MODEL")]
+    #[arg(long, global = true, value_name = "PROVIDER/MODEL", help_heading = SESSION_OPTIONS)]
     model: Option<String>,
     #[arg(
         long,
         global = true,
-        help = "Use one-layer subagents; fixed after the first message"
+        help = "Use one-layer subagents; fixed after the first message",
+        help_heading = SESSION_OPTIONS
     )]
     flat: bool,
     /// Reasoning effort level for the model.
-    #[arg(long, global = true, value_name = "LEVEL")]
+    #[arg(long, global = true, value_name = "LEVEL", help_heading = SESSION_OPTIONS)]
     effort: Option<String>,
     /// Working directory (default: the current directory).
     #[arg(long, global = true, value_name = "DIR")]
@@ -59,7 +63,7 @@ struct Args {
     #[arg(long)]
     claim_lock: bool,
     /// Permission mode for this session.
-    #[arg(long, global = true,value_parser=["manual","auto","unattended","yolo"])]
+    #[arg(long, global = true, value_parser=["manual","auto","unattended","yolo"], help_heading = SESSION_OPTIONS)]
     mode: Option<String>,
     #[arg(long, help = "Compact before sending -p (or use compact <id>)")]
     compact: bool,
@@ -160,6 +164,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Commands::Init(options)) = &args.command {
         if args.mode.is_some() || args.model.is_some() {
             return Err("init writes defaults: use --default-mode and --default-model".into());
+        }
+        if args.flat || args.effort.is_some() {
+            return Err("--flat and --effort are session options; init does not use them".into());
         }
         return init::run(
             options,
@@ -263,8 +270,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         for e in store.errors() {
             println!("skipped {e}");
         }
+        let findings = doctor::check(&store);
+        for warning in &findings.warnings {
+            println!("warning: {warning}");
+        }
+        for error in &findings.errors {
+            println!("error: {error}");
+        }
         if let Some(provider) = probe {
             probe_provider(&store, provider).await?;
+        }
+        if !findings.errors.is_empty() {
+            return Err(format!(
+                "doctor found {} problem(s); no session can start until they are fixed",
+                findings.errors.len()
+            )
+            .into());
         }
         return Ok(());
     }
