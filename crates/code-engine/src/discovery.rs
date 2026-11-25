@@ -3,27 +3,23 @@ use crate::{
     Control, Session, State,
     schema::{EngineError, EngineEvent},
 };
-use code_config::{ConfigStore, Snapshot};
+use code_config::ConfigStore;
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) fn pending_model(snapshot: &Snapshot, id: &str) -> bool {
-    let Some((provider, model)) = id.split_once('/') else {
+pub(crate) fn pending_model(snapshot: &ConfigStore, id: &str) -> bool {
+    let Some((provider, _)) = id.split_once('/') else {
         return false;
     };
-    snapshot.providers.get(provider).is_some_and(|p| {
-        p.enabled
-            && !p.models.contains_key(model)
-            && p.command
-                .as_ref()
-                .and_then(|c| c.discover.as_ref())
-                .is_some()
-    })
+    snapshot.model(id).is_none()
+        && snapshot
+            .provider(provider)
+            .is_some_and(|p| p.enabled && p.discovery().is_some())
 }
 
 impl Session {
     /// The most recently applied configuration, without I/O.
-    pub fn configuration(&self) -> Snapshot {
+    pub fn configuration(&self) -> ConfigStore {
         self.config.lock().unwrap().clone()
     }
     pub fn discovery_running(&self) -> bool {
@@ -33,16 +29,9 @@ impl Session {
     pub fn refresh_discovery(&self) {
         let ids: Vec<_> = self
             .configuration()
-            .providers
-            .into_iter()
-            .filter(|(_, p)| {
-                p.enabled
-                    && p.command
-                        .as_ref()
-                        .and_then(|c| c.discover.as_ref())
-                        .is_some()
-            })
-            .map(|(id, _)| id)
+            .providers()
+            .filter(|(_, p)| p.enabled && p.discovery().is_some())
+            .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
             self.control.discover_provider(&id);
@@ -84,17 +73,10 @@ impl Control {
             .await;
             let errors = match result {
                 Ok(Ok(store)) => {
-                    let next = store.snapshot();
                     let mut config = control.config.lock().unwrap();
-                    if let Some(provider) = next.providers.get(&id) {
-                        config.providers.insert(id.clone(), provider.clone());
-                    }
-                    config.discovery_errors.remove(&id);
-                    if let Some(error) = next.discovery_errors.get(&id) {
-                        config.discovery_errors.insert(id.clone(), error.clone());
-                    }
+                    config.adopt_discovery(&store, &id);
                     control.usage.update_config(&config);
-                    next.errors.clone()
+                    store.errors().to_vec()
                 }
                 Ok(Err(error)) => vec![error.to_string()],
                 Err(_) => vec![format!("{id}: discovery background worker failed")],
@@ -137,8 +119,7 @@ impl Control {
         let snapshot = self.config.lock().unwrap();
         if pending_model(&snapshot, id) {
             let reason = snapshot
-                .discovery_errors
-                .get(provider)
+                .discovery_error(provider)
                 .map(|e| e.message.as_str())
                 .unwrap_or("provider did not advertise the requested model");
             return Err(EngineError::bad(format!(
@@ -159,7 +140,7 @@ impl State {
             .as_ref()
             .map(|e| &e.model)
             .or(settings.model.as_ref())
-            .or(self.store.snapshot().config.default_model.as_ref())
+            .or(self.store.config().default_model.as_ref())
             .cloned();
         if let Some(id) = id {
             self.control.await_model(&id, cancel).await?;

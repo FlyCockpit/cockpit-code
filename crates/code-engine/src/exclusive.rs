@@ -1,5 +1,5 @@
 use crate::{Session, model::Model, schema::EngineError, sessions::SessionSettings};
-use code_config::{PermissionMode, Snapshot, Transport};
+use code_config::{ConfigStore, PermissionMode, Transport};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -71,7 +71,7 @@ pub(crate) fn safety(settings: &SessionSettings) -> Option<String> {
         settings.safety_model.clone()
     }
 }
-pub(crate) fn enabled_mcps(settings: &SessionSettings, snapshot: &Snapshot) -> BTreeSet<String> {
+pub(crate) fn enabled_mcps(settings: &SessionSettings, snapshot: &ConfigStore) -> BTreeSet<String> {
     settings
         .mcps
         .clone()
@@ -83,8 +83,7 @@ pub(crate) fn enabled_mcps(settings: &SessionSettings, snapshot: &Snapshot) -> B
                 .as_ref()
                 .is_some_and(|ex| ex.block_network)
                 || snapshot
-                    .mcps
-                    .get(name)
+                    .mcp(name)
                     .and_then(|m| m.connection())
                     .is_some_and(|m| matches!(m.transport, Transport::Stdio))
         })
@@ -136,7 +135,7 @@ impl Session {
                 let mode = self
                     .settings()
                     .mode
-                    .unwrap_or(snapshot.config.permissions.mode);
+                    .unwrap_or(snapshot.config().permissions.mode);
                 if matches!(mode, PermissionMode::Auto | PermissionMode::Unattended) {
                     changes.push(("mode".into(), serde_json::json!(PermissionMode::Manual)));
                 }

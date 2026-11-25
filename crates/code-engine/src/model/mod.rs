@@ -339,11 +339,11 @@ impl Model {
     pub fn new(
         provider_id: String,
         model_id: String,
-        mut provider: Provider,
+        provider: Provider,
         config: ModelConfig,
         requested_effort: Option<&str>,
     ) -> Result<Self> {
-        provider.kind = config.kind.unwrap_or(provider.kind);
+        let provider = provider.for_model(&config);
         let effort = config
             .reasoning
             .resolve(requested_effort)
@@ -367,9 +367,6 @@ impl Model {
         }
         if provider.kind == ProviderType::Command && provider.connection_command().is_none() {
             return Err(EngineError::bad("command provider requires command block"));
-        }
-        if provider.kind == ProviderType::Command && provider.max_concurrent_contexts.is_none() {
-            provider.max_concurrent_contexts = Some(1);
         }
         if config.max_output_tokens == Some(0) {
             return Err(EngineError::bad("maxOutputTokens must be positive"));
@@ -661,10 +658,10 @@ impl Model {
         })
     }
     pub fn command_latest(&self) -> bool {
-        command::latest(&self.provider)
+        self.provider.latest_history_only(&self.config)
     }
     pub fn command_text(&self) -> bool {
-        command::text_output(&self.provider)
+        self.provider.text_command(&self.config)
     }
     fn cache_control(&self) -> Option<Value> {
         match self.provider.prompt_caching {
@@ -882,11 +879,7 @@ impl Model {
             err.retry_after_secs = after;
             return Err(err);
         }
-        let locator = self
-            .config
-            .reported_cost
-            .as_ref()
-            .or(self.provider.reported_cost.as_ref());
+        let locator = self.provider.reported_cost(&self.config);
         if let Some(ReportedCost::Header { name, unit }) = locator {
             state.reported_cost = response
                 .headers()

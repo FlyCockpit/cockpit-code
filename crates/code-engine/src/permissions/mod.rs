@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use code_config::{PermissionMode, Snapshot, ThinkingMode};
+use code_config::{ConfigStore, PermissionMode, ThinkingMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) fn session_gate(
     control: Arc<Control>,
-    config: Arc<Mutex<Snapshot>>,
+    config: Arc<Mutex<ConfigStore>>,
     custom: Option<Arc<dyn PermissionGate>>,
 ) -> Arc<dyn PermissionGate> {
     let policy = SessionGate::new(control, config);
@@ -79,7 +79,7 @@ impl PermissionGate for CustomGate {
 
 pub(crate) struct SessionGate {
     pub control: Arc<Control>,
-    pub config: Arc<Mutex<Snapshot>>,
+    pub config: Arc<Mutex<ConfigStore>>,
     grants: Mutex<BTreeSet<String>>,
     approval_queue: tokio::sync::Mutex<()>,
     libraries: tokio::sync::Mutex<crate::reviewer::Libraries>,
@@ -131,7 +131,7 @@ impl SessionGate {
         }
         Ok(None)
     }
-    pub fn new(control: Arc<Control>, config: Arc<Mutex<Snapshot>>) -> Self {
+    pub fn new(control: Arc<Control>, config: Arc<Mutex<ConfigStore>>) -> Self {
         Self {
             control,
             config,
@@ -332,14 +332,11 @@ pub const TOOL_CALL_PROMPT: &str = include_str!("../builtin/safety-tool-call.md"
 pub const WRITE_EDIT_PROMPT: &str = include_str!("../builtin/safety-write-edit.md");
 
 /// Validate the session safety authority independently of subagent eligibility.
-pub(crate) fn validate_model(snapshot: &Snapshot, id: &str) -> Result<(), EngineError> {
-    let (provider, model) = id
-        .split_once('/')
+pub(crate) fn validate_model(snapshot: &ConfigStore, id: &str) -> Result<(), EngineError> {
+    id.split_once('/')
         .ok_or_else(|| EngineError::bad("safety model must be provider/model"))?;
-    let entry = snapshot
-        .providers
-        .get(provider)
-        .and_then(|provider| provider.models.get(model))
+    let (_, entry) = snapshot
+        .model(id)
         .ok_or_else(|| EngineError::bad(format!("safety model {id} is not configured")))?;
     if !entry
         .capabilities
@@ -443,15 +440,10 @@ impl SessionGate {
         let (provider, model) = id
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("safety model unavailable"))?;
-        let provider_config = snapshot
-            .providers
-            .get(provider)
+        let (provider_config, config) = snapshot
+            .model(id)
             .ok_or_else(|| anyhow::anyhow!("safety model unavailable"))?;
-        let mut config = provider_config
-            .models
-            .get(model)
-            .ok_or_else(|| anyhow::anyhow!("safety model unavailable"))?
-            .clone();
+        let mut config = config.clone();
         config.reasoning.default = None;
         config.reasoning.efforts.clear();
         config.thinking = Some(ThinkingMode::None);
@@ -479,18 +471,15 @@ impl SessionGate {
             });
             json!({"action":op,"contract":j.contracts.get(&op.agent_id).map(crate::goal::GoalContract::open_context),"latestMessage":latest})
         };
-        let prompts = &snapshot.config.permissions.prompts;
-        let system = if matches!(op.call.name.as_str(), "write" | "edit") {
-            prompts
-                .resolved_write_edit
-                .as_deref()
-                .unwrap_or(WRITE_EDIT_PROMPT)
-        } else {
-            prompts
-                .resolved_tool_call
-                .as_deref()
-                .unwrap_or(TOOL_CALL_PROMPT)
-        };
+        let writes = matches!(op.call.name.as_str(), "write" | "edit");
+        let system = snapshot
+            .config()
+            .review_prompt(writes)
+            .unwrap_or(if writes {
+                WRITE_EDIT_PROMPT
+            } else {
+                TOOL_CALL_PROMPT
+            });
         let system = format!(
             "{system}\n\nThe improve verdict may include an optional focuses array of short strings, one perspective per variation. Return the same verdict/reason/hint fields plus focuses when useful."
         );
@@ -499,7 +488,7 @@ impl SessionGate {
             .project_reviewer_guidance(&op.cwd, cancel)
             .await?;
         let mut system = system;
-        if let Some(global) = &snapshot.config.permissions.resolved_reviewer_guidance {
+        if let Some(global) = snapshot.config().reviewer_guidance() {
             system.push_str(&format!("\n\nGlobal reviewer guidance:\n{global}"));
         }
         if let Some(project) = project {
@@ -733,7 +722,7 @@ impl PermissionGate for SessionGate {
             .unwrap()
             .settings
             .mode
-            .unwrap_or(snapshot.config.permissions.mode);
+            .unwrap_or(snapshot.config().permissions.mode);
         if !matches!(mode, PermissionMode::Auto | PermissionMode::Unattended)
             || !needs_review(op)
             || granted(&self.grants.lock().unwrap(), op)
@@ -757,7 +746,7 @@ impl PermissionGate for SessionGate {
                 &self.control,
                 &snapshot,
                 op,
-                snapshot.config.permissions.auto_variations,
+                snapshot.config().permissions.auto_variations,
                 &verdict.hint,
                 &verdict.focuses,
                 "improve",
@@ -792,7 +781,7 @@ impl PermissionGate for SessionGate {
         )?;
         let override_mode = self.control.journal.lock().unwrap().settings.mode;
         let mode =
-            override_mode.unwrap_or_else(|| self.config.lock().unwrap().config.permissions.mode);
+            override_mode.unwrap_or_else(|| self.config.lock().unwrap().config().permissions.mode);
         crate::exclusive::check_mode(&self.control.journal.lock().unwrap().settings, mode)?;
         let final_check = self.final_checks.lock().unwrap().contains(&op.call.id);
         let gated = final_check

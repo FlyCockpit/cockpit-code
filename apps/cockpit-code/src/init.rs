@@ -228,7 +228,7 @@ pub fn run(args: &InitArgs, json_output: bool, cwd: &Path) -> Result<(), Box<dyn
         )?);
     }
     let store = code_config::ConfigStore::load(dirs.clone())?;
-    let detection = code_engine::lsp_defaults::resolve(&store.snapshot().config.lsp, cwd);
+    let detection = code_engine::lsp_defaults::resolve(&store.config().lsp, cwd);
     if json_output {
         println!(
             "{}",

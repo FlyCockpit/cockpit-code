@@ -1,23 +1,8 @@
 //! Advertisement is independent of availability. Filter capabilities first.
 use crate::{tool_names::Names, tools::ToolDefinition};
-use code_config::{Snapshot, tools::Profile};
+use code_config::tools::Profile;
 use std::collections::BTreeMap;
 
-pub(crate) fn snapshots(snapshot: &Snapshot) -> BTreeMap<String, Profile> {
-    let global = snapshot.config.tools.profile;
-    let mut profiles = BTreeMap::from([(String::new(), global)]);
-    for (pid, provider) in &snapshot.providers {
-        let inherited = provider.tools.profile.unwrap_or(global);
-        profiles.insert(format!("{pid}/"), inherited);
-        for (mid, model) in &provider.models {
-            profiles.insert(
-                format!("{pid}/{mid}"),
-                model.tools.profile.unwrap_or(inherited),
-            );
-        }
-    }
-    profiles
-}
 pub(crate) fn selected(profiles: &BTreeMap<String, Profile>, model: &str) -> Profile {
     profiles
         .get(model)

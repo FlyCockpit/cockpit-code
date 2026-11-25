@@ -242,7 +242,7 @@ pub(crate) fn show(control: &Control, caller: &str, id: &str) -> Result<Value, E
 }
 pub(crate) async fn ask(
     control: &Arc<Control>,
-    snapshot: &code_config::Snapshot,
+    snapshot: &code_config::ConfigStore,
     caller: &str,
     target: &str,
     question: &str,
@@ -283,8 +283,7 @@ pub(crate) async fn ask(
     )?;
     let pending=async {
         let body:Value=serde_json::from_slice(&checkpoint.request.body).map_err(|e|EngineError::bad(e.to_string()))?;
-        let mut provider=snapshot.providers.get(&checkpoint.provider_id).cloned().ok_or_else(||EngineError::bad("fork provider unavailable"))?;
-        provider.prompt_caching=checkpoint.caching.clone();
+        let provider=snapshot.provider(&checkpoint.provider_id).ok_or_else(||EngineError::bad("fork provider unavailable"))?.with_caching(checkpoint.caching.clone());
         let model=crate::model::Model::new(checkpoint.provider_id.clone(),body["model"].as_str().ok_or_else(||EngineError::bad("checkpoint model unavailable"))?.into(),provider,checkpoint.config.clone(),checkpoint.effort.as_deref())?;
         let current_report = {
             let journal = control.journal.lock().unwrap();
@@ -328,7 +327,7 @@ pub(crate) async fn execute(
         Some("ask") => {
             ask(
                 &state.control,
-                state.store.snapshot(),
+                &state.store,
                 &state.agent_id,
                 id()?,
                 args["question"]

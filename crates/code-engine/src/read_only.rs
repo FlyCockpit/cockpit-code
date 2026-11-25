@@ -59,7 +59,7 @@ impl PermissionGate for Scope {
 #[derive(Clone)]
 pub(crate) struct WebAccess {
     pub gate: Arc<dyn PermissionGate>,
-    pub config: Arc<Mutex<code_config::Snapshot>>,
+    pub config: Arc<Mutex<code_config::ConfigStore>>,
     pub blocked: Arc<dyn Fn() -> bool + Send + Sync>,
     pub agent_id: String,
     pub breadcrumb: String,
@@ -161,7 +161,7 @@ impl ReadOnly {
         let mut op = PreparedOperation::metadata(call.clone(), self.resolver.cwd.clone(), None);
         op.agent_id = web.agent_id.clone();
         op.breadcrumb = web.breadcrumb.clone();
-        let config = web.config.lock().unwrap().config.web.clone();
+        let config = web.config.lock().unwrap().config().web.clone();
         crate::tools::web::execute(web.gate.as_ref(), op, &config, (web.blocked)(), cancel)
             .await
             .map(|output| crate::tools::cap(&output))

@@ -4,7 +4,7 @@ use crate::{
     schema::{EngineError, HistoryEvent},
     tools::ToolDefinition,
 };
-use code_config::{Snapshot, tools::ToolOverride};
+use code_config::{ConfigStore, tools::ToolOverride};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 pub(crate) type Overrides = BTreeMap<String, ToolOverride>;
@@ -74,42 +74,20 @@ impl Names {
             .into_owned()
     }
 }
-pub(crate) fn merged(snapshot: &Snapshot, id: &str) -> Overrides {
-    let mut out = snapshot.tools.clone();
-    if let Some((p, m)) = id.split_once('/')
-        && let Some(provider) = snapshot.providers.get(p)
-    {
-        for layer in [
-            Some(&provider.tools.overrides),
-            provider.models.get(m).map(|c| &c.tools.overrides),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            for (name, config) in layer {
-                out.entry(name.clone()).or_default().overlay(config);
-            }
-        }
-    }
-    out
-}
-pub(crate) fn snapshots(snapshot: &Snapshot) -> BTreeMap<String, Overrides> {
+pub(crate) fn snapshots(snapshot: &ConfigStore) -> BTreeMap<String, Overrides> {
     let mut out: BTreeMap<_, _> = snapshot
-        .providers
-        .iter()
-        .flat_map(|(p, provider)| {
-            provider.models.keys().map(move |m| {
-                let id = format!("{p}/{m}");
-                let overrides = merged(snapshot, &id);
-                (id, overrides)
-            })
+        .models()
+        .map(|(p, _, m, _)| {
+            let id = format!("{p}/{m}");
+            let overrides = snapshot.tool_overrides(&id);
+            (id, overrides)
         })
         .collect();
-    out.insert(String::new(), merged(snapshot, ""));
-    for provider in snapshot.providers.keys() {
+    out.insert(String::new(), snapshot.tool_overrides(""));
+    for (provider, _) in snapshot.providers() {
         out.insert(
             format!("{provider}/"),
-            merged(snapshot, &format!("{provider}/")),
+            snapshot.tool_overrides(&format!("{provider}/")),
         );
     }
     out
@@ -210,7 +188,7 @@ impl State {
             .frozen
             .as_ref()
             .map(|c| frozen(&c.tool_overrides, &id))
-            .unwrap_or_else(|| merged(self.store.snapshot(), &id))
+            .unwrap_or_else(|| self.store.tool_overrides(&id))
     }
     pub(crate) fn tool_names(&self) -> Names {
         names(&self.tool_overrides())
@@ -224,7 +202,7 @@ impl Control {
             j.settings
                 .model
                 .as_deref()
-                .or(config.config.default_model.as_deref())
+                .or(config.config().default_model.as_deref())
         } else {
             j.agents.get(agent).and_then(|a| a.model.as_deref())
         }
@@ -250,11 +228,11 @@ impl Control {
         if let Some(context) = context {
             return names(&frozen(&context.tool_overrides, id));
         }
-        names(&merged(&config, id))
+        names(&config.tool_overrides(id))
     }
 }
-pub fn warnings(snapshot: &Snapshot, id: &str) -> Vec<String> {
-    let overrides = merged(snapshot, id);
+pub fn warnings(snapshot: &ConfigStore, id: &str) -> Vec<String> {
+    let overrides = snapshot.tool_overrides(id);
     let mut out = vec![];
     for core in ["read", "edit", "write", "bash"] {
         if overrides
@@ -328,9 +306,15 @@ mod tests {
 
     #[test]
     fn retired_search_override_is_an_unknown_tool() {
-        let mut snapshot = Snapshot::default();
-        snapshot.tools.insert("search".into(), Default::default());
-        let overrides = merged(&snapshot, "");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("tools.json"), r#"{"search":{}}"#).unwrap();
+        let store = ConfigStore::load(code_config::Directories {
+            config: temp.path().into(),
+            data: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        let overrides = store.tool_overrides("");
         assert!(overrides.contains_key("search"));
         let error = apply(crate::tool_defaults::definitions(), &overrides).unwrap_err();
         assert_eq!(error.message, "unknown tool override search");

@@ -83,11 +83,7 @@ impl FrozenContext {
                 )
             } else {
                 let mut hashes = BTreeMap::new();
-                let config = &store.snapshot().config;
-                let system_path = config
-                    .system_prompt
-                    .clone()
-                    .unwrap_or_else(|| store.directories.config.join("system.md"));
+                let system_path = store.system_prompt_path();
                 let system = read_source(&system_path, &mut hashes)?.unwrap_or_else(|| BASE.into());
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
@@ -144,26 +140,22 @@ impl FrozenContext {
         }
         let model_steering = global.map(|g| g.model_steering.clone()).unwrap_or_else(|| {
             store
-                .snapshot()
-                .providers
-                .iter()
-                .flat_map(|(p, provider)| {
-                    provider.models.iter().map(move |(m, c)| {
-                        (
-                            format!("{p}/{m}"),
-                            ModelSteering {
-                                prompt: c.model_prompt.clone(),
-                                reminder: c.model_reminder.clone(),
-                                reminder_turns: c.model_reminder_turns.unwrap_or(10),
-                            },
-                        )
-                    })
+                .models()
+                .map(|(p, _, m, c)| {
+                    (
+                        format!("{p}/{m}"),
+                        ModelSteering {
+                            prompt: c.model_prompt.clone(),
+                            reminder: c.model_reminder.clone(),
+                            reminder_turns: c.model_reminder_turns.unwrap_or(10),
+                        },
+                    )
                 })
                 .collect()
         });
         let tool_overrides = global
             .map(|g| g.tool_overrides.clone())
-            .unwrap_or_else(|| crate::tool_names::snapshots(store.snapshot()));
+            .unwrap_or_else(|| crate::tool_names::snapshots(store));
         Ok(Self {
             tool_model: None,
             tool_overrides,
@@ -180,7 +172,7 @@ impl FrozenContext {
             model_catalogs: BTreeMap::new(),
             tool_profiles: global
                 .map(|g| g.tool_profiles.clone())
-                .unwrap_or_else(|| crate::tool_profiles::snapshots(store.snapshot())),
+                .unwrap_or_else(|| store.tool_profiles()),
             base_and_global,
             global_skills,
             global_hashes,
@@ -228,14 +220,7 @@ impl FrozenContext {
         store: &ConfigStore,
     ) -> Result<BTreeMap<PathBuf, Option<String>>, EngineError> {
         let mut paths = self.source_hashes.keys().cloned().collect::<Vec<_>>();
-        paths.push(
-            store
-                .snapshot()
-                .config
-                .system_prompt
-                .clone()
-                .unwrap_or_else(|| store.directories.config.join("system.md")),
-        );
+        paths.push(store.system_prompt_path());
         for dir in [
             std::env::var_os("HOME")
                 .map(PathBuf::from)

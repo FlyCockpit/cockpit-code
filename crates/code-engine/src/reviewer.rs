@@ -111,7 +111,7 @@ pub(crate) async fn check(
         crate::read_only::ALLOWED, if safety_only { "" } else { "|\"improve\"" },
         if safety_only { "This is the final safety-only check. Never request another improvement round." } else { "Use improve only for a safe action for which a concrete better variation is warranted." },
     )) });
-    let overrides = crate::tool_names::merged(&control.config.lock().unwrap(), &model.id());
+    let overrides = control.config.lock().unwrap().tool_overrides(&model.id());
     let names = crate::tool_names::names(&overrides);
     let definitions = crate::tool_names::apply(ReadOnly::definitions(), &overrides)?;
     let reader = ReadOnly::new(cwd.to_owned())

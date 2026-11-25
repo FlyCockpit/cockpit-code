@@ -1,7 +1,7 @@
 //! Provider account usage and soft budgets. Catalog reads never run a command.
 use crate::schema::{EngineError, UsageRecord};
 use chrono::{Datelike, Duration, TimeZone, Utc};
-use code_config::{BudgetPeriod, ConfigStore, Provider, Snapshot};
+use code_config::{BudgetPeriod, ConfigStore, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -107,7 +107,7 @@ struct Data {
     costs_loaded: bool,
 }
 pub struct Cache {
-    config: Mutex<Snapshot>,
+    config: Mutex<ConfigStore>,
     data: Mutex<Data>,
     cache_dir: PathBuf,
     data_dir: PathBuf,
@@ -118,11 +118,7 @@ fn instances() -> &'static Mutex<BTreeMap<PathBuf, Weak<Cache>>> {
 }
 fn fingerprint(provider: &Provider) -> String {
     crate::hex::hex(&Sha256::digest(
-        serde_json::to_vec(&(
-            provider.usage_argv(),
-            provider.connection_command().map(|c| &c.env),
-        ))
-        .unwrap_or_default(),
+        serde_json::to_vec(&(provider.usage_argv(), provider.command_env())).unwrap_or_default(),
     ))
 }
 impl Cache {
@@ -130,19 +126,19 @@ impl Cache {
     pub fn start(store: &ConfigStore) -> Arc<Self> {
         let mut instances = instances().lock().unwrap();
         if let Some(cache) = instances
-            .get(&store.directories.data)
+            .get(&store.directories().data)
             .and_then(Weak::upgrade)
         {
-            cache.update_config(store.snapshot());
+            cache.update_config(store);
             return cache;
         }
         let cache = Arc::new(Self {
-            config: Mutex::new(store.snapshot().clone()),
+            config: Mutex::new(store.clone()),
             data: Mutex::default(),
-            cache_dir: store.directories.cache.join("usage"),
-            data_dir: store.directories.data.clone(),
+            cache_dir: store.directories().cache.join("usage"),
+            data_dir: store.directories().data,
         });
-        instances.insert(store.directories.data.clone(), Arc::downgrade(&cache));
+        instances.insert(store.directories().data, Arc::downgrade(&cache));
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let weak = Arc::downgrade(&cache);
             runtime.spawn(async move {
@@ -204,7 +200,7 @@ impl Cache {
         }
         cache
     }
-    pub fn update_config(&self, snapshot: &Snapshot) {
+    pub fn update_config(&self, snapshot: &ConfigStore) {
         *self.config.lock().unwrap() = snapshot.clone();
     }
     pub fn observe(&self, ts: &str, usage: &UsageRecord) {
@@ -212,8 +208,7 @@ impl Cache {
             .config
             .lock()
             .unwrap()
-            .providers
-            .get(&usage.provider)
+            .provider(&usage.provider)
             .map(fingerprint);
         let mut data = self.data.lock().unwrap();
         data.costs
@@ -274,12 +269,21 @@ impl Cache {
         });
     }
     pub async fn refresh(self: &Arc<Self>, force: bool) {
-        let providers = self.config.lock().unwrap().providers.clone();
+        let providers: Vec<(String, Provider)> = self
+            .config
+            .lock()
+            .unwrap()
+            .providers()
+            .map(|(id, provider)| (id.clone(), provider.clone()))
+            .collect();
         let mut tasks = Vec::new();
         for (id, provider) in providers {
             if !provider.enabled || provider.usage_argv().is_none() {
                 continue;
             }
+            let Some(ttl) = provider.usage_ttl_secs() else {
+                continue;
+            };
             let fingerprint = fingerprint(&provider);
             {
                 let mut data = self.data.lock().unwrap();
@@ -290,13 +294,7 @@ impl Cache {
                             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                             .is_some_and(|t| {
                                 (Utc::now() - t.with_timezone(&Utc)).num_seconds()
-                                    < provider
-                                        .usage
-                                        .as_ref()
-                                        .and_then(|u| u.ttl_secs)
-                                        .unwrap_or(300)
-                                        .min(i64::MAX as u64)
-                                        as i64
+                                    < ttl.min(i64::MAX as u64) as i64
                             })
                 });
                 if data.running.contains(&id) || (!force && fresh) {
@@ -350,8 +348,7 @@ impl Cache {
         let config = self.config.lock().unwrap();
         let data = self.data.lock().unwrap();
         config
-            .providers
-            .iter()
+            .providers()
             .map(|(id, provider)| view(id, provider, &data))
             .collect()
     }
@@ -359,8 +356,7 @@ impl Cache {
         let config = self.config.lock().unwrap();
         let data = self.data.lock().unwrap();
         config
-            .providers
-            .get(provider)
+            .provider(provider)
             .map(|p| view(provider, p, &data).headroom)
             .unwrap_or(Value::Null)
     }
@@ -416,7 +412,9 @@ fn view(id: &str, provider: &Provider, data: &Data) -> ProviderUsage {
         .cloned()
         .unwrap_or_default();
     let document = cached.document.clone();
-    let bounds = provider.budget.as_ref().map(|b| period(b.period));
+    let soft_budget = provider.budget();
+    let usage_ttl = provider.usage_ttl_secs();
+    let bounds = soft_budget.as_ref().map(|b| period(b.period));
     let mut spent = 0.0;
     let mut unknown = 0;
     for (ts, usage) in data.costs.values().filter(|(_, u)| u.provider == id) {
@@ -448,7 +446,7 @@ fn view(id: &str, provider: &Provider, data: &Data) -> ProviderUsage {
     {
         spent = spent.max(reported);
     }
-    let budget = provider.budget.as_ref().map(|b| Limit {
+    let budget = soft_budget.map(|b| Limit {
         id: "budget".into(),
         label: format!("Soft {:?} budget", b.period),
         used_percent: Some(spent / b.usd * 100.0),
@@ -486,35 +484,31 @@ fn view(id: &str, provider: &Provider, data: &Data) -> ProviderUsage {
     let mut headroom = if let Some((kind, limit, percent)) = tightest {
         json!({"kind":kind,"remainingPercent":(100.0-percent).max(0.0),"resetsAt":limit.resets_at})
     } else {
-        json!({"kind":if provider.usage.is_some() {"quota"} else {"unlimited"}})
+        json!({"kind":if usage_ttl.is_some() {"quota"} else {"unlimited"}})
     };
     if data.costs_loaded {
         headroom["spentUsd"] = json!(spent);
     } else if headroom["kind"] == "budget" {
         headroom.as_object_mut().unwrap().remove("remainingPercent");
     }
-    let expired = cached
-        .fetched_at
-        .as_ref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .is_none_or(|t| {
-            (Utc::now() - t.with_timezone(&Utc)).num_seconds()
-                >= provider
-                    .usage
-                    .as_ref()
-                    .and_then(|u| u.ttl_secs)
-                    .unwrap_or(300)
-                    .min(i64::MAX as u64) as i64
-        });
+    let expired = |ttl: u64| {
+        cached
+            .fetched_at
+            .as_ref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_none_or(|t| {
+                (Utc::now() - t.with_timezone(&Utc)).num_seconds()
+                    >= ttl.min(i64::MAX as u64) as i64
+            })
+    };
+    let usage_expired = usage_ttl.is_some_and(expired);
     ProviderUsage {
         provider: id.into(),
         label: provider.label.clone(),
         document,
         fetched_at: cached.fetched_at,
         error: cached.error.clone(),
-        stale: cached.error.is_some()
-            || (provider.usage.is_some() && expired)
-            || !data.costs_loaded,
+        stale: cached.error.is_some() || usage_expired || !data.costs_loaded,
         refreshing: data.running.contains(id),
         budget,
         spent_usd: spent,
@@ -534,8 +528,8 @@ async fn read_command(provider: &Provider) -> Result<Document, EngineError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    if let Some(config) = provider.connection_command() {
-        command.envs(&config.env);
+    if let Some(env) = provider.command_env() {
+        command.envs(env);
     }
     #[cfg(unix)]
     command.process_group(0);

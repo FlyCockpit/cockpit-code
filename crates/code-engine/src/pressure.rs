@@ -31,13 +31,11 @@ impl Control {
             j.settings
                 .model
                 .as_deref()
-                .or(config.config.default_model.as_deref())
+                .or(config.config().default_model.as_deref())
         } else {
             j.agents.get(agent).and_then(|a| a.model.as_deref())
         };
-        let model_config = id
-            .and_then(|id| id.split_once('/'))
-            .and_then(|(p, m)| config.providers.get(p)?.models.get(m));
+        let model_config = id.and_then(|id| config.model(id)).map(|(_, m)| m);
         let model_config = checkpoint.map(|p| &p.config).or(model_config);
         let window = model_config.and_then(|m| m.context_window);
         let compact_at = id

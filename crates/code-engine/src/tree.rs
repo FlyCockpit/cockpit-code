@@ -340,7 +340,7 @@ pub(crate) fn execute<'a>(
     })
 }
 fn models(state: &State, args: &Value) -> Result<String, EngineError> {
-    let snapshot = state.store.snapshot();
+    let snapshot = &state.store;
     let settings = state.control.journal.lock().unwrap().settings.clone();
     let toggles = ModelToggles {
         disabled_models: settings.disabled_models,
@@ -349,59 +349,57 @@ fn models(state: &State, args: &Value) -> Result<String, EngineError> {
     let filter = &args["filter"];
     let action = field(args, "action")?;
     let mut rows = Vec::new();
-    for (provider_id, provider) in &snapshot.providers {
-        for (model_id, model) in &provider.models {
-            if !code_config::subagent_eligible(provider_id, model_id, provider, model, &toggles) {
-                continue;
-            }
-            let id = format!("{provider_id}/{model_id}");
-            if !state.control.model_allowed(&state.agent_id, &id) {
-                continue;
-            }
-            if settings.exclusive.as_ref().is_some_and(|ex| ex.model != id) {
-                continue;
-            }
-            if filter["provider"]
-                .as_str()
-                .is_some_and(|p| p != provider_id)
-                || filter["minContext"]
-                    .as_u64()
-                    .is_some_and(|n| model.context_window.unwrap_or(0) < n)
+    for (provider_id, provider, model_id, model) in snapshot.models() {
+        if !code_config::subagent_eligible(provider_id, model_id, provider, model, &toggles) {
+            continue;
+        }
+        let id = format!("{provider_id}/{model_id}");
+        if !state.control.model_allowed(&state.agent_id, &id) {
+            continue;
+        }
+        if settings.exclusive.as_ref().is_some_and(|ex| ex.model != id) {
+            continue;
+        }
+        if filter["provider"]
+            .as_str()
+            .is_some_and(|p| p != provider_id)
+            || filter["minContext"]
+                .as_u64()
+                .is_some_and(|n| model.context_window.unwrap_or(0) < n)
+        {
+            continue;
+        }
+        if let Some(inputs) = filter["inputs"].as_array() {
+            let configured = serde_json::to_value(&model.capabilities.input).unwrap();
+            if !inputs
+                .iter()
+                .all(|v| configured.as_array().unwrap().contains(v))
             {
                 continue;
             }
-            if let Some(inputs) = filter["inputs"].as_array() {
-                let configured = serde_json::to_value(&model.capabilities.input).unwrap();
-                if !inputs
-                    .iter()
-                    .all(|v| configured.as_array().unwrap().contains(v))
-                {
-                    continue;
-                }
-            }
-            if filter["text"].as_str().is_some_and(|s| {
-                !format!(
-                    "{id} {} {}",
-                    model.label.as_deref().unwrap_or(""),
-                    model.description
-                )
-                .to_lowercase()
-                .contains(&s.to_lowercase())
-            }) {
-                continue;
-            }
-            if action == "describe" {
-                let requested = args["id"]
-                    .as_str()
-                    .or(args["model"].as_str())
-                    .ok_or_else(|| EngineError::bad("describe requires id"))?;
-                if requested == id {
-                    return Ok(json!({"id":id,"provider":provider_id,"entry":model,"headroom":state.control.usage.headroom(provider_id)}).to_string());
-                }
-                continue;
-            }
-            rows.push(json!({"id":id,"label":model.label,"description":model.description.lines().next().unwrap_or(""),"headroom":state.control.usage.headroom(provider_id),"contextWindow":model.context_window,"input":model.capabilities.input,"output":model.capabilities.output,"benchmarks":model.benchmarks.keys().collect::<Vec<_>>(),"scores":model.benchmarks}));
         }
+        if filter["text"].as_str().is_some_and(|s| {
+            !format!(
+                "{id} {} {}",
+                model.label.as_deref().unwrap_or(""),
+                model.description
+            )
+            .to_lowercase()
+            .contains(&s.to_lowercase())
+        }) {
+            continue;
+        }
+        if action == "describe" {
+            let requested = args["id"]
+                .as_str()
+                .or(args["model"].as_str())
+                .ok_or_else(|| EngineError::bad("describe requires id"))?;
+            if requested == id {
+                return Ok(json!({"id":id,"provider":provider_id,"entry":model,"headroom":state.control.usage.headroom(provider_id)}).to_string());
+            }
+            continue;
+        }
+        rows.push(json!({"id":id,"label":model.label,"description":model.description.lines().next().unwrap_or(""),"headroom":state.control.usage.headroom(provider_id),"contextWindow":model.context_window,"input":model.capabilities.input,"output":model.capabilities.output,"benchmarks":model.benchmarks.keys().collect::<Vec<_>>(),"scores":model.benchmarks}));
     }
     if action == "describe" {
         return Err(EngineError::bad("model not found in eligible set"));
@@ -409,7 +407,7 @@ fn models(state: &State, args: &Value) -> Result<String, EngineError> {
     if action == "rank" {
         let benchmark = field(args, "benchmark")?;
         rows.retain(|r| r["scores"][benchmark].as_f64().is_some());
-        let higher = snapshot.config.higher_is_better(benchmark);
+        let higher = snapshot.config().higher_is_better(benchmark);
         rows.sort_by(|a, b| {
             let order = a["scores"][benchmark]
                 .as_f64()
@@ -611,7 +609,7 @@ async fn start_child(
             .config
             .lock()
             .unwrap()
-            .config
+            .config()
             .subagents
             .max_depth
             .unwrap_or(depth);
@@ -647,7 +645,7 @@ async fn start_child(
             .or(settings.model.clone())
             .as_ref()
             .cloned()
-            .or_else(|| state.store.snapshot().config.default_model.clone())
+            .or_else(|| state.store.config().default_model.clone())
             .ok_or_else(|| {
                 EngineError::bad(
                     "parent has no current model; pass an explicit subagent-eligible model",
@@ -695,9 +693,9 @@ async fn start_child(
     }
     let background = args["background"] == true;
     state.control.await_model(&model_id, cancel).await?;
-    let ready_store = ConfigStore::load(state.store.directories.clone())
+    let ready_store = code_config::ConfigStore::load(state.store.directories())
         .map_err(|e| EngineError::bad(e.to_string()))?;
-    let snapshot = ready_store.snapshot();
+    let snapshot = &ready_store;
     let toggles = ModelToggles {
         disabled_models: settings.disabled_models.clone(),
         disabled_providers: settings.disabled_providers.clone(),
@@ -705,15 +703,9 @@ async fn start_child(
     let (provider_id, model_name) = model_id
         .split_once('/')
         .ok_or_else(|| EngineError::bad("model must be provider/model"))?;
-    let eligible = snapshot
-        .providers
-        .get(provider_id)
-        .and_then(|p| {
-            p.models
-                .get(model_name)
-                .map(|m| code_config::subagent_eligible(provider_id, model_name, p, m, &toggles))
-        })
-        .unwrap_or(false);
+    let eligible = snapshot.model(&model_id).is_some_and(|(p, m)| {
+        code_config::subagent_eligible(provider_id, model_name, p, m, &toggles)
+    });
     if !eligible {
         return Err(EngineError::bad(if inherited_model {
             "parent's current model is not subagent-eligible; pass an explicit eligible model"
@@ -744,7 +736,7 @@ async fn start_child(
     resolver
         .validate(&cwd)
         .map_err(|e| EngineError::bad(e.to_string()))?;
-    let store = ConfigStore::load(state.store.directories.clone())
+    let store = code_config::ConfigStore::load(state.store.directories())
         .map_err(|e| EngineError::bad(e.to_string()))?;
     let inherited = if context == "fork" {
         state.history()
@@ -890,29 +882,23 @@ fn task_title(args: &Value, prompt: &str) -> Result<String, EngineError> {
     }
 }
 fn allowed_models(state: &State, policy: &[crate::ModelPolicy]) -> Vec<String> {
-    let snapshot = state.store.snapshot();
+    let snapshot = &state.store;
     let settings = state.model_settings();
     let toggles = ModelToggles {
         disabled_models: settings.disabled_models,
         disabled_providers: settings.disabled_providers,
     };
     snapshot
-        .providers
-        .iter()
-        .flat_map(|(provider, p)| {
-            p.models
-                .iter()
-                .filter_map(|(model, m)| {
-                    let id = format!("{provider}/{model}");
-                    (code_config::subagent_eligible(provider, model, p, m, &toggles)
-                        && crate::subtree::permits(policy, &id))
-                    .then_some(id)
-                })
-                .collect::<Vec<_>>()
+        .models()
+        .filter_map(|(provider, p, model, m)| {
+            let id = format!("{provider}/{model}");
+            (code_config::subagent_eligible(provider, model, p, m, &toggles)
+                && crate::subtree::permits(policy, &id))
+            .then_some(id)
         })
         .collect()
 }
-fn check_capacity(j: &Journal, parent: &str, snapshot: &Snapshot) -> Result<(), EngineError> {
+fn check_capacity(j: &Journal, parent: &str, snapshot: &ConfigStore) -> Result<(), EngineError> {
     if j.finalizing
         .iter()
         .any(|ancestor| ancestor == parent || crate::agents::descendant(j, ancestor, parent))
@@ -936,14 +922,14 @@ fn check_capacity(j: &Journal, parent: &str, snapshot: &Snapshot) -> Result<(), 
         .filter(|a| a.parent_id.as_deref() == Some(parent))
         .filter(alive)
         .count();
-    if children >= snapshot.config.subagents.max_concurrent_children {
+    if children >= snapshot.config().subagents.max_concurrent_children {
         return Err(EngineError::bad(
             "maxConcurrentChildren reached; wait for an existing child",
         ));
     }
     let total = j.agents.values().filter(alive).count();
     if snapshot
-        .config
+        .config()
         .subagents
         .max_total_agents
         .is_some_and(|n| total >= n)
@@ -974,7 +960,7 @@ async fn continue_child(
     }
     let id = field(args, "continue")?;
     let prompt = field(args, "prompt")?.to_owned();
-    let store = ConfigStore::load(state.store.directories.clone())
+    let store = code_config::ConfigStore::load(state.store.directories())
         .map_err(|e| EngineError::bad(e.to_string()))?;
     let mut contract = state.control.contract(id);
     let before_resolution = contract.clone();
@@ -1039,7 +1025,7 @@ async fn continue_child(
                 "only done, failed or roadblocked children can continue; use message to steer a running child; killed children cannot continue",
             ));
         }
-        check_capacity(&j, &state.agent_id, state.store.snapshot())?;
+        check_capacity(&j, &state.agent_id, &state.store)?;
         // Status can become terminal just before the runner publishes its result.
         if state
             .control
@@ -1476,7 +1462,7 @@ async fn launch_child(
             && control.contract(&run_id).roadblock().is_none()
             && !token.is_cancelled()
         {
-            let policy = child_state.store.snapshot().config.goal.clone();
+            let policy = child_state.store.config().goal.clone();
             for round in 0..policy.max_review_rounds {
                 match crate::goal_review::panel(&child_state, &token, barrier.clone()).await {
                     Ok((gaps, _)) if gaps.is_empty() => break,

@@ -7,7 +7,7 @@ use crate::{
     schema::*,
     tools::PreparedOperation,
 };
-use code_config::Snapshot;
+use code_config::ConfigStore;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -89,7 +89,7 @@ impl Control {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn select(
     control: &Control,
-    snapshot: &Snapshot,
+    snapshot: &ConfigStore,
     op: &PreparedOperation,
     count: usize,
     hint: &str,
@@ -123,8 +123,7 @@ pub(crate) async fn select(
         checkpoint.provider_id.clone()
     };
     let provider = snapshot
-        .providers
-        .get(&provider_id)
+        .provider(&provider_id)
         .cloned()
         .ok_or_else(|| EngineError::bad("author provider unavailable"))?;
     let body: Value = serde_json::from_slice(&checkpoint.request.body)
@@ -132,12 +131,7 @@ pub(crate) async fn select(
     let model_id = body["model"]
         .as_str()
         .ok_or_else(|| EngineError::bad("author model missing"))?;
-    if checkpoint.config.kind.unwrap_or(provider.kind) == code_config::ProviderType::Command
-        && provider
-            .command
-            .as_ref()
-            .is_some_and(|c| c.history.as_deref() == Some("latest"))
-    {
+    if provider.latest_history_only(&checkpoint.config) {
         return Ok(None);
     }
     let mut config = checkpoint.config.clone();

@@ -256,7 +256,7 @@ pub(crate) fn task_scope(
 }
 impl Control {
     fn save_scope_request(&self, mut request: ScopeRequest) -> Result<ScopeRequest, EngineError> {
-        let patterns = self.config.lock().unwrap().config.shared_paths.clone();
+        let patterns = self.config.lock().unwrap().config().shared_paths.clone();
         let envelopes = {
             let mut j = self.journal.lock().unwrap();
             if j.scope_requests
@@ -342,7 +342,7 @@ impl Control {
         let Some(path) = &op.target else {
             return Ok(None);
         };
-        let config = self.config.lock().unwrap().config.clone();
+        let config = self.config.lock().unwrap().config().clone();
         let request = {
             let j = self.journal.lock().unwrap();
             let Some(owner) = owner(&j, &op.agent_id, path, &config.shared_paths) else {
@@ -559,7 +559,7 @@ async fn resolve(
             if scope.is_empty() {
                 scope.push(request.path.parent().unwrap_or(&request.cwd).to_path_buf());
             }
-            let config = control.config.lock().unwrap().config.clone();
+            let config = control.config.lock().unwrap().config().clone();
             let mut j = control.journal.lock().unwrap();
             if owner(&j, &request.requester, &request.path, &config.shared_paths).as_deref()
                 != Some(&request.owner)
@@ -615,7 +615,7 @@ async fn resolve(
             request.output=Some("Scope granted. Re-read the file and retry the write/edit through its normal permission gate.".into());
         }
         ScopeDecision::Apply => {
-            let config = control.config.lock().unwrap().config.clone();
+            let config = control.config.lock().unwrap().config().clone();
             {
                 let j = control.journal.lock().unwrap();
                 let current = owner(&j, &request.requester, &request.path, &config.shared_paths);

@@ -21,7 +21,7 @@ use crate::{paths::Resolver, schema::Tokens, schema::UsageRecord};
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use code_config::{
-    ImageRequest, Modality, ModelConfig, Provider, ProviderType, ReportedCost, Snapshot,
+    ConfigStore, ImageRequest, Modality, ModelConfig, Provider, ProviderType, ReportedCost,
 };
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
@@ -54,13 +54,10 @@ fn media(kind: &Modality) -> bool {
 }
 
 /// Whether `generate` belongs in a new agent's `tools[]` (fixed afterwards).
-pub(crate) fn offered(snapshot: &Snapshot) -> bool {
-    snapshot.providers.values().any(|p| {
-        p.enabled
-            && p.models
-                .values()
-                .any(|m| m.capabilities.output.iter().any(media))
-    })
+pub(crate) fn offered(snapshot: &ConfigStore) -> bool {
+    snapshot
+        .models()
+        .any(|(_, p, _, m)| p.enabled && m.capabilities.output.iter().any(media))
 }
 
 pub(crate) struct Context<'a> {
@@ -68,7 +65,7 @@ pub(crate) struct Context<'a> {
     pub gate: &'a dyn PermissionGate,
     pub barrier: &'a CommitBarrier,
     pub op: PreparedOperation,
-    pub snapshot: Snapshot,
+    pub snapshot: ConfigStore,
     pub session_id: String,
     pub agent_id: String,
     pub assets: PathBuf,
@@ -84,7 +81,7 @@ pub(crate) struct Generated {
 }
 
 pub(crate) async fn execute(ctx: Context<'_>) -> Result<Generated> {
-    let limits = Limits::new(ctx.snapshot.config.generate.max_output_bytes);
+    let limits = Limits::new(ctx.snapshot.config().generate.max_output_bytes);
     execute_with(ctx, limits).await
 }
 
@@ -261,21 +258,15 @@ fn provider_kind(provider: &Provider, model: &ModelConfig) -> ProviderType {
 }
 
 fn choose(
-    snapshot: &Snapshot,
+    snapshot: &ConfigStore,
     requested: Option<&str>,
     kind: &Modality,
     kind_name: &str,
 ) -> Result<(String, String, Provider, ModelConfig)> {
     let candidates = snapshot
-        .providers
-        .iter()
-        .filter(|(_, p)| p.enabled)
-        .flat_map(|(pid, p)| {
-            p.models
-                .iter()
-                .filter(|(_, m)| m.capabilities.output.contains(kind))
-                .map(move |(mid, m)| (pid.clone(), mid.clone(), p.clone(), m.clone()))
-        })
+        .models()
+        .filter(|(_, p, _, m)| p.enabled && m.capabilities.output.contains(kind))
+        .map(|(pid, p, mid, m)| (pid.clone(), mid.clone(), p.clone(), m.clone()))
         .collect::<Vec<_>>();
     let ids = candidates
         .iter()
@@ -443,11 +434,7 @@ async fn send(
         .await
         .map_err(|_| anyhow::anyhow!("provider network error"))?;
     let status = response.status();
-    let header_cost = match model
-        .reported_cost
-        .as_ref()
-        .or(provider.reported_cost.as_ref())
-    {
+    let header_cost = match provider.reported_cost(model) {
         Some(ReportedCost::Header { name, unit }) => response
             .headers()
             .get(name)
@@ -528,11 +515,7 @@ async fn send(
         cache_write_tokens: None,
         reasoning_tokens: None,
     };
-    let body_cost = match model
-        .reported_cost
-        .as_ref()
-        .or(provider.reported_cost.as_ref())
-    {
+    let body_cost = match provider.reported_cost(model) {
         Some(ReportedCost::Body { pointer, unit }) => value
             .pointer(pointer)
             .and_then(Value::as_f64)
@@ -999,15 +982,11 @@ mod tests {
         config: Value,
     ) -> (tempfile::TempDir, crate::Session) {
         let (dir, store) = crate::test_support::store(config);
-        let providers = store.directories.config.join("providers");
+        let providers = store.directories().config.join("providers");
         std::fs::create_dir_all(&providers).unwrap();
         std::fs::write(providers.join("p.json"), provider.to_string()).unwrap();
-        let store = code_config::ConfigStore::load(store.directories.clone()).unwrap();
-        assert!(
-            store.snapshot().errors.is_empty(),
-            "{:?}",
-            store.snapshot().errors
-        );
+        let store = ConfigStore::load(store.directories()).unwrap();
+        assert!(store.errors().is_empty(), "{:?}", store.errors());
         let session = crate::Session::create(store, dir.path().into(), Default::default()).unwrap();
         (dir, session)
     }
@@ -1763,15 +1742,15 @@ mod tests {
         session.shutdown().await.unwrap();
         let (_dir, store) = crate::test_support::store(json!({}));
         assert_eq!(
-            store.snapshot().config.generate.max_output_bytes,
+            store.config().generate.max_output_bytes,
             4 * 1024 * 1024 * 1024
         );
         std::fs::write(
-            store.directories.config.join("config.json"),
+            store.directories().config.join("config.json"),
             r#"{"generate":{"maxOutputBytes":0}}"#,
         )
         .unwrap();
-        let error = code_config::ConfigStore::load(store.directories.clone())
+        let error = ConfigStore::load(store.directories())
             .err()
             .unwrap()
             .to_string();

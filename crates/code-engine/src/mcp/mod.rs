@@ -2,7 +2,7 @@
 pub mod protocol;
 mod transport;
 use anyhow::{Result, bail};
-use code_config::{Mcp, Snapshot, Transport};
+use code_config::{ConfigStore, Mcp, Transport};
 use protocol::{McpClient, ToolDescriptor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,7 +50,7 @@ pub(crate) struct Manager {
     notices: Mutex<VecDeque<String>>,
 }
 impl Manager {
-    pub fn new(snapshot: &Snapshot, enabled: &BTreeSet<String>, cwd: PathBuf) -> Self {
+    pub fn new(snapshot: &ConfigStore, enabled: &BTreeSet<String>, cwd: PathBuf) -> Self {
         let manager = Self {
             entries: Mutex::default(),
             cwd,
@@ -61,12 +61,12 @@ impl Manager {
         manager.configure(snapshot, enabled);
         manager
     }
-    pub fn configure(&self, snapshot: &Snapshot, enabled: &BTreeSet<String>) {
+    pub fn configure(&self, snapshot: &ConfigStore, enabled: &BTreeSet<String>) {
         let mut entries = self.entries.lock().unwrap();
         for entry in entries.values() {
             entry.configured.store(false, Ordering::Release);
         }
-        for (name, config) in &snapshot.mcps {
+        for (name, config) in snapshot.mcps() {
             let entry = entries.entry(name.clone()).or_insert_with(|| {
                 Arc::new(Entry {
                     config: Mutex::new(config.clone()),
@@ -100,7 +100,7 @@ impl Manager {
             entry.status.lock().unwrap().description = config.description.clone();
         }
     }
-    pub fn refresh(self: &Arc<Self>, snapshot: &Snapshot, enabled: &BTreeSet<String>) {
+    pub fn refresh(self: &Arc<Self>, snapshot: &ConfigStore, enabled: &BTreeSet<String>) {
         self.configure(snapshot, enabled);
         self.set_enabled(enabled);
     }

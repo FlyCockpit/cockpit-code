@@ -116,7 +116,7 @@ pub(crate) async fn execute(
         let changed = state.control.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        let config = state.config.lock().unwrap().config.clone();
+        let config = state.config.lock().unwrap().config().clone();
         let deadline = state
             .control
             .background_deadline(&state.agent_id, started, &config);

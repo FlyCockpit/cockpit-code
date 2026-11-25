@@ -2,9 +2,8 @@
 //! catalog, which providers need discovery, and each provider's usage.
 use super::views::QueueClass;
 use crate::usage::{self, Budget, ProviderUsage};
-use code_config::{Billing, Directories, Modality, ModelToggles, Snapshot};
+use code_config::{Billing, ConfigStore, Directories, Modality, ModelToggles};
 use serde_json::Value;
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -134,10 +133,7 @@ pub(super) fn usage_of(
     p: &code_config::Provider,
     u: code_engine::usage::ProviderUsage,
 ) -> ProviderUsage {
-    let subscription = !p.models.is_empty()
-        && p.models
-            .values()
-            .all(|m| matches!(m.billing, Billing::Subscription));
+    let subscription = p.is_subscription();
     let mut out = ProviderUsage {
         label: u
             .label
@@ -146,8 +142,8 @@ pub(super) fn usage_of(
             .unwrap_or_else(|| u.provider.clone()),
         provider: u.provider.clone(),
         subscription,
-        declared: p.usage.is_some(),
-        budget: p.budget.as_ref().map(|b| Budget {
+        declared: p.usage_ttl_secs().is_some(),
+        budget: p.budget().map(|b| Budget {
             usd: b.usd,
             period: match b.period {
                 code_config::BudgetPeriod::Day => "day",
@@ -207,89 +203,51 @@ pub(super) fn usage_of(
     out
 }
 
-/// Command providers whose discovery cache is missing, past its TTL or
-/// older than the provider file.
-pub(super) fn discovery_expired(snap: &Snapshot, dirs: &Directories) -> BTreeSet<String> {
-    snap.providers
-        .iter()
-        .filter(|(_, p)| p.enabled)
-        .filter_map(|(id, p)| {
-            let d = p.command.as_ref()?.discover.as_ref()?;
-            let cache = dirs.cache.join("discover").join(format!("{id}.json"));
-            let cached = std::fs::metadata(&cache).and_then(|m| m.modified()).ok();
-            let config =
-                std::fs::metadata(dirs.config.join("providers").join(format!("{id}.json")))
-                    .and_then(|m| m.modified())
-                    .ok();
-            let fresh = cached.is_some_and(|c| {
-                c.elapsed()
-                    .is_ok_and(|age| age.as_secs() < d.ttl_secs.unwrap_or(86_400))
-                    && config.is_none_or(|cfg| cfg <= c)
-            });
-            // A cached failure retries once its negative-cache entry expires.
-            let retry = snap.discovery_errors.get(id).is_some_and(|e| {
-                e.cached
-                    && std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .is_ok_and(|now| now.as_secs() >= e.retry_at)
-            });
-            (!fresh || retry).then(|| id.clone())
-        })
-        .collect()
-}
-
 /// The catalog of `snap`; under `/exclusive` only its `exclusive` model.
-pub(super) fn build(snap: &Snapshot, exclusive: Option<&str>, config_dir: &Path) -> Catalog {
+pub(super) fn build(snap: &ConfigStore, exclusive: Option<&str>, config_dir: &Path) -> Catalog {
     let mut models = Vec::new();
     let toggles = ModelToggles::default();
-    for (pid, provider) in &snap.providers {
-        for (mid, m) in &provider.models {
-            if exclusive.is_some_and(|ex| ex != format!("{pid}/{mid}")) {
-                continue;
-            }
-            let text_only =
-                m.capabilities.output.is_empty() || m.capabilities.output == [Modality::Text];
-            models.push(ModelInfo {
-                id: format!("{pid}/{mid}"),
-                provider: pid.clone(),
-                provider_label: provider.label.clone().unwrap_or_else(|| pid.clone()),
-                label: m.label.clone().unwrap_or_else(|| mid.clone()),
-                description: m.description.clone(),
-                context_window: m.context_window,
-                max_output: m.max_output_tokens,
-                efforts: m.reasoning.efforts.clone(),
-                default_effort: m.reasoning.default.clone(),
-                input: m
-                    .capabilities
-                    .input
-                    .iter()
-                    .map(modality)
-                    .chain(m.capabilities.file_input.then(|| "file".to_string()))
-                    .collect(),
-                output: m.capabilities.output.iter().map(modality).collect(),
-                tools: m.capabilities.tools,
-                benchmarks: m.benchmarks.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-                cost: m.cost.as_ref().map(|c| CostRates {
-                    input: c.input_per_m_tok,
-                    output: c.output_per_m_tok,
-                    cache_read: c.cache_read_per_m_tok,
-                    cache_write: c.cache_write_per_m_tok,
-                }),
-                provider_enabled: provider.enabled,
-                subagent_capable: code_config::subagent_eligible(pid, mid, provider, m, &toggles),
-                chat_capable: text_only || m.capabilities.output.contains(&Modality::Text),
-                subscription: matches!(m.billing, Billing::Subscription),
-                context_unknown: m.kind.unwrap_or(provider.kind)
-                    == code_config::ProviderType::Command
-                    && provider
-                        .command
-                        .as_ref()
-                        .is_some_and(|c| c.history.as_deref() == Some("latest")),
-            });
+    for (pid, provider, mid, m) in snap.models() {
+        if exclusive.is_some_and(|ex| ex != format!("{pid}/{mid}")) {
+            continue;
         }
+        let text_only =
+            m.capabilities.output.is_empty() || m.capabilities.output == [Modality::Text];
+        models.push(ModelInfo {
+            id: format!("{pid}/{mid}"),
+            provider: pid.clone(),
+            provider_label: provider.label.clone().unwrap_or_else(|| pid.clone()),
+            label: m.label.clone().unwrap_or_else(|| mid.clone()),
+            description: m.description.clone(),
+            context_window: m.context_window,
+            max_output: m.max_output_tokens,
+            efforts: m.reasoning.efforts.clone(),
+            default_effort: m.reasoning.default.clone(),
+            input: m
+                .capabilities
+                .input
+                .iter()
+                .map(modality)
+                .chain(m.capabilities.file_input.then(|| "file".to_string()))
+                .collect(),
+            output: m.capabilities.output.iter().map(modality).collect(),
+            tools: m.capabilities.tools,
+            benchmarks: m.benchmarks.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            cost: m.cost.as_ref().map(|c| CostRates {
+                input: c.input_per_m_tok,
+                output: c.output_per_m_tok,
+                cache_read: c.cache_read_per_m_tok,
+                cache_write: c.cache_write_per_m_tok,
+            }),
+            provider_enabled: provider.enabled,
+            subagent_capable: code_config::subagent_eligible(pid, mid, provider, m, &toggles),
+            chat_capable: text_only || m.capabilities.output.contains(&Modality::Text),
+            subscription: matches!(m.billing, Billing::Subscription),
+            context_unknown: provider.latest_history_only(m),
+        });
     }
     let mut benchmarks: Vec<Benchmark> = snap
-        .config
+        .config()
         .benchmarks
         .iter()
         .map(|(k, b)| Benchmark {
@@ -317,19 +275,14 @@ pub(super) fn build(snap: &Snapshot, exclusive: Option<&str>, config_dir: &Path)
     // warnings ("{id}/{model}: Warning: …") are in the model description
     // already. Anything else is a skipped file.
     let providers: Vec<ProviderView> = snap
-        .providers
-        .iter()
+        .providers()
         .map(|(id, p)| {
-            let failure = snap.discovery_errors.get(id);
+            let failure = snap.discovery_error(id);
             ProviderView {
                 id: id.clone(),
                 label: p.label.clone().unwrap_or_else(|| id.clone()),
                 enabled: p.enabled,
-                discovers: p
-                    .command
-                    .as_ref()
-                    .and_then(|c| c.discover.as_ref())
-                    .is_some(),
+                discovers: p.discovery().is_some(),
                 warning: failure.map(|e| e.message.clone()),
                 warning_detail: failure.map(|e| {
                     let kind = serde_json::to_value(e.kind)
@@ -352,14 +305,10 @@ pub(super) fn build(snap: &Snapshot, exclusive: Option<&str>, config_dir: &Path)
         })
         .collect();
     let mut errors = vec![];
-    for e in &snap.errors {
+    for e in snap.errors() {
         let (head, rest) = e.split_once(": ").unwrap_or(("", e));
-        let model_warning = head.split_once('/').is_some_and(|(p, m)| {
-            snap.providers
-                .get(p)
-                .is_some_and(|p| p.models.contains_key(m))
-        }) && rest.starts_with("Warning:");
-        let discovery = snap.discovery_errors.contains_key(head)
+        let model_warning = snap.model(head).is_some() && rest.starts_with("Warning:");
+        let discovery = snap.discovery_error(head).is_some()
             || (providers.iter().any(|p| p.id == head && p.discovers)
                 && rest.ends_with("using static models"));
         if !model_warning && !discovery {
@@ -370,12 +319,12 @@ pub(super) fn build(snap: &Snapshot, exclusive: Option<&str>, config_dir: &Path)
         models,
         providers,
         benchmarks,
-        theme: snap.config.theme.clone(),
-        mouse: snap.config.mouse,
-        attention: snap.config.attention.clone(),
-        vim: snap.config.vim,
-        paste_collapse_lines: snap.config.paste_collapse_lines,
-        queue_default: QueueClass::from_config(snap.config.queue_default),
+        theme: snap.config().theme.clone(),
+        mouse: snap.config().mouse,
+        attention: snap.config().attention.clone(),
+        vim: snap.config().vim,
+        paste_collapse_lines: snap.config().paste_collapse_lines,
+        queue_default: QueueClass::from_config(snap.config().queue_default),
         config_dir: config_dir.to_path_buf(),
         config_var,
         errors,

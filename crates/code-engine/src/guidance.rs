@@ -600,9 +600,9 @@ mod tests {
             let path = cwd.join(".cockpit-code/reviewer-guidance.md");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"trusted").unwrap();
-            pin_content(&store.directories.data, &path, Some(b"trusted")).unwrap();
+            pin_content(&store.directories().data, &path, Some(b"trusted")).unwrap();
             let blob = store
-                .directories
+                .directories()
                 .data
                 .join("reviewer-guidance-content")
                 .join(crate::context::digest(b"trusted"));
