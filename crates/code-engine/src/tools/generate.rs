@@ -161,12 +161,12 @@ async fn execute_with(mut ctx: Context<'_>, limits: Limits) -> Result<Generated>
                 .as_str()
                 .unwrap_or("wav")
                 .to_owned();
-            let (document, usage) = tokio::select! {
+            let (value, document, usage) = tokio::select! {
                 _ = ctx.cancel.cancelled() => bail!("cancelled"),
                 r = tokio::time::timeout_at(deadline, send(kind_wire, &provider, &model, request, &ctx.temp, limits, ctx.cancel)) =>
                     r.map_err(|_| timed_out())??,
             };
-            ((document, audio_format), usage)
+            ((value, document, audio_format), usage)
         }
         ProviderType::Command => {
             return command_provider(
@@ -220,10 +220,10 @@ async fn execute_with(mut ctx: Context<'_>, limits: Limits) -> Result<Generated>
     }
     // Usage is committed before decoding: a billed response whose media
     // fails to decode, exceeds a limit or is cancelled still counts.
-    let (document, audio_format) = response;
+    let (value, document, audio_format) = response;
     let media = tokio::select! {
         _ = ctx.cancel.cancelled() => bail!("cancelled"),
-        r = tokio::time::timeout_at(deadline, decode_media(kind_wire, document, audio_format, &ctx.temp, limits, ctx.cancel)) =>
+        r = tokio::time::timeout_at(deadline, decode_media(kind_wire, value, document, audio_format, &ctx.temp, limits, ctx.cancel)) =>
             r.map_err(|_| timed_out())??,
     };
     let Some(Media { data, mime }) = media else {
@@ -419,7 +419,7 @@ async fn send(
     temp: &Path,
     limits: Limits,
     cancel: &CancellationToken,
-) -> Result<(Document, Usage)> {
+) -> Result<(Value, Document, Usage)> {
     let base = provider
         .connection_url()
         .context("provider has no baseUrl")?
@@ -461,7 +461,7 @@ async fn send(
     let token = cancel.child_token();
     let _stop = token.clone().drop_guard();
     let network = |_| anyhow!("provider network error");
-    let document = if status.is_success() {
+    let (value, document) = if status.is_success() {
         // Disk writes run on a blocking thread fed through a bounded channel.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let mut writer = spill_writer(rx, temp.to_path_buf(), limits);
@@ -508,7 +508,6 @@ async fn send(
             .map_err(network)?;
         Document::parse(Spilled::Memory(text.into_bytes()), limits, &token)?
     };
-    let value = &document.value;
     if !status.is_success() || value.get("error").is_some_and(|e| !e.is_null()) {
         let message = value["error"]["message"]
             .as_str()
@@ -547,6 +546,7 @@ async fn send(
         )
     });
     Ok((
+        value,
         document,
         Some((tokens, header_cost.or(body_cost).or(rated))),
     ))
@@ -556,6 +556,7 @@ async fn send(
 /// stops it at its next check, which also releases the response spill.
 async fn decode_media(
     wire: ProviderType,
+    value: Value,
     document: Document,
     audio_format: String,
     temp: &Path,
@@ -573,9 +574,9 @@ async fn decode_media(
             cancel: &token,
         };
         if wire == ProviderType::OpenaiResponses {
-            responses_media(&decoder)
+            responses_media(&value, &decoder)
         } else {
-            chat_media(&decoder, &audio_format)
+            chat_media(&value, &decoder, &audio_format)
         }
     })
     .await
@@ -669,8 +670,7 @@ fn sniff(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn responses_media(decoder: &Decoder) -> Result<Option<Media>> {
-    let value = &decoder.document.value;
+fn responses_media(value: &Value, decoder: &Decoder) -> Result<Option<Media>> {
     for item in value["output"].as_array().into_iter().flatten() {
         if item["type"] == "image_generation_call"
             && let Some(result) = item["result"].as_str()
@@ -689,8 +689,8 @@ fn responses_media(decoder: &Decoder) -> Result<Option<Media>> {
     Ok(None)
 }
 
-fn chat_media(decoder: &Decoder, format: &str) -> Result<Option<Media>> {
-    let message = &decoder.document.value["choices"][0]["message"];
+fn chat_media(value: &Value, decoder: &Decoder, format: &str) -> Result<Option<Media>> {
+    let message = &value["choices"][0]["message"];
     for image in message["images"].as_array().into_iter().flatten() {
         if let Some(url) = image["image_url"]["url"].as_str() {
             return decoder.decode(url, "image/png").map(Some);
@@ -1333,7 +1333,7 @@ mod tests {
     fn decode(raw: &str, default_mime: &str) -> Result<(Vec<u8>, String)> {
         let temp = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
-        let document = Document::parse(
+        let (_, document) = Document::parse(
             Spilled::Memory(b"null".to_vec()),
             Limits::new(u64::MAX),
             &cancel,

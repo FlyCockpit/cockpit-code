@@ -73,9 +73,28 @@ pub(crate) struct ReadOnly {
     tools: ToolBox,
     resolver: crate::paths::Resolver,
     roots: Vec<PathBuf>,
-    pub receipts: Arc<Mutex<Vec<Receipt>>>,
+    receipts: Arc<Mutex<Vec<Receipt>>>,
 }
 impl ReadOnly {
+    /// Appends the unchanged files this reader has read, except those `skip`
+    /// selects, to `references` unless an identical receipt is already there.
+    pub(crate) fn extend_references(
+        &self,
+        references: &mut Vec<Receipt>,
+        skip: impl Fn(&Receipt) -> bool,
+    ) {
+        for receipt in self.receipts.lock().unwrap().iter() {
+            if skip(receipt) {
+                continue;
+            }
+            if !references
+                .iter()
+                .any(|r| r.path == receipt.path && r.hash == receipt.hash && r.args == receipt.args)
+            {
+                references.push(receipt.clone());
+            }
+        }
+    }
     pub(crate) fn with_outputs(mut self, dir: PathBuf) -> Self {
         self.roots.push(dir);
         self.tools = ToolBox::new(

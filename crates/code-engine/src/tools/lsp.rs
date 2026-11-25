@@ -124,32 +124,7 @@ impl Manager {
             bail!("LSP session server limit (16) reached");
         }
         let client = Arc::new(Client::spawn(server, root).await?);
-        let init = client.request("initialize", json!({
-            "processId":std::process::id(),"rootUri":uri(root)?,
-            "workspaceFolders":[{"uri":uri(root)?,"name":root.file_name().unwrap_or_default().to_string_lossy()}],
-            "capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"relatedInformation":true},"diagnostic":{}},"workspace":{"applyEdit":false,"configuration":true,"workspaceFolders":true}},
-            "clientInfo":{"name":"cockpit-code","version":env!("CARGO_PKG_VERSION")}
-        }), cancel).await;
-        match init {
-            Ok(result) => {
-                if result["capabilities"]["positionEncoding"]
-                    .as_str()
-                    .is_some_and(|e| e != "utf-16")
-                {
-                    client.shutdown().await;
-                    bail!("LSP server selected an unsupported position encoding");
-                }
-                *client.capabilities.lock().unwrap() = result["capabilities"].clone();
-                if let Err(error) = client.notify("initialized", json!({})).await {
-                    client.shutdown().await;
-                    return Err(error);
-                }
-            }
-            Err(error) => {
-                client.shutdown().await;
-                return Err(error);
-            }
-        }
+        client.initialize(root, cancel).await?;
         state.clients.insert(key, client.clone());
         self.connected.store(true, Ordering::Release);
         Ok(client)
@@ -302,6 +277,36 @@ impl Client {
             operation: AsyncMutex::default(),
             reader: Mutex::new(Some(reader)),
         })
+    }
+    /// The initialize handshake; a server that fails it is shut down.
+    async fn initialize(&self, root: &Path, cancel: &CancellationToken) -> Result<()> {
+        let init = self.request("initialize", json!({
+            "processId":std::process::id(),"rootUri":uri(root)?,
+            "workspaceFolders":[{"uri":uri(root)?,"name":root.file_name().unwrap_or_default().to_string_lossy()}],
+            "capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"relatedInformation":true},"diagnostic":{}},"workspace":{"applyEdit":false,"configuration":true,"workspaceFolders":true}},
+            "clientInfo":{"name":"cockpit-code","version":env!("CARGO_PKG_VERSION")}
+        }), cancel).await;
+        match init {
+            Ok(result) => {
+                if result["capabilities"]["positionEncoding"]
+                    .as_str()
+                    .is_some_and(|e| e != "utf-16")
+                {
+                    self.shutdown().await;
+                    bail!("LSP server selected an unsupported position encoding");
+                }
+                *self.capabilities.lock().unwrap() = result["capabilities"].clone();
+                if let Err(error) = self.notify("initialized", json!({})).await {
+                    self.shutdown().await;
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                self.shutdown().await;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         tokio::time::timeout(
@@ -557,7 +562,7 @@ impl ToolBox {
             Value::Null
         };
         let client = self.lsp.client(&language, &server, &root, cancel).await?;
-        let _serial = tokio::select! { _ = cancel.cancelled() => bail!("cancelled"), serial = client.operation.lock() => serial };
+        let _serial = client.serialize(cancel).await?;
         let version = if let Some(text) = text {
             client.open(&file, &language, &text).await?
         } else {
@@ -591,22 +596,9 @@ impl ToolBox {
             "diagnostics" => "textDocument/diagnostic",
             _ => bail!("unsupported LSP operation {operation}"),
         };
-        let pull = client
-            .capabilities
-            .lock()
-            .unwrap()
-            .get("diagnosticProvider")
-            .is_some_and(|v| !v.is_null() && v != &Value::Bool(false));
+        let pull = client.pulls_diagnostics();
         let result = if operation == "diagnostics" && !pull {
-            let document_uri = uri(&file)?;
-            tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let changed = client.diagnostic_changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
-                    if let Some(diag) = client.diagnostics.lock().unwrap().get(&document_uri).cloned() && diag.version.is_none_or(|v| v == version) { break Ok(json!({"items":diag.items,"version":diag.version,"source":"publishDiagnostics"})); }
-                    if client.broken.load(Ordering::Acquire) { bail!("LSP server disconnected"); }
-                    tokio::select! { _ = cancel.cancelled() => bail!("cancelled"), _ = changed => {} }
-                }
-            }).await.unwrap_or_else(|_| Ok(json!({"items":null,"status":"pending","message":"No diagnostics published for this document yet; retry."})))?
+            client.published_diagnostics(&file, version, cancel).await?
         } else {
             if operation == "diagnostics" {
                 params = json!({"textDocument":{"uri":uri(&file)?}});
@@ -671,16 +663,36 @@ impl Manager {
         let (mode, wait) = self.write_settings(agent)?;
         let (language, server) = self.select(&json!({}), file).ok()?;
         let root = root(file, cwd, &server.root_markers);
-        tokio::time::timeout(wait,async {
-            let client=self.client(&language,&server,&root,cancel).await.ok()?;
-            let _serial=tokio::select!{_=cancel.cancelled()=>return None,guard=client.operation.lock()=>guard};
-            let existing=file.exists();
-            let text=if existing{std::fs::read_to_string(file).ok()?}else{String::new()};
-            let version=client.open(file,&language,&text).await.ok()?;
-            let before=if existing{client.settled_diagnostics(file,version,cancel).await.ok()?}else{Vec::new()};
+        tokio::time::timeout(wait, async {
+            let client = self.client(&language, &server, &root, cancel).await.ok()?;
+            let _serial = client.serialize(cancel).await.ok()?;
+            let existing = file.exists();
+            let text = if existing {
+                std::fs::read_to_string(file).ok()?
+            } else {
+                String::new()
+            };
+            let version = client.open(file, &language, &text).await.ok()?;
+            let before = if existing {
+                client
+                    .settled_diagnostics(file, version, cancel)
+                    .await
+                    .ok()?
+            } else {
+                Vec::new()
+            };
             drop(_serial);
-            Some(WriteBaseline{client,language,before,mode,wait})
-        }).await.ok().flatten()
+            Some(WriteBaseline {
+                client,
+                language,
+                before,
+                mode,
+                wait,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
     }
     pub(crate) async fn after_write(
         &self,
@@ -690,18 +702,76 @@ impl Manager {
         cancel: &CancellationToken,
     ) -> Option<String> {
         let before = before?;
-        tokio::time::timeout(before.wait,async {
-            if std::fs::read_to_string(file).ok().as_deref()!=Some(text){return None;}
-            let _serial=tokio::select!{_=cancel.cancelled()=>return None,guard=before.client.operation.lock()=>guard};
-            let version=before.client.open(file,&before.language,text).await.ok()?;
-            before.client.notify("textDocument/didSave",json!({"textDocument":{"uri":uri(file).ok()?},"text":text})).await.ok()?;
-            let after=before.client.settled_diagnostics(file,version,cancel).await.ok()?;
-            if std::fs::read_to_string(file).ok().as_deref()!=Some(text){return None;}
-            Some(render_introduced(file,&before.before,after,before.mode))
-        }).await.ok().flatten()
+        tokio::time::timeout(before.wait, async {
+            if std::fs::read_to_string(file).ok().as_deref() != Some(text) {
+                return None;
+            }
+            let _serial = before.client.serialize(cancel).await.ok()?;
+            let version = before
+                .client
+                .open(file, &before.language, text)
+                .await
+                .ok()?;
+            before
+                .client
+                .notify(
+                    "textDocument/didSave",
+                    json!({"textDocument":{"uri":uri(file).ok()?},"text":text}),
+                )
+                .await
+                .ok()?;
+            let after = before
+                .client
+                .settled_diagnostics(file, version, cancel)
+                .await
+                .ok()?;
+            if std::fs::read_to_string(file).ok().as_deref() != Some(text) {
+                return None;
+            }
+            Some(render_introduced(file, &before.before, after, before.mode))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 impl Client {
+    /// Waits for this client's turn to use the server; operations never interleave.
+    async fn serialize(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("cancelled"),
+            serial = self.operation.lock() => Ok(serial),
+        }
+    }
+    /// Whether the server answers `textDocument/diagnostic` pull requests.
+    fn pulls_diagnostics(&self) -> bool {
+        self.capabilities
+            .lock()
+            .unwrap()
+            .get("diagnosticProvider")
+            .is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
+    }
+    /// The diagnostics last published for `file` at `version`, or a pending
+    /// note when none arrive within three seconds.
+    async fn published_diagnostics(
+        &self,
+        file: &Path,
+        version: i64,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let document_uri = uri(file)?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = self.diagnostic_changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                if let Some(diag) = self.diagnostics.lock().unwrap().get(&document_uri).cloned() && diag.version.is_none_or(|v| v == version) { break Ok(json!({"items":diag.items,"version":diag.version,"source":"publishDiagnostics"})); }
+                if self.broken.load(Ordering::Acquire) { bail!("LSP server disconnected"); }
+                tokio::select! { _ = cancel.cancelled() => bail!("cancelled"), _ = changed => {} }
+            }
+        }).await.unwrap_or_else(|_| Ok(json!({"items":null,"status":"pending","message":"No diagnostics published for this document yet; retry."})))
+    }
     async fn settled_diagnostics(
         &self,
         file: &Path,
@@ -709,13 +779,7 @@ impl Client {
         cancel: &CancellationToken,
     ) -> Result<Vec<Value>> {
         let document = uri(file)?;
-        if self
-            .capabilities
-            .lock()
-            .unwrap()
-            .get("diagnosticProvider")
-            .is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
-        {
+        if self.pulls_diagnostics() {
             let result = self
                 .request(
                     "textDocument/diagnostic",

@@ -127,6 +127,15 @@ impl SseClient {
         }
         bail!("MCP SSE stream ended before response")
     }
+    /// Stops the event pump and forgets the session; the next request reconnects.
+    async fn disconnect(&mut self) {
+        if let Some(task) = self.pump.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.rx = None;
+        self.post_url = None;
+    }
 }
 impl Drop for SseClient {
     fn drop(&mut self) {
@@ -138,12 +147,7 @@ impl Drop for SseClient {
 #[async_trait]
 impl McpClient for SseClient {
     async fn shutdown(&mut self) {
-        if let Some(task) = self.pump.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        self.rx = None;
-        self.post_url = None;
+        self.disconnect().await;
     }
     async fn initialize(&mut self) -> Result<()> {
         self.request("initialize", Some(initialize_params()))

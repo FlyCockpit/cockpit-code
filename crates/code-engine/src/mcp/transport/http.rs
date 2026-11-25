@@ -90,10 +90,8 @@ impl HttpClient {
         }
         serde_json::from_value::<JsonRpcResponse>(value)?.into_result()
     }
-}
-#[async_trait]
-impl McpClient for HttpClient {
-    async fn initialize(&mut self) -> Result<()> {
+    /// Initializes the session, adopting the server's protocol version.
+    async fn handshake(&mut self) -> Result<()> {
         let value = self
             .request("initialize", Some(initialize_params()))
             .await?;
@@ -109,6 +107,12 @@ impl McpClient for HttpClient {
             bail!("MCP initialized notification HTTP {}", response.status());
         }
         Ok(())
+    }
+}
+#[async_trait]
+impl McpClient for HttpClient {
+    async fn initialize(&mut self) -> Result<()> {
+        self.handshake().await
     }
     async fn list_tools(&mut self) -> Result<Vec<ToolDescriptor>> {
         let mut tools = vec![];

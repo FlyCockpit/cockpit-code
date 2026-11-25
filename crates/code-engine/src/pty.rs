@@ -114,6 +114,21 @@ impl Pty {
         }
         Ok(())
     }
+    /// Reads output into `buf`; the slave closing (EIO) reads as end of file.
+    fn poll_read(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let mut ready = ready!(self.master.poll_read_ready(cx))?;
+            match ready.try_io(|fd| fd.get_ref().read(buf.initialize_unfilled())) {
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => return Poll::Ready(Ok(())),
+                Ok(Err(e)) => return Poll::Ready(Err(e)),
+                Err(_) => {}
+            }
+        }
+    }
 }
 pub(crate) struct ProcessGroup(pub i32);
 impl ProcessGroup {
@@ -139,17 +154,6 @@ impl AsyncRead for Reader {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            let mut ready = ready!(self.0.master.poll_read_ready(cx))?;
-            match ready.try_io(|fd| fd.get_ref().read(buf.initialize_unfilled())) {
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => return Poll::Ready(Ok(())),
-                Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_) => {}
-            }
-        }
+        self.0.poll_read(cx, buf)
     }
 }
