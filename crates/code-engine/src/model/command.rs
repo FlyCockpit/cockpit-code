@@ -24,6 +24,57 @@ pub struct RequestContext {
     pub output_file: Option<PathBuf>,
 }
 
+/// What one command invocation needs from the selected model, resolved up front.
+pub(super) struct Target<'a> {
+    provider_id: &'a str,
+    model_id: &'a str,
+    command: Option<&'a code_config::ResolvedCommand>,
+    latest: bool,
+    text: bool,
+    reported_cost: Option<&'a ReportedCost>,
+    output_reservation: u64,
+}
+impl<'a> Target<'a> {
+    pub(super) fn new(
+        provider_id: &'a str,
+        model_id: &'a str,
+        provider: &'a Provider,
+        config: &'a ModelConfig,
+    ) -> Self {
+        Self {
+            provider_id,
+            model_id,
+            command: provider.connection_command(),
+            latest: latest(provider),
+            text: text_output(provider),
+            reported_cost: config
+                .reported_cost
+                .as_ref()
+                .or(provider.reported_cost.as_ref()),
+            output_reservation: config.max_output_tokens.unwrap_or(8192),
+        }
+    }
+    fn id(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+/// `history: latest`: the provider keeps its own conversation and receives only the delta.
+pub(super) fn latest(provider: &Provider) -> bool {
+    provider.kind == ProviderType::Command
+        && provider
+            .command
+            .as_ref()
+            .is_some_and(|c| c.history.as_deref() == Some("latest"))
+}
+/// `output: text` (the default): stdout is the assistant text, not JSONL events.
+pub(super) fn text_output(provider: &Provider) -> bool {
+    provider.kind == ProviderType::Command
+        && provider
+            .command
+            .as_ref()
+            .is_some_and(|c| c.output.as_deref().unwrap_or("text") == "text")
+}
+
 /// Only replayable conversation events. Metadata and credentials never enter model history.
 pub(super) fn history(events: &[HistoryEvent]) -> Value {
     json!(
@@ -156,13 +207,12 @@ struct Invocation {
     conversation: Conversation,
     state_file: Option<PathBuf>,
 }
-fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
+fn prepare(model: &Target<'_>, request: &PreparedRequest) -> Result<Invocation> {
     if request.conversation_id.trim().is_empty() {
         return Err(EngineError::bad("conversation_id must be nonempty"));
     }
     let config = model
-        .provider
-        .connection_command()
+        .command
         .ok_or_else(|| EngineError::bad("missing command configuration"))?;
     let body: Value = serde_json::from_slice(&request.body).map_err(io_error)?;
     let messages = body["messages"].clone();
@@ -190,8 +240,8 @@ fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
         ("depth", request.command_context.depth.to_string()),
         ("isSubagent", (request.agent_id != "root").to_string()),
         ("agent", request.command_context.agent.clone()),
-        ("model", model.model_id.clone()),
-        ("provider", model.provider_id.clone()),
+        ("model", model.model_id.to_owned()),
+        ("provider", model.provider_id.to_owned()),
         ("cwd", cwd.to_string_lossy().into_owned()),
         (
             "permissionMode",
@@ -271,7 +321,7 @@ fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     let mut since = 0;
-    if model.command_latest()
+    if model.latest
         && conversation.sent <= all.len()
         && conversation.prefix_hash == hash(&json!(&all[..conversation.sent]))
     {
@@ -280,7 +330,7 @@ fn prepare(model: &Model, request: &PreparedRequest) -> Result<Invocation> {
         if all.get(since).is_some_and(|m| m["kind"] == "assistant") {
             since += 1;
         }
-    } else if model.command_latest() {
+    } else if model.latest {
         // A fork/restore/compaction changed the prefix. Start a new provider conversation.
         conversation = Conversation::default();
     }
@@ -444,7 +494,7 @@ fn text(state: &mut State, delta: &str, tx: &EventSender) -> Result<()> {
 
 fn event(
     v: &Value,
-    model: &Model,
+    model: &Target<'_>,
     _request: &PreparedRequest,
     state: &mut State,
     tx: &EventSender,
@@ -513,14 +563,7 @@ fn event(
         }
         "usage" => {
             state.usage = v.clone();
-            state.observe_cost(
-                model
-                    .config
-                    .reported_cost
-                    .as_ref()
-                    .or(model.provider.reported_cost.as_ref()),
-                v,
-            );
+            state.observe_cost(model.reported_cost, v);
         }
         "quota" => state.quota = Some(v.clone()),
         "error" => {
@@ -559,7 +602,7 @@ fn event(
 
 async fn read_stdout(
     mut stdout: impl AsyncRead + Unpin,
-    model: &Model,
+    model: &Target<'_>,
     request: &PreparedRequest,
     state: &mut State,
     tx: &EventSender,
@@ -576,14 +619,14 @@ async fn read_stdout(
             break;
         }
         total += n as u64;
-        if !model.command_text() && total > JSONL_TOTAL_LIMIT {
+        if !model.text && total > JSONL_TOTAL_LIMIT {
             return Err(EngineError::bad(format!(
                 "command provider JSONL output exceeds {} MiB",
                 JSONL_TOTAL_LIMIT >> 20
             )));
         }
         pending.extend_from_slice(&buf[..n]);
-        if model.command_text() {
+        if model.text {
             let valid = match std::str::from_utf8(&pending) {
                 Ok(s) => s.len(),
                 Err(e) if e.error_len().is_none() => e.valid_up_to(),
@@ -613,7 +656,7 @@ async fn read_stdout(
         }
     }
     if !pending.is_empty() {
-        if model.command_text() {
+        if model.text {
             return Err(EngineError::bad("command stdout ended in incomplete UTF-8"));
         }
         parse_line(
@@ -630,7 +673,7 @@ async fn read_stdout(
 }
 fn parse_line(
     line: &[u8],
-    model: &Model,
+    model: &Target<'_>,
     request: &PreparedRequest,
     state: &mut State,
     tx: &EventSender,
@@ -688,13 +731,13 @@ fn redact_diagnostic(mut diagnostic: String, secrets: &[String]) -> String {
 }
 
 pub(super) async fn attempt(
-    model: &Model,
+    model: &Target<'_>,
     request: &PreparedRequest,
     tx: &EventSender,
     cancel: &CancellationToken,
     state: &mut State,
 ) -> Result<()> {
-    if model.command_latest() && request.command_context.latest && request.kind != "agent" {
+    if model.latest && request.command_context.latest && request.kind != "agent" {
         return Err(EngineError::bad(
             "history: latest disables hidden forks and utility calls",
         ));
@@ -702,8 +745,7 @@ pub(super) async fn attempt(
     let mut invocation = prepare(model, request)?;
     let secrets = diagnostic_secrets(
         model
-            .provider
-            .connection_command()
+            .command
             .unwrap()
             .redaction_values
             .iter()
@@ -734,14 +776,7 @@ pub(super) async fn attempt(
     let stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let mut stderr_tail = Vec::new();
-    let timeout = Duration::from_secs(
-        model
-            .provider
-            .connection_command()
-            .unwrap()
-            .timeout_secs
-            .unwrap_or(900),
-    );
+    let timeout = Duration::from_secs(model.command.unwrap().timeout_secs.unwrap_or(900));
     let result = {
         let input = async {
             if let Some(text) = invocation.stdin.as_ref() {
@@ -807,7 +842,7 @@ pub(super) async fn attempt(
             Err(error)
         }
     };
-    if model.command_text() && result.is_ok() {
+    if model.text && result.is_ok() {
         // An unambiguous, versioned JSON trailer lives on one stderr line.
         for line in String::from_utf8_lossy(&stderr_tail).lines() {
             if let Ok(v) = serde_json::from_str::<Value>(line)
@@ -825,7 +860,7 @@ pub(super) async fn attempt(
         state.stop_reason = "end_turn".into();
     }
     if result.is_ok()
-        && !model.command_text()
+        && !model.text
         && request.kind != "generate"
         && state.text.is_empty()
         && state.calls.is_empty()
@@ -863,14 +898,14 @@ pub(super) async fn attempt(
             .map_err(io_error)?;
         tmp.persist(&path).map_err(io_error)?;
     }
-    if model.command_latest() && result.is_ok() {
+    if model.latest && result.is_ok() {
         let used = state.usage["contextUsed"].as_u64();
         let window = state.usage["contextWindow"].as_u64();
         let _ = tx.send(EngineEvent::Context {
             meter: ContextMeter {
                 used: used.unwrap_or(0),
                 window,
-                output_reservation: model.config.max_output_tokens.unwrap_or(8192),
+                output_reservation: model.output_reservation,
                 source: if used.is_some() && window.is_some() {
                     "provider"
                 } else {
@@ -956,14 +991,8 @@ mod tests {
             })
             .unwrap();
             assert!(store.snapshot().errors.is_empty());
-            let model = Model {
-                client: crate::http_client(Client::builder).unwrap(),
-                provider: store.snapshot().providers["p"].clone(),
-                config: store.snapshot().providers["p"].models["m"].clone(),
-                provider_id: "p".into(),
-                model_id: "m".into(),
-                effort: None,
-            };
+            let provider = store.snapshot().providers["p"].clone();
+            let model = Target::new("p", "m", &provider, &provider.models["m"]);
             let mut request: PreparedRequest =
                 serde_json::from_value(super::super::tests::request_value()).unwrap();
             request.body = serde_json::to_vec(&json!({"messages":[]})).unwrap();
@@ -1003,14 +1032,8 @@ mod tests {
             cache: root.path().join("cache"),
         })
         .unwrap();
-        let model = Model {
-            client: crate::http_client(Client::builder).unwrap(),
-            provider: store.snapshot().providers["p"].clone(),
-            config: store.snapshot().providers["p"].models["m"].clone(),
-            provider_id: "p".into(),
-            model_id: "m".into(),
-            effort: None,
-        };
+        let provider = store.snapshot().providers["p"].clone();
+        let model = Target::new("p", "m", &provider, &provider.models["m"]);
         let mut request: PreparedRequest =
             serde_json::from_value(super::super::tests::request_value()).unwrap();
         request.body = serde_json::to_vec(&json!({"messages":[]})).unwrap();
@@ -1137,16 +1160,9 @@ mod tests {
 
     #[test]
     fn empty_conversation_identity_is_rejected_before_command_preparation() {
-        let provider = serde_json::from_value(json!({"type":"command"})).unwrap();
-        let config = serde_json::from_value(json!({})).unwrap();
-        let model = Model {
-            client: crate::http_client(Client::builder).unwrap(),
-            provider,
-            config,
-            provider_id: "p".into(),
-            model_id: "m".into(),
-            effort: None,
-        };
+        let provider: Provider = serde_json::from_value(json!({"type":"command"})).unwrap();
+        let config: ModelConfig = serde_json::from_value(json!({})).unwrap();
+        let model = Target::new("p", "m", &provider, &config);
         let mut request: PreparedRequest =
             serde_json::from_value(super::super::tests::request_value()).unwrap();
         request.conversation_id.clear();

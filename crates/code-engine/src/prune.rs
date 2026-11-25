@@ -297,8 +297,8 @@ pub(crate) fn apply(
         let model = state.model()?;
         let meter = ContextMeter {
             used: report.tokens_after,
-            window: model.config.context_window,
-            output_reservation: model.config.max_output_tokens.unwrap_or(8192),
+            window: model.context_window(),
+            output_reservation: model.output_reservation(),
             source: "tokenizer (after user prune)".into(),
             warning: false,
         };

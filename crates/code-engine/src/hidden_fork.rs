@@ -70,7 +70,7 @@ impl HiddenFork {
         {
             return Err(EngineError::bad("hidden fork author request is malformed"));
         }
-        let percent = self.model.config.context_window.map_or(0, |w| {
+        let percent = self.model.context_window().map_or(0, |w| {
             self.author.input_estimate.saturating_mul(100) / w.max(1)
         });
         let tail = format!(
@@ -134,16 +134,14 @@ impl HiddenFork {
             }
         }
         let mut results = Vec::with_capacity(self.copies);
-        if self.model.provider.max_concurrent_contexts.is_some()
-            || self.model.config.max_concurrent_contexts.is_some()
-        {
+        if self.model.context_limits() != (None, None) {
             for index in 0..self.copies {
                 results.push(self.copy(index, usage, cancel, task).await);
             }
             return Ok(results);
         }
         let start = if self.copies > 1
-            && (self.model.provider.prompt_caching == code_config::PromptCaching::Off
+            && (self.model.caching() == code_config::PromptCaching::Off
                 || !self.model.observed_cache_hit())
         {
             results.push(self.copy(0, usage, cancel, task).await);
@@ -468,8 +466,7 @@ impl HiddenFork {
             if let Some(HistoryEvent::ToolResult { output, .. }) = tail.last_mut() {
                 let percent = self
                     .model
-                    .config
-                    .context_window
+                    .context_window()
                     .map_or(0, |w| request.input_estimate.saturating_mul(100) / w.max(1));
                 output.push_str(&crate::pressure::tag(
                     percent,

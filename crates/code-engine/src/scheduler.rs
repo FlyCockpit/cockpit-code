@@ -12,14 +12,15 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct Target(BTreeMap<String, usize>);
 impl Target {
     pub fn model(model: &Model) -> Self {
+        let (provider, per_model) = model.context_limits();
         let mut limits = BTreeMap::new();
         limits.insert(
             format!("provider:{}", model.provider_id),
-            model.provider.max_concurrent_contexts.unwrap_or(usize::MAX),
+            provider.unwrap_or(usize::MAX),
         );
         limits.insert(
             format!("model:{}/{}", model.provider_id, model.model_id),
-            model.config.max_concurrent_contexts.unwrap_or(usize::MAX),
+            per_model.unwrap_or(usize::MAX),
         );
         Self(limits)
     }

@@ -217,7 +217,7 @@ async fn sample(
                     "empty, invalid headings/content, refusal or task continuation".into()
                 },
                 stop_reason: c.stop_reason,
-                max_output_tokens: model.config.max_output_tokens.unwrap_or(8192),
+                max_output_tokens: model.output_reservation(),
             },
         )?;
     }
@@ -281,17 +281,15 @@ pub(crate) async fn draft(
     tx: &EventSender,
     cancel: &CancellationToken,
 ) -> Result<String, EngineError> {
-    let window = model.config.context_window.unwrap_or(65536);
+    let window = model.context_window().unwrap_or(65536);
     // Reasoning and visible output share the provider's completion budget. A
     // 4096-token author limit can leave Flash no room for the actual handoff.
     let mut draft_model = model.clone();
     let reserve = model
-        .config
-        .max_output_tokens
-        .unwrap_or(8192)
+        .output_reservation()
         .max(16384)
         .min((window / 4).max(1));
-    draft_model.config.max_output_tokens = Some(reserve);
+    draft_model.reserve_output(reserve);
     let model = &draft_model;
     let mut allowance = window
         .saturating_sub(reserve)
