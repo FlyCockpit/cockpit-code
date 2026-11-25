@@ -300,6 +300,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let options = SessionOptions {
         model: args.model,
         effort: args.effort,
+        system_prompt: None,
     };
     if let Some(Commands::Guidance { id }) = &args.command {
         let session = Session::resume(store, id, options)?;

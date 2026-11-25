@@ -6,8 +6,10 @@ use crate::session::{AcpSession, Action, ClientCaps, parse_mode};
 use agent_client_protocol_schema::v1;
 use base64::Engine as _;
 use code_config::{ConfigStore, Directories};
+use code_engine::context::{ClientPrompt, ClientPromptMode};
 use code_engine::schema::{Attachment, ErrorKind};
 use code_engine::{Session, SessionOptions, sessions};
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
@@ -195,7 +197,10 @@ impl Server {
                 "loadSession": true,
                 "promptCapabilities": {"image": true, "audio": true, "embeddedContext": true},
                 "mcpCapabilities": {"http": false, "sse": false},
-                "sessionCapabilities": {"list": {}, "resume": {}, "close": {}},
+                "sessionCapabilities": {
+                    "list": {}, "resume": {}, "close": {},
+                    "systemPrompt": {"mode": {"override": {}}},
+                },
             },
             "agentInfo": {
                 "name": "cockpit-code", "title": "cockpit-code",
@@ -271,8 +276,8 @@ impl Server {
     fn new_session(&mut self, id: &Value, params: &Value) -> Option<rpc::Reply> {
         let result = (|| {
             let client_mcp_count = params["mcpServers"].as_array().map_or(0, Vec::len);
+            let system_prompt = client_prompt(params)?;
             let req = decode::<v1::NewSessionRequest>(&normalize_session_params(params))?;
-            refuse_system_prompt(params)?;
             if !req.cwd.is_absolute() {
                 return Err(RpcError::params("cwd must be an absolute path"));
             }
@@ -289,6 +294,7 @@ impl Server {
                 SessionOptions {
                     model: self.options.model.clone(),
                     effort: self.options.effort.clone(),
+                    system_prompt,
                 },
             )
             .map_err(|e| RpcError::internal(e.message))?;
@@ -335,14 +341,20 @@ impl Server {
             .as_str()
             .map(String::from);
         let result = (|| {
+            let system_prompt = client_prompt(params)?;
             if replay {
                 decode::<v1::LoadSessionRequest>(&normalize_session_params(params))?;
             } else {
                 decode::<v1::ResumeSessionRequest>(&normalize_session_params(params))?;
             }
-            refuse_system_prompt(params)?;
             if let Some(s) = self.sessions.get(&acp_id) {
+                same_system_prompt(&acp_id, system_prompt.as_ref(), s.system_prompt())?;
                 return Ok(s.clone());
+            }
+            if let Some(supplied) = &system_prompt {
+                let stored = sessions::stored_system_prompt(&self.directories.data, &acp_id)
+                    .map_err(|e| self.open_error(&acp_id, e))?;
+                same_system_prompt(&acp_id, Some(supplied), stored)?;
             }
             let store = self.store()?;
             let options = SessionOptions::default();
@@ -356,19 +368,7 @@ impl Server {
                     )));
                 }
             };
-            let session = opened.map_err(|e| match e.kind {
-                ErrorKind::LockConflict => self.lock_error(&acp_id),
-                _ if !self
-                    .directories
-                    .data
-                    .join("sessions")
-                    .join(&acp_id)
-                    .is_dir() =>
-                {
-                    RpcError::new(rpc::NOT_FOUND, format!("no session {acp_id}"))
-                }
-                _ => RpcError::internal(e.message),
-            })?;
+            let session = opened.map_err(|e| self.open_error(&acp_id, e))?;
             let s = AcpSession::start(
                 acp_id.clone(),
                 session,
@@ -395,6 +395,16 @@ impl Server {
             }
         }
         None
+    }
+
+    fn open_error(&self, id: &str, e: code_engine::schema::EngineError) -> RpcError {
+        match e.kind {
+            ErrorKind::LockConflict => self.lock_error(id),
+            _ if !self.directories.data.join("sessions").join(id).is_dir() => {
+                RpcError::new(rpc::NOT_FOUND, format!("no session {id}"))
+            }
+            _ => RpcError::internal(e.message),
+        }
     }
 
     fn lock_error(&self, id: &str) -> RpcError {
@@ -629,20 +639,71 @@ fn prompt_content(
     Ok((text, attachments))
 }
 
+/// A request's `systemPrompt` as the engine stores it; `None` when absent or
+/// null. ACP v1 requires an error, before any session opens, for anything the
+/// agent can't apply: an unadvertised mode, a non-text block, empty content.
+/// The value is decoded on its own, before the request, so neither a schema
+/// error nor any other reply echoes the text; it is never logged.
+fn client_prompt(params: &Value) -> Result<Option<ClientPrompt>, RpcError> {
+    let Some(value) = params.get("systemPrompt").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let prompt = v1::SystemPrompt::deserialize(value).map_err(|_| {
+        RpcError::params(
+            "systemPrompt must be {\"mode\": \"append\" | \"override\", \"content\": [{\"type\": \"text\", \"text\": ...}]}",
+        )
+    })?;
+    let mode = match prompt.mode {
+        v1::SystemPromptMode::Append => ClientPromptMode::Append,
+        v1::SystemPromptMode::Override => ClientPromptMode::Override,
+        _ => {
+            return Err(RpcError::params(
+                "unsupported systemPrompt mode: cockpit-code supports \"append\" and \"override\"",
+            ));
+        }
+    };
+    if prompt.content.is_empty() {
+        return Err(RpcError::params("systemPrompt.content must not be empty"));
+    }
+    let mut texts = Vec::with_capacity(prompt.content.len());
+    for block in &prompt.content {
+        match block {
+            v1::ContentBlock::Text(t) => texts.push(t.text.as_str()),
+            _ => {
+                return Err(RpcError::params(
+                    "systemPrompt.content supports only text blocks",
+                ));
+            }
+        }
+    }
+    ClientPrompt::new(mode, texts.join("\n\n"))
+        .map(Some)
+        .map_err(|e| RpcError::params(format!("systemPrompt: {}", e.message)))
+}
+
+/// A session's system prompt is fixed when it is created (and stored with it),
+/// so load and resume may omit it or repeat it, but not change it.
+fn same_system_prompt(
+    id: &str,
+    supplied: Option<&ClientPrompt>,
+    stored: Option<ClientPrompt>,
+) -> Result<(), RpcError> {
+    match supplied {
+        Some(supplied) if stored.as_ref() != Some(supplied) => Err(RpcError::params(format!(
+            "{}; a session keeps the system prompt it was created with. Send the same value, or omit systemPrompt to keep the stored one.",
+            if stored.is_some() {
+                format!("systemPrompt differs from the one session {id} was created with")
+            } else {
+                format!("session {id} was created without a systemPrompt")
+            }
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Client MCP servers and extra directories are ignored by this server. Clear
 /// present values before schema decoding, including entries the schema cannot
 /// represent, while preserving required-field checks for absent keys.
-/// We don't advertise `sessionCapabilities.systemPrompt`, and ACP v1 requires an
-/// agent that can't apply a supplied system prompt to fail the request.
-fn refuse_system_prompt(params: &Value) -> Result<(), RpcError> {
-    if params.get("systemPrompt").is_some_and(|p| !p.is_null()) {
-        return Err(RpcError::params(
-            "systemPrompt is not supported: cockpit-code does not advertise sessionCapabilities.systemPrompt",
-        ));
-    }
-    Ok(())
-}
-
 fn normalize_session_params(params: &Value) -> Value {
     let mut params = params.clone();
     if let Some(object) = params.as_object_mut() {
@@ -660,29 +721,189 @@ mod tests {
     use agent_client_protocol_schema::v1;
     use serde_json::{Value, json};
 
+    use std::time::Duration;
+
+    struct Harness {
+        root: std::path::PathBuf,
+        server: super::Server,
+        frames: tokio::sync::mpsc::UnboundedReceiver<String>,
+        next_id: u64,
+    }
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    impl Harness {
+        /// A server whose only model `p/m` is a command provider that appends
+        /// each request's agent role and frozen system prompt to `requests.log`.
+        fn new(name: &str, provider: bool) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "code-acp-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let config = root.join("config");
+            if provider {
+                std::fs::create_dir_all(config.join("providers")).unwrap();
+                std::fs::write(config.join("config.json"), r#"{"skillsDirs":[]}"#).unwrap();
+                let log = root.join("requests.log");
+                std::fs::write(config.join("providers/p.json"), json!({
+                    "type":"command", "command":{
+                        "argv":["sh", "-c", r#"printf '<<<request agent=%s>>>\n' "$1" >> "$3"; cat "$2" >> "$3"; printf '\n<<<end>>>\n' >> "$3"; printf '%s\n' '{"type":"text","delta":"ok"}' '{"type":"done","stopReason":"end_turn"}'"#, "fake", "{agent}", "{systemPromptFile}", log],
+                        "output":"jsonl",
+                    },
+                    "models":{"m":{"capabilities":{"output":["text"]}}},
+                }).to_string()).unwrap();
+            }
+            let (tx, frames) = tokio::sync::mpsc::unbounded_channel();
+            let server = super::Server {
+                out: std::sync::Arc::new(super::Out::new(tx)),
+                directories: code_config::Directories {
+                    config,
+                    data: root.join("data"),
+                    cache: root.join("cache"),
+                },
+                options: super::Options {
+                    model: provider.then(|| "p/m".into()),
+                    ..Default::default()
+                },
+                caps: Default::default(),
+                sessions: Default::default(),
+            };
+            Self {
+                root,
+                server,
+                frames,
+                next_id: 0,
+            }
+        }
+
+        /// Sends one request and returns its response, skipping notifications.
+        async fn call(&mut self, method: &str, params: Value) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            self.server.frame(&request.to_string()).await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let frame: Value =
+                        serde_json::from_str(&self.frames.recv().await.unwrap()).unwrap();
+                    if frame["id"] == id && frame.get("method").is_none() {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{method} got no response"))
+        }
+
+        async fn ok(&mut self, method: &str, params: Value) -> Value {
+            let reply = self.call(method, params).await;
+            assert!(reply.get("error").is_none(), "{method}: {reply}");
+            reply["result"].clone()
+        }
+
+        async fn refused(&mut self, method: &str, params: Value) -> String {
+            let reply = self.call(method, params).await;
+            assert_eq!(reply["error"]["code"], -32602, "{method}: {reply}");
+            reply["error"]["message"].as_str().unwrap().to_owned()
+        }
+
+        /// One turn, which must send exactly one new build-agent model request.
+        async fn prompt(&mut self, sid: &str) {
+            let before = self.build_requests().len();
+            let result = self
+                .ok(
+                    "session/prompt",
+                    json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hello"}]}),
+                )
+                .await;
+            assert_eq!(result["stopReason"], "end_turn", "{result}");
+            assert_eq!(
+                self.build_requests().len(),
+                before + 1,
+                "one new model request"
+            );
+        }
+
+        /// System prompts of the build-agent requests logged so far.
+        fn build_requests(&self) -> Vec<String> {
+            let log = std::fs::read_to_string(self.root.join("requests.log")).unwrap_or_default();
+            log.split("<<<request agent=")
+                .filter_map(|r| r.strip_prefix("build>>>\n"))
+                .map(|r| r.split("\n<<<end>>>").next().unwrap().to_owned())
+                .collect()
+        }
+
+        fn cwd(&self) -> Value {
+            std::fs::create_dir_all(self.root.join("work")).unwrap();
+            json!(self.root.join("work"))
+        }
+    }
+
+    fn text_prompt(mode: &str, text: &str) -> Value {
+        json!({"mode": mode, "content": [{"type": "text", "text": text}]})
+    }
+
     #[tokio::test]
-    async fn session_requests_with_a_system_prompt_are_refused() {
-        let root = std::env::temp_dir().join(format!(
-            "cockpit-code-acp-system-prompt-{}",
-            std::process::id()
-        ));
-        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
-        let mut server = super::Server {
-            out: std::sync::Arc::new(super::Out::new(tx)),
-            directories: code_config::Directories {
-                config: root.join("config"),
-                data: root.join("data"),
-                cache: root.join("cache"),
-            },
-            options: Default::default(),
-            caps: Default::default(),
-            sessions: Default::default(),
-        };
-        let cwd = std::env::temp_dir();
-        for prompt in [
-            json!({"mode": "append", "content": [{"type": "text", "text": "Review only."}]}),
-            json!({"mode": "someFutureMode", "content": []}),
-        ] {
+    async fn initialize_advertises_append_and_override_system_prompts() {
+        let mut h = Harness::new("system-prompt-caps", false);
+        let result = h
+            .ok(
+                "initialize",
+                json!({"protocolVersion": 1, "clientCapabilities": {}}),
+            )
+            .await;
+        let response: v1::InitializeResponse = serde_json::from_value(result).unwrap();
+        let caps = response
+            .agent_capabilities
+            .session_capabilities
+            .system_prompt;
+        assert!(
+            caps.and_then(|c| c.mode)
+                .and_then(|m| m.override_)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_system_prompts_are_refused_before_any_session_opens() {
+        let mut h = Harness::new("system-prompt-refused", false);
+        let cwd = h.cwd();
+        let text = |t: &str| json!([{"type": "text", "text": t}]);
+        let cases = [
+            (
+                json!({"mode": "someFutureMode", "content": text("x")}),
+                "unsupported systemPrompt mode",
+            ),
+            (
+                json!({"mode": "_vendor", "content": text("x")}),
+                "unsupported systemPrompt mode",
+            ),
+            (
+                json!({"mode": "append", "content": []}),
+                "must not be empty",
+            ),
+            (
+                json!({"mode": "override", "content": text(" \n ")}),
+                "text is empty",
+            ),
+            (
+                json!({"mode": "append", "content": [{"type": "image", "data": "aGk=", "mimeType": "image/png"}]}),
+                "only text blocks",
+            ),
+            (
+                json!({"mode": "append", "content": [{"type": "resource_link", "uri": "file:///etc/passwd", "name": "passwd"}]}),
+                "only text blocks",
+            ),
+            (
+                json!({"mode": "append", "content": text(&"x".repeat(code_engine::context::CLIENT_PROMPT_MAX_BYTES + 1))}),
+                "the limit is",
+            ),
+        ];
+        for (prompt, expected) in cases {
             for (method, mut params) in [
                 ("session/new", json!({"cwd": cwd, "mcpServers": []})),
                 (
@@ -692,26 +913,238 @@ mod tests {
                 ("session/resume", json!({"sessionId": "s", "cwd": cwd})),
             ] {
                 params["systemPrompt"] = prompt.clone();
-                let request =
-                    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-                server.frame(&request.to_string()).await;
-                let reply: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
-                assert_eq!(reply["error"]["code"], -32602, "{method}: {reply}");
-                assert!(
-                    reply["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("systemPrompt is not supported"),
-                    "{method}: {reply}"
-                );
+                let message = h.refused(method, params).await;
+                assert!(message.contains(expected), "{method}: {message}");
+                assert!(!message.contains("xxxx"), "the text is never echoed");
             }
         }
-        // Refused before any session or directory is touched.
-        assert!(server.sessions.is_empty());
-        assert!(!root.exists());
-        // An absent or null prompt is not a request for one.
-        assert!(super::refuse_system_prompt(&json!({"cwd": "/w"})).is_ok());
-        assert!(super::refuse_system_prompt(&json!({"cwd": "/w", "systemPrompt": null})).is_ok());
+        // A wrongly typed value fails schema decoding, with the same code and a
+        // fixed message that never echoes the value.
+        for bad in [
+            json!("SECRET-WRONG-TYPE"),
+            json!({"content": text("SECRET-NO-MODE")}),
+            json!({"mode": "append"}),
+            json!({"mode": "append", "content": [{"type": "text", "text": 7}]}),
+            json!({"mode": "append", "content": [{"type": "SECRET-TYPE", "text": "x"}]}),
+            json!({"mode": "append", "content": "SECRET-NOT-A-LIST"}),
+        ] {
+            for (method, mut params) in [
+                ("session/new", json!({"cwd": cwd, "mcpServers": []})),
+                (
+                    "session/load",
+                    json!({"sessionId": "s", "cwd": cwd, "mcpServers": []}),
+                ),
+                ("session/resume", json!({"sessionId": "s", "cwd": cwd})),
+            ] {
+                params["systemPrompt"] = bad.clone();
+                let message = h.refused(method, params).await;
+                assert!(
+                    message.starts_with("systemPrompt must be"),
+                    "{method}: {message}"
+                );
+                assert!(!message.contains("SECRET"), "{method}: {message}");
+            }
+        }
+        assert!(h.server.sessions.is_empty());
+        assert!(
+            !h.root.join("data").exists(),
+            "no session storage was touched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn append_prompt_reaches_every_turn_and_survives_load_and_resume() {
+        let mut h = Harness::new("system-prompt-append", true);
+        let cwd = h.cwd();
+        // Literal text: no `${ENV}`, `{placeholder}` or `@file` expansion.
+        let marker = "CLIENT-APPEND-7f3a: answer in French. ${HOME} {cwd} @{systemPromptFile}";
+        let created = h
+            .ok(
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": [], "systemPrompt": {"mode": "append", "content": [
+                    {"type": "text", "text": "CLIENT-APPEND-7f3a: answer in French."},
+                    {"type": "text", "text": "${HOME} {cwd} @{systemPromptFile}"},
+                ]}}),
+            )
+            .await;
+        let sid = created["sessionId"].as_str().unwrap().to_owned();
+        let marker = marker.replacen(". $", ".\n\n$", 1);
+        h.prompt(&sid).await;
+        h.prompt(&sid).await;
+        let requests = h.build_requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        for system in &requests {
+            // Appended after cockpit-code's own instructions, which stay.
+            let at = system
+                .find(&marker)
+                .expect("client text in the system prompt");
+            assert!(system[..at].contains("You are a coding agent"), "{system}");
+            assert!(system[..at].contains("Agent role instructions"), "{system}");
+        }
+        // Reopening keeps the stored prompt, whether the client repeats it or omits it.
+        let same = json!({"mode": "append", "content": [
+            {"type": "text", "text": "CLIENT-APPEND-7f3a: answer in French."},
+            {"type": "text", "text": "${HOME} {cwd} @{systemPromptFile}"},
+        ]});
+        for (method, prompt) in [
+            ("session/resume", same.clone()),
+            ("session/load", Value::Null),
+            ("session/resume", Value::Null),
+            ("session/load", same.clone()),
+        ] {
+            h.ok("session/close", json!({"sessionId": sid})).await;
+            assert!(h.server.sessions.is_empty());
+            h.ok(
+                method,
+                json!({"sessionId": sid, "cwd": cwd, "mcpServers": [], "systemPrompt": prompt}),
+            )
+            .await;
+            h.prompt(&sid).await;
+            let last = h.build_requests().pop().unwrap();
+            assert_eq!(last, requests[0], "{method}: the same frozen prompt");
+        }
+        // A different prompt is refused, for the open session and a stored one.
+        let other = text_prompt("append", "something else");
+        for open in [true, false] {
+            if !open {
+                h.ok("session/close", json!({"sessionId": sid})).await;
+            }
+            for method in ["session/load", "session/resume"] {
+                let message = h
+                    .refused(
+                        method,
+                        json!({"sessionId": sid, "cwd": cwd, "mcpServers": [], "systemPrompt": other}),
+                    )
+                    .await;
+                assert!(
+                    message.contains("differs from the one session"),
+                    "{message}"
+                );
+            }
+            let message = h
+                .refused(
+                    "session/load",
+                    json!({"sessionId": sid, "cwd": cwd, "mcpServers": [],
+                           "systemPrompt": {"mode": "override", "content": same["content"]}}),
+                )
+                .await;
+            assert!(
+                message.contains("differs"),
+                "mode is part of the prompt: {message}"
+            );
+        }
+        assert!(h.server.sessions.is_empty(), "a refused load opens nothing");
+        // Forks keep the source's prompt.
+        let forked = h
+            .call(
+                "session/load",
+                json!({"sessionId": sid, "cwd": cwd, "mcpServers": [], "systemPrompt": same,
+                       "_meta": {"cockpitCode": {"lock": "fork"}}}),
+            )
+            .await;
+        assert!(forked.get("error").is_none(), "{forked}");
+        // The copy is served under the requested id; its own id is in _meta.
+        let fork_id = forked["result"]["_meta"]["cockpitCode"]["engineSessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(fork_id, sid);
+        let stored = super::client_prompt(&json!({"systemPrompt": same})).unwrap();
+        assert_eq!(h.server.sessions[&sid].system_prompt(), stored);
+        h.prompt(&sid).await;
+        assert_eq!(
+            h.build_requests().pop().unwrap(),
+            requests[0],
+            "the fork's model request"
+        );
+        // ... and after the fork itself is reopened.
+        h.ok("session/close", json!({"sessionId": sid})).await;
+        assert_eq!(
+            code_engine::sessions::stored_system_prompt(&h.server.directories.data, &fork_id)
+                .unwrap(),
+            stored
+        );
+        h.ok("session/resume", json!({"sessionId": fork_id, "cwd": cwd}))
+            .await;
+        h.prompt(&fork_id).await;
+        assert_eq!(
+            h.build_requests().pop().unwrap(),
+            requests[0],
+            "the reopened fork"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn override_prompt_replaces_the_base_instructions_only() {
+        let mut h = Harness::new("system-prompt-override", true);
+        let cwd = h.cwd();
+        let created = h
+            .ok(
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": [],
+                       "systemPrompt": text_prompt("override", "CLIENT-OVERRIDE-91c2: you are a reviewer.")}),
+            )
+            .await;
+        let sid = created["sessionId"].as_str().unwrap().to_owned();
+        h.prompt(&sid).await;
+        let system = h.build_requests().pop().unwrap();
+        assert!(
+            system.starts_with("CLIENT-OVERRIDE-91c2: you are a reviewer.\n"),
+            "{system}"
+        );
+        assert!(!system.contains("You are a coding agent"), "{system}");
+        // Harness rules, tools and the role stay; the override text appears once.
+        assert!(system.contains("<system-message id="), "{system}");
+        assert!(system.contains("Agent role instructions"), "{system}");
+        assert_eq!(system.matches("CLIENT-OVERRIDE-91c2").count(), 1);
+        h.ok("session/close", json!({"sessionId": sid})).await;
+        h.ok("session/resume", json!({"sessionId": sid, "cwd": cwd}))
+            .await;
+        h.prompt(&sid).await;
+        assert_eq!(h.build_requests().pop().unwrap(), system);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sessions_without_a_system_prompt_use_the_defaults_and_refuse_a_late_one() {
+        let mut h = Harness::new("system-prompt-none", true);
+        let cwd = h.cwd();
+        let created = h
+            .ok(
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": [], "systemPrompt": null}),
+            )
+            .await;
+        let sid = created["sessionId"].as_str().unwrap().to_owned();
+        h.prompt(&sid).await;
+        let system = h.build_requests().pop().unwrap();
+        assert!(system.starts_with("You are a coding agent"), "{system}");
+        assert!(
+            !system.contains("Session instructions from the client"),
+            "{system}"
+        );
+        h.ok("session/close", json!({"sessionId": sid})).await;
+        let message = h
+            .refused(
+                "session/resume",
+                json!({"sessionId": sid, "cwd": cwd, "systemPrompt": text_prompt("append", "late")}),
+            )
+            .await;
+        assert!(
+            message.contains("was created without a systemPrompt"),
+            "{message}"
+        );
+        // An unknown session is still "not found", with or without a prompt.
+        let reply = h
+            .call(
+                "session/resume",
+                json!({"sessionId": "00000000-0000-4000-8000-000000000000", "cwd": cwd,
+                       "systemPrompt": text_prompt("append", "x")}),
+            )
+            .await;
+        assert_eq!(reply["error"]["code"], super::rpc::NOT_FOUND, "{reply}");
     }
 
     macro_rules! accepts {

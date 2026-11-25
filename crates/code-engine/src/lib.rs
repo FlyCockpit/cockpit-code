@@ -8,6 +8,7 @@ mod exclusive;
 mod file_notices;
 mod flat;
 pub use code_config::SubagentMode;
+pub use context::{ClientPrompt, ClientPromptMode};
 mod finalize;
 mod frontend;
 mod progress;
@@ -107,6 +108,10 @@ pub const EXPLORE_PROMPT: &str = include_str!("builtin/explore.md");
 pub struct SessionOptions {
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Client instructions for a new session. `Session::create` stores them with
+    /// the session, fixed for its lifetime; opening an existing session ignores
+    /// this and keeps the stored value (see [`sessions::stored_system_prompt`]).
+    pub system_prompt: Option<context::ClientPrompt>,
 }
 pub(crate) struct Control {
     data_dir: PathBuf,
@@ -669,6 +674,7 @@ impl Session {
             effort: options.effort,
             safety_model: store.config().permissions.auto_model.clone(),
             subagents: store.config().subagents.mode,
+            system_prompt: options.system_prompt,
             ..Default::default()
         };
         let journal = Journal::create(&store, cwd, settings)?;
@@ -859,6 +865,16 @@ impl Session {
     }
     pub fn id(&self) -> String {
         self.control.journal.lock().unwrap().header.id.clone()
+    }
+    /// The client instructions stored with this session.
+    pub fn system_prompt(&self) -> Option<context::ClientPrompt> {
+        self.control
+            .journal
+            .lock()
+            .unwrap()
+            .settings
+            .system_prompt
+            .clone()
     }
     /// Set a user-owned title. Pending automatic passes can no longer replace it.
     pub fn rename(&self, title: impl Into<String>) -> Result<(), EngineError> {
@@ -1925,7 +1941,7 @@ impl State {
         if self.context_state.frozen.is_some() {
             return self.freeze_tool_model(&self.model()?);
         }
-        let (existing, shared, global, role) = {
+        let (existing, shared, global, role, client) = {
             let journal = self.control.journal.lock().unwrap();
             let role = journal.agents[&self.agent_id].stable_prompt.clone();
             let existing = journal.histories.get(&self.agent_id).and_then(|h| {
@@ -1952,7 +1968,8 @@ impl State {
                     _ => None,
                 })
             });
-            (existing, shared, global, role)
+            let client = journal.settings.system_prompt.clone();
+            (existing, shared, global, role, client)
         };
         let mut context = if let Some(existing) = existing {
             existing
@@ -1960,7 +1977,13 @@ impl State {
             let mut context = if let Some(shared) = shared {
                 shared.for_role(role)
             } else {
-                context::FrozenContext::capture(&self.store, &self.cwd, role, global.as_ref())?
+                context::FrozenContext::capture(
+                    &self.store,
+                    &self.cwd,
+                    role,
+                    global.as_ref(),
+                    client.as_ref(),
+                )?
             };
             context.freeze_offered(self.model().ok().map(|m| m.id()), |context, overrides| {
                 tool_names::apply(tool_defaults::definitions(), overrides)?;

@@ -14,5 +14,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Subagents in tree or flat layouts, and autonomous `/goal` runs with spending, time and token limits and an optional review panel.
 - Permission modes `manual`, `auto`, `unattended` and `yolo`, with a configurable safety model for the automatic modes.
 - MCP servers over stdio, HTTP and SSE; LSP navigation and diagnostics through locally installed language servers; persistent sessions with resume, fork, compact and prune; PTY background jobs and user terminals.
+- ACP clients can send a session system prompt (`systemPrompt`, `append` or `override` mode) on `session/new`. It is stored with the session, so load, resume and forks keep it.
 - A sandboxed Python `script` tool, web search and fetch, skills from `~/.agents/skills`, and file attachments.
 - Release binaries for Linux (static musl builds for x86_64 and aarch64) and macOS (Apple silicon, Intel) on GitHub Releases, with SHA256SUMS, third-party license notices and signed GitHub build provenance attestations for every asset (`gh attestation verify <file> --repo FlyCockpit/cockpit-code`).

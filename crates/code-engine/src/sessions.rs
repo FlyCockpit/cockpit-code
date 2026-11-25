@@ -73,6 +73,8 @@ pub struct SessionSettings {
     pub strict_tools: BTreeMap<String, bool>,
     /// Server resolution, including empty results, frozen for the session.
     pub lsp_servers: Option<BTreeMap<String, code_config::lsp::LspServer>>,
+    /// Client instructions, set at creation and fixed for the session.
+    pub system_prompt: Option<crate::context::ClientPrompt>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +186,13 @@ fn status(dir: &Path, token: Option<&str>, read_only: bool) -> Result<LockStatus
 pub fn lock_status(data: &Path, id: &str) -> Result<LockStatus> {
     valid_id(id)?;
     status(&data.join("sessions").join(id), None, false)
+}
+/// The client instructions stored with session `id`, read without opening it.
+pub fn stored_system_prompt(data: &Path, id: &str) -> Result<Option<crate::context::ClientPrompt>> {
+    valid_id(id)?;
+    let settings: SessionSettings =
+        read_json(&data.join("sessions").join(id).join("settings.json"))?;
+    Ok(settings.system_prompt)
 }
 pub fn list(cwd: &Path) -> Result<Vec<SessionInfo>> {
     list_in(
@@ -1512,6 +1521,9 @@ impl Journal {
     pub fn change_settings(&mut self, changes: Vec<(String, Value)>) -> Result<Vec<EventEnvelope>> {
         let mut proposed = serde_json::to_value(&self.settings).map_err(bad)?;
         for (key, value) in &changes {
+            if key == "systemPrompt" {
+                return Err(bad("the system prompt is fixed when a session is created"));
+            }
             if proposed.get(key).is_none() {
                 return Err(bad("unknown session setting"));
             }

@@ -387,6 +387,10 @@ impl AcpSession {
 
     /// `_meta` of an open result: the engine session behind `acp_id`, and
     /// the source when it is a fork.
+    pub fn system_prompt(&self) -> Option<code_engine::context::ClientPrompt> {
+        self.session.system_prompt()
+    }
+
     pub fn open_meta(&self) -> Value {
         let engine_id = self.session.id();
         json!({"cockpitCode": {

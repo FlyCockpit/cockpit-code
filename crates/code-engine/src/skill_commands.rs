@@ -32,7 +32,7 @@ impl Session {
         }
         let store = code_config::ConfigStore::load(self.directories.clone())
             .map_err(|e| EngineError::bad(e.to_string()))?;
-        Ok(FrozenContext::capture(&store, &cwd, crate::BUILD_PROMPT.into(), None)?.skills)
+        Ok(FrozenContext::capture(&store, &cwd, crate::BUILD_PROMPT.into(), None, None)?.skills)
     }
     /// Build the tagged user message; queued frontends may pass this to queue_message.
     pub fn skill_message(&self, name: &str, args: &str) -> Result<String, EngineError> {
