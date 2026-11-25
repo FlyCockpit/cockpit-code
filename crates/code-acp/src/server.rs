@@ -272,6 +272,7 @@ impl Server {
         let result = (|| {
             let client_mcp_count = params["mcpServers"].as_array().map_or(0, Vec::len);
             let req = decode::<v1::NewSessionRequest>(&normalize_session_params(params))?;
+            refuse_system_prompt(params)?;
             if !req.cwd.is_absolute() {
                 return Err(RpcError::params("cwd must be an absolute path"));
             }
@@ -339,6 +340,7 @@ impl Server {
             } else {
                 decode::<v1::ResumeSessionRequest>(&normalize_session_params(params))?;
             }
+            refuse_system_prompt(params)?;
             if let Some(s) = self.sessions.get(&acp_id) {
                 return Ok(s.clone());
             }
@@ -650,6 +652,17 @@ fn prompt_content(
 /// Client MCP servers and extra directories are ignored by this server. Clear
 /// present values before schema decoding, including entries the schema cannot
 /// represent, while preserving required-field checks for absent keys.
+/// We don't advertise `sessionCapabilities.systemPrompt`, and ACP v1 requires an
+/// agent that can't apply a supplied system prompt to fail the request.
+fn refuse_system_prompt(params: &Value) -> Result<(), RpcError> {
+    if params.get("systemPrompt").is_some_and(|p| !p.is_null()) {
+        return Err(RpcError::params(
+            "systemPrompt is not supported: cockpit-code does not advertise sessionCapabilities.systemPrompt",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_session_params(params: &Value) -> Value {
     let mut params = params.clone();
     if let Some(object) = params.as_object_mut() {
@@ -665,7 +678,61 @@ fn normalize_session_params(params: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use agent_client_protocol_schema::v1;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn session_requests_with_a_system_prompt_are_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "cockpit-code-acp-system-prompt-{}",
+            std::process::id()
+        ));
+        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let mut server = super::Server {
+            out: std::sync::Arc::new(super::Out::new(tx)),
+            directories: code_config::Directories {
+                config: root.join("config"),
+                data: root.join("data"),
+                cache: root.join("cache"),
+            },
+            options: Default::default(),
+            caps: Default::default(),
+            sessions: Default::default(),
+        };
+        let cwd = std::env::temp_dir();
+        for prompt in [
+            json!({"mode": "append", "content": [{"type": "text", "text": "Review only."}]}),
+            json!({"mode": "someFutureMode", "content": []}),
+        ] {
+            for (method, mut params) in [
+                ("session/new", json!({"cwd": cwd, "mcpServers": []})),
+                (
+                    "session/load",
+                    json!({"sessionId": "s", "cwd": cwd, "mcpServers": []}),
+                ),
+                ("session/resume", json!({"sessionId": "s", "cwd": cwd})),
+            ] {
+                params["systemPrompt"] = prompt.clone();
+                let request =
+                    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+                server.frame(&request.to_string()).await;
+                let reply: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32602, "{method}: {reply}");
+                assert!(
+                    reply["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("systemPrompt is not supported"),
+                    "{method}: {reply}"
+                );
+            }
+        }
+        // Refused before any session or directory is touched.
+        assert!(server.sessions.is_empty());
+        assert!(!root.exists());
+        // An absent or null prompt is not a request for one.
+        assert!(super::refuse_system_prompt(&json!({"cwd": "/w"})).is_ok());
+        assert!(super::refuse_system_prompt(&json!({"cwd": "/w", "systemPrompt": null})).is_ok());
+    }
 
     macro_rules! accepts {
         ($ty:ty, $value:expr) => {
