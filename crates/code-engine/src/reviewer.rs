@@ -186,21 +186,11 @@ pub(crate) async fn check(
         }
     }
     .await;
-    for receipt in reader.receipts.lock().unwrap().iter() {
-        if library
+    reader.extend_references(&mut library.references, |receipt| {
+        library
             .guidance
             .iter()
             .any(|(path, _)| path == &receipt.path)
-        {
-            continue;
-        }
-        if !library
-            .references
-            .iter()
-            .any(|r| r.path == receipt.path && r.hash == receipt.hash && r.args == receipt.args)
-        {
-            library.references.push(receipt.clone());
-        }
-    }
+    });
     result
 }

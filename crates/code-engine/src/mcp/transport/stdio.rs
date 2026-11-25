@@ -57,6 +57,11 @@ impl StdioClient {
         }
         let _ = self.child.start_kill();
     }
+    /// Kills the server's process group and reaps the leader.
+    async fn terminate(&mut self) {
+        self.kill_group();
+        let _ = self.child.wait().await;
+    }
     fn has_exited(&mut self) -> Result<bool> {
         #[cfg(unix)]
         {
@@ -154,8 +159,7 @@ impl McpClient for StdioClient {
         self.notification("notifications/initialized").await
     }
     async fn shutdown(&mut self) {
-        self.kill_group();
-        let _ = self.child.wait().await;
+        self.terminate().await;
     }
     async fn list_tools(&mut self) -> Result<Vec<ToolDescriptor>> {
         let mut tools = vec![];

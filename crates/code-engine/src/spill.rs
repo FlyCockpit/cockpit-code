@@ -464,10 +464,10 @@ fn escaped_char(unit: u32, mut low: impl FnMut() -> io::Result<u32>) -> io::Resu
 
 /// A provider JSON response. In memory it is parsed exactly as before
 /// (`from_utf8_lossy` + `serde_json`). Spilled, it is scanned from the file:
-/// strings longer than `inline_string` stay there and appear in `value` as
-/// unforgeable placeholders that [`Document::text`] resolves to a stream.
+/// strings longer than `inline_string` stay there and appear in the parsed
+/// value as unforgeable placeholders that [`Document::text`] resolves to a
+/// stream. The document keeps the file (and so the strings) alive.
 pub(crate) struct Document {
-    pub value: Value,
     spilled: Option<Spilled>,
     marker: String,
     ranges: Vec<(u64, u64)>,
@@ -477,7 +477,12 @@ pub(crate) enum Text<'a> {
     Stream(Box<dyn Read + Send + 'a>),
 }
 impl Document {
-    pub(crate) fn parse(body: Spilled, limits: Limits, cancel: &CancellationToken) -> Result<Self> {
+    /// The parsed value, and the document that resolves its strings.
+    pub(crate) fn parse(
+        body: Spilled,
+        limits: Limits,
+        cancel: &CancellationToken,
+    ) -> Result<(Value, Self)> {
         let marker = format!("\u{0}cockpit-spilled-string:{}:", uuid::Uuid::new_v4());
         // In memory every string stays inline, as serde_json would keep it;
         // the budget then also covers the body's own strings (at most
@@ -515,12 +520,14 @@ impl Document {
             };
             (value, std::mem::take(&mut scanner.ranges))
         };
-        Ok(Self {
+        Ok((
             value,
-            spilled: body.is_file().then_some(body),
-            marker,
-            ranges,
-        })
+            Self {
+                spilled: body.is_file().then_some(body),
+                marker,
+                ranges,
+            },
+        ))
     }
     pub(crate) fn text<'a>(&'a self, s: &'a str) -> Text<'a> {
         let range = s
@@ -1107,21 +1114,21 @@ mod tests {
                 text.to_string()
             };
             let expected: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let document = Document::parse(
+            let (value, document) = Document::parse(
                 spilled(root.path(), text.as_bytes()),
                 limits(1 << 20, 1 << 20, u64::MAX),
                 &CancellationToken::new(),
             )
             .unwrap();
-            assert_eq!(resolve(&document, &document.value), expected, "{text}");
+            assert_eq!(resolve(&document, &value), expected, "{text}");
             // In memory it is serde_json itself.
-            let memory = Document::parse(
+            let (memory, _) = Document::parse(
                 Spilled::Memory(text.as_bytes().to_vec()),
                 limits(1 << 20, 1 << 20, u64::MAX),
                 &CancellationToken::new(),
             )
             .unwrap();
-            assert_eq!(memory.value, expected);
+            assert_eq!(memory, expected);
         }
     }
 
@@ -1150,14 +1157,14 @@ mod tests {
         for bytes in documents {
             let expected: Value =
                 serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap_or(Value::Null);
-            let document = Document::parse(
+            let (value, _) = Document::parse(
                 Spilled::Memory(bytes.clone()),
                 limits(1 << 20, 1 << 20, u64::MAX),
                 &CancellationToken::new(),
             )
             .unwrap();
             assert_eq!(
-                document.value,
+                value,
                 expected,
                 "{:?}",
                 String::from_utf8_lossy(&bytes[..bytes.len().min(40)])
@@ -1200,7 +1207,7 @@ mod tests {
         let text = format!(
             r#"{{"result":"{long}","error":null,"x":"\u0000cockpit-spilled-string:fake:0"}}"#
         );
-        let document = Document::parse(
+        let (value, document) = Document::parse(
             spilled(root.path(), text.as_bytes()),
             Limits {
                 inline_string: 64,
@@ -1209,12 +1216,12 @@ mod tests {
             &CancellationToken::new(),
         )
         .unwrap();
-        let placeholder = document.value["result"].as_str().unwrap();
+        let placeholder = value["result"].as_str().unwrap();
         assert!(placeholder.len() < 100);
         assert!(matches!(document.text(placeholder), Text::Stream(_)));
         assert_eq!(document.prefix(placeholder, 3), "QQQ");
         // A provider cannot forge a placeholder: the marker carries a fresh UUID.
-        let forged = document.value["x"].as_str().unwrap();
+        let forged = value["x"].as_str().unwrap();
         assert!(matches!(document.text(forged), Text::Inline(_)));
         // Non-media JSON is still bounded by the in-memory budget.
         let many = format!("[{}0]", "0,".repeat(100));
@@ -1243,7 +1250,7 @@ mod tests {
         assert!(memory(&nodes).is_err());
         let string = format!(r#"{{"result":"{}"}}"#, "Q".repeat((1 << 20) - 20));
         assert_eq!(
-            memory(&string).unwrap().value,
+            memory(&string).unwrap().0,
             serde_json::from_str::<Value>(&string).unwrap()
         );
     }
