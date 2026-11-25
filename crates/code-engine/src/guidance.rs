@@ -595,7 +595,8 @@ mod tests {
     async fn invalid_guidance_blobs_allow_startup_without_trusting_the_working_file() {
         for corrupt in [false, true] {
             let (temp, store) = crate::test_support::store(serde_json::json!({}));
-            let cwd = temp.path().join("project");
+            // Sessions key guidance by the canonical cwd (macOS temp dirs sit under a symlink).
+            let cwd = std::fs::canonicalize(temp.path()).unwrap().join("project");
             let path = cwd.join(".cockpit-code/reviewer-guidance.md");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"trusted").unwrap();
