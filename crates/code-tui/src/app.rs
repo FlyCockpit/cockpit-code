@@ -4045,7 +4045,7 @@ impl App {
                     "Quit cockpit-code?",
                     Body::Markdown(body.join("\n")),
                     vec![
-                        DialogOption::new("quit", "Quit").key('y').guarded(),
+                        DialogOption::new("quit", "Quit").key('q').guarded(),
                         DialogOption::new("stay", "Stay").key('n'),
                     ],
                 );
@@ -4935,7 +4935,7 @@ const HELP: &str = "**Keys**
 - **Scrollbars** page on a track click and drag by the thumb.
 - **Clipboard**: over SSH copies use OSC 52 (plain text only; rich copies fall back to markdown or HTML source); inside tmux enable `set -g set-clipboard on`.
 
-**Dialogs**: ↑↓ move (j/k are just letters), enter or a click chooses, an option's key or number chooses it. Options that destroy or approve something (compact, delete, allow, approve, apply, quit and the like) show `alt+<key>`: typed letters never choose them, only alt+key, or ↑↓ onto them + enter (alt+enter from their text field). Question dialogs submit with alt+s / ctrl+s, or ↓ to Submit + enter. Keys typed in the moment a dialog opens are ignored.
+**Dialogs**: ↑↓ move (j/k are just letters), enter or a click chooses, an option's key or number chooses it. Options that destroy or approve something (compact, delete, allow, approve, apply, quit and the like) show `alt+<key>`: typed letters never choose them, only alt+key, or ↑↓ onto them + enter. A dialog opens on a safe option, so enter alone never destroys or approves. Question dialogs submit with alt+s / ctrl+s, or ↓ to Submit + enter. Keys typed in the moment a dialog opens are ignored.
 
 While a child's transcript is open, the composer sends it a steering message (delivered at its next turn boundary).
 
@@ -5015,9 +5015,20 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Opens a dialog with `open` for many seeds and types random prose
-    /// into it: no guarded option is ever chosen. Its guarded options.
+    /// Opens a dialog with `open`: it opens on a safe option, a plain
+    /// Enter there fires no guarded one, and its rows, field and footer
+    /// name the alt+key that works. Then for many seeds it types random
+    /// prose into it: no guarded option is ever chosen. Its guarded options.
     fn guarded_and_safe(app: &mut App, open: impl Fn(&mut App)) -> Vec<String> {
+        use crate::dialog::tests::{assert_keys_agree, assert_opens_safe};
+        for check in [assert_opens_safe, assert_keys_agree] {
+            app.overlay = Overlay::None;
+            open(app);
+            let Overlay::Dialog(d, _) = &mut app.overlay else {
+                panic!("no dialog open");
+            };
+            check(d);
+        }
         let mut ids = vec![];
         for seed in 0..40 {
             app.overlay = Overlay::None;
@@ -5159,6 +5170,59 @@ mod tests {
         // Asking sends a question: the prefilled field's Enter only hints.
         let ids = guarded_and_safe(&mut app, |app| app.ask_dialog("child"));
         assert_eq!(ids, ["ask"]);
+        // Closing a private terminal.
+        let ids = guarded_and_safe(&mut app, |app| {
+            let i = app.term_add(crate::engine::TermInfo {
+                id: "t1".into(),
+                user: true,
+                agent: "root".into(),
+                breadcrumb: "root".into(),
+                cwd: "/".into(),
+                prompt: None,
+                command: None,
+                share_output: false,
+                staged: 0,
+                whenever: false,
+                status: "running".into(),
+                exit: None,
+            });
+            app.term_close_dialog(i);
+        });
+        assert_eq!(ids, ["close"]);
+    }
+
+    /// One key name per guarded action: the Quit dialog (a job running)
+    /// opens on Stay and quits with alt+q; terminal close and Stop branch
+    /// name alt+c and alt+s in their option, field hint and footer, and
+    /// /help names no other key for them.
+    #[tokio::test]
+    async fn quit_opens_on_stay_and_each_guarded_action_has_one_key_name() {
+        let (_dir, mut app) = app();
+        app.running = true;
+        app.command("quit", "");
+        let Overlay::Dialog(d, DialogPurpose::Quit) = &mut app.overlay else {
+            panic!("no quit dialog");
+        };
+        assert_eq!(d.options[d.selected].id, "stay");
+        let open = Instant::now();
+        assert!(matches!(
+            d.key_at(key(KeyCode::Enter), open + Duration::from_millis(1000)),
+            crate::dialog::Outcome::Chosen { id, .. } if id == "stay"
+        ));
+        app.overlay = Overlay::None;
+        app.command("quit", "");
+        let Overlay::Dialog(d, _) = &mut app.overlay else {
+            panic!("no quit dialog");
+        };
+        assert!(matches!(
+            d.key_at(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT), open),
+            crate::dialog::Outcome::Chosen { id, .. } if id == "quit"
+        ));
+        app.running = false;
+        let dialogs = HELP.split("**Dialogs**").nth(1).unwrap();
+        let dialogs = dialogs.split("\n\n").next().unwrap();
+        assert!(!dialogs.contains("alt+enter"), "{dialogs}");
+        assert!(dialogs.contains("`alt+<key>`") && dialogs.contains("opens on a safe option"));
     }
 
     #[tokio::test]

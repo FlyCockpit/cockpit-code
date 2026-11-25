@@ -138,6 +138,9 @@ pub struct Dialog {
     /// The user moved the selection with ↑/↓ (or alt+key, a click): only
     /// then can Enter choose a guarded option.
     moved: bool,
+    /// The user put the cursor on an option (↑/↓ in the list, a click):
+    /// until then it rests where the dialog opened it.
+    steered: bool,
     /// A bare key met a guarded option: the footer says how to choose it.
     hint: Option<String>,
 }
@@ -212,8 +215,21 @@ impl Dialog {
             armed: true,
             nudged: false,
             moved: false,
+            steered: false,
             hint: None,
         }
+        .start_safe()
+    }
+    /// A dialog opens with the cursor on its first safe option, so a plain
+    /// Enter does the safe thing at once; a guarded one takes ↑↓ + Enter
+    /// or its alt+key (when every option is guarded, Enter only hints).
+    fn start_safe(mut self) -> Self {
+        if self.is_guarded(self.selected)
+            && let Some(i) = self.options.iter().position(|o| !o.guarded)
+        {
+            self.selected = i;
+        }
+        self
     }
     /// A prompt dialog's title says how many prompts wait behind it.
     /// `first` keeps the prompt's own title across renders (the caller
@@ -267,7 +283,7 @@ impl Dialog {
         if let Some(i) = self.options.iter().position(|o| o.id == id) {
             self.selected = i;
         }
-        self
+        self.start_safe()
     }
     fn chosen(&mut self, idx: usize) -> Outcome {
         if self.edit_first && !self.text_focus && self.wants_text(idx) {
@@ -309,6 +325,7 @@ impl Dialog {
         self.text_focus = false;
         self.armed = true;
         self.moved = true;
+        self.steered = true;
         self.guard.end();
         self.chosen(i)
     }
@@ -320,24 +337,36 @@ impl Dialog {
     fn enter_chooses(&self, idx: usize) -> bool {
         !self.is_guarded(idx) || (self.moved && idx == self.selected)
     }
+    /// The key that chooses option `idx` with alt: its letter, or its
+    /// number. The one name every row, field hint and footer shows.
+    fn alt_key(&self, idx: usize) -> String {
+        self.options[idx]
+            .key
+            .map_or_else(|| (idx + 1).to_string(), String::from)
+    }
     /// Typed text met guarded option `idx`: say how to choose it.
     fn refuse(&mut self, idx: usize) -> Outcome {
-        let key = self.options[idx]
-            .key
-            .map_or_else(|| (idx + 1).to_string(), String::from);
         self.hint = Some(format!(
             "{}: {}",
             self.options[idx].label.to_lowercase(),
-            deliberate_hint(&key)
+            deliberate_hint(&self.alt_key(idx))
         ));
         Outcome::Pending
     }
-    /// The option Enter in the text field chooses.
+    /// The option Enter in the text field chooses: the selected one when
+    /// it takes the text, else the field's own option, else (while the
+    /// cursor still rests on the safe option it opened on, which may
+    /// ignore the field) the first that needs text, else the selected one.
     fn field_target(&self) -> usize {
         if self.needs_text.is_empty() || !self.wants_text(self.selected) {
             self.text_option
                 .as_ref()
                 .and_then(|id| self.options.iter().position(|o| &o.id == id))
+                .or_else(|| {
+                    self.options
+                        .iter()
+                        .position(|o| !self.steered && self.needs_text.contains(&o.id))
+                })
                 .unwrap_or(self.selected)
         } else {
             self.selected
@@ -410,14 +439,14 @@ impl Dialog {
             self.guard.end();
         }
         // alt+key (or alt+number) chooses its option from anywhere, the
-        // text field too.
+        // text field too: from the field it takes the field as it is (an
+        // empty optional note, a prefill), as Enter there would.
         if alt
             && let KeyCode::Char(c) = key.code
             && let Some(i) = self.key_target(c)
         {
             self.moved = true;
             self.guard.end();
-            self.text_focus = false;
             return self.chosen(i);
         }
         if self.text_focus
@@ -454,11 +483,13 @@ impl Dialog {
             KeyCode::Up => {
                 self.selected = (self.selected + n - 1) % n;
                 self.moved = true;
+                self.steered = true;
                 self.guard.end();
             }
             KeyCode::Down => {
                 self.selected = (self.selected + 1) % n;
                 self.moved = true;
+                self.steered = true;
                 self.guard.end();
             }
             KeyCode::Enter => {
@@ -499,9 +530,8 @@ impl Dialog {
                 t.text()
             };
             let key = match (o.key, o.guarded) {
+                (_, true) => format!("  alt+{}", self.alt_key(i)),
                 (Some(k), false) => format!("  {k}"),
-                (Some(k), true) => format!("  alt+{k}"),
-                (None, true) => format!("  alt+{}", i + 1),
                 (None, false) => String::new(),
             };
             let first = tail.len();
@@ -552,9 +582,9 @@ impl Dialog {
                         .map(|o| o.label.to_lowercase())
                         .unwrap_or_default();
                     let enter = if self.enter_chooses(idx) {
-                        "enter"
+                        "enter".to_string()
                     } else {
-                        "alt+enter"
+                        format!("alt+{}", self.alt_key(idx))
                     };
                     format!("{placeholder} · {enter}: {target} · tab: back to the options")
                 } else {
@@ -861,9 +891,10 @@ pub(crate) mod tests {
                     ids.iter().all(|id| id == "jump"),
                     "child {child}, step {step}: {ids:?}"
                 );
-                assert_eq!(d.selected, 0);
-                // Enter on the opening selection (Allow once) only hints.
+                // The bare o only hinted; Enter on the opening selection
+                // (Deny, the first safe option) asks for the feedback.
                 assert!(d.hint.as_deref().unwrap().contains("alt+o or ↑↓ + Enter"));
+                assert!(d.selected == 2 && d.text_focus);
             }
         }
     }
@@ -875,11 +906,11 @@ pub(crate) mod tests {
         for c in "jjkkjj".chars() {
             d.key_at(k(c), at(open, 1000));
         }
-        assert_eq!(d.selected, 0);
-        d.key_at(code(KeyCode::Down), at(open, 1000));
-        assert_eq!(d.selected, 1);
+        assert_eq!(d.selected, 2);
         d.key_at(code(KeyCode::Up), at(open, 1000));
-        assert_eq!(d.selected, 0);
+        assert_eq!(d.selected, 1);
+        d.key_at(code(KeyCode::Down), at(open, 1000));
+        assert_eq!(d.selected, 2);
     }
 
     #[test]
@@ -904,10 +935,9 @@ pub(crate) mod tests {
             chosen(d.key_at(code(KeyCode::Enter), at(open, 1100))).as_deref(),
             Some("compact")
         );
-        // ↓↑ back onto the opening Allow once, then Enter.
+        // From the opening Deny, ↓ (wrapping) onto Allow once, then Enter.
         let mut d = opened(approval(false), open);
         d.key_at(code(KeyCode::Down), at(open, 1000));
-        d.key_at(code(KeyCode::Up), at(open, 1000));
         assert_eq!(
             chosen(d.key_at(code(KeyCode::Enter), at(open, 1100))).as_deref(),
             Some("once")
@@ -937,7 +967,9 @@ pub(crate) mod tests {
                 "Close terminal?",
                 Body::None,
                 vec![
-                    DialogOption::new("close", "Close and send").guarded(),
+                    DialogOption::new("close", "Close and send")
+                        .key('c')
+                        .guarded(),
                     DialogOption::new("stay", "Keep it open"),
                 ],
             )
@@ -949,14 +981,33 @@ pub(crate) mod tests {
         assert!(type_text(&mut d, open, 1000, 50, "done here\n").is_empty());
         assert_eq!(
             d.hint.as_deref(),
-            Some("close and send: alt+1 or ↑↓ + Enter")
+            Some("close and send: alt+c or ↑↓ + Enter")
         );
+        // alt+c, alt+1 and alt+Enter (from the field) all close and send.
+        for key in [alt('c'), alt('1')] {
+            let mut d = opened(close(), open);
+            type_text(&mut d, open, 1000, 50, "done here");
+            assert!(matches!(
+                d.key_at(key, at(open, 2000)),
+                Outcome::Chosen { id, text: Some(t) } if id == "close" && t == "done here"
+            ));
+        }
         assert!(matches!(
             d.key_at(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), at(open, 2000)),
             Outcome::Chosen { id, text: Some(t) } if id == "close" && t == "done here"
         ));
+        // ↑ leaves the field on the opening Keep it open; ↑ again onto
+        // Close and send, then Enter.
         let mut d = opened(close(), open);
         type_text(&mut d, open, 1000, 50, "ok");
+        d.key_at(code(KeyCode::Up), at(open, 2000));
+        assert_eq!(
+            chosen(d.key_at(code(KeyCode::Enter), at(open, 2050))).as_deref(),
+            Some("stay")
+        );
+        let mut d = opened(close(), open);
+        type_text(&mut d, open, 1000, 50, "ok");
+        d.key_at(code(KeyCode::Up), at(open, 2000));
         d.key_at(code(KeyCode::Up), at(open, 2000));
         assert_eq!(
             chosen(d.key_at(code(KeyCode::Enter), at(open, 2100))).as_deref(),
@@ -1031,6 +1082,123 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_field_key_takes_the_field_as_it_is() {
+        let open = Instant::now();
+        // An empty optional note: alt+c closes at once.
+        let mut d = opened(
+            Dialog::new(
+                "Close terminal?",
+                Body::None,
+                vec![
+                    DialogOption::new("close", "Close and send")
+                        .key('c')
+                        .guarded(),
+                    DialogOption::new("stay", "Keep it open"),
+                ],
+            )
+            .with_text("note")
+            .text_option("close", true),
+            open,
+        );
+        assert!(matches!(
+            d.key_at(alt('c'), at(open, 1000)),
+            Outcome::Chosen { id, text: None } if id == "close"
+        ));
+        // A prefilled question: alt+a from the field sends it; from the
+        // options it opens the field to edit first.
+        let ask = || {
+            Dialog::new(
+                "Ask",
+                Body::None,
+                vec![
+                    DialogOption::new("ask", "Ask").key('a').guarded(),
+                    DialogOption::new("cancel", "Cancel"),
+                ],
+            )
+            .with_text("question")
+            .prefill("status?")
+            .text_option("ask", true)
+        };
+        let mut d = opened(ask(), open);
+        assert!(matches!(
+            d.key_at(alt('a'), at(open, 1000)),
+            Outcome::Chosen { id, text: Some(t) } if id == "ask" && t == "status?"
+        ));
+        let mut d = opened(ask(), open);
+        d.key_at(code(KeyCode::Tab), at(open, 1000));
+        assert!(matches!(
+            d.key_at(alt('a'), at(open, 1100)),
+            Outcome::Pending
+        ));
+        assert!(d.text_focus);
+        // Roadblock opens on the safe "edit the contract": a message typed
+        // in the field goes with Pivot (deliberately), never to the editor.
+        let roadblock = || {
+            Dialog::new(
+                "Roadblock",
+                Body::None,
+                vec![
+                    DialogOption::new("pivot", "Pivot with a message")
+                        .key('p')
+                        .guarded(),
+                    DialogOption::new("pivot-edit", "Pivot: edit the contract…").key('e'),
+                    DialogOption::new("override", "Override").key('o').guarded(),
+                    DialogOption::new("stop", "Stop").key('s').guarded(),
+                ],
+            )
+            .with_text("message or override note")
+            .needs_text(&["pivot", "override"])
+        };
+        let mut d = opened(roadblock(), open);
+        assert_eq!(d.options[d.selected].id, "pivot-edit");
+        d.key_at(code(KeyCode::Tab), at(open, 1000));
+        assert!(type_text(&mut d, open, 1100, 10, "go left\n").is_empty());
+        assert_eq!(
+            d.hint.as_deref(),
+            Some("pivot with a message: alt+p or ↑↓ + Enter")
+        );
+        assert!(matches!(
+            d.key_at(alt('p'), at(open, 1300)),
+            Outcome::Chosen { id, text: Some(t) } if id == "pivot" && t == "go left"
+        ));
+        // alt+Enter from that field pivots with the message too.
+        let mut d = opened(roadblock(), open);
+        d.key_at(code(KeyCode::Tab), at(open, 1000));
+        type_text(&mut d, open, 1100, 10, "go left");
+        assert!(matches!(
+            d.key_at(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), at(open, 1300)),
+            Outcome::Chosen { id, text: Some(t) } if id == "pivot" && t == "go left"
+        ));
+        // Write outside scope opens on Reject; ↓ to Grant, Tab, directories
+        // and Enter (or alt+Enter) grant them: the field goes with the
+        // option the user moved to.
+        for enter in [KeyModifiers::NONE, KeyModifiers::ALT] {
+            let mut d = opened(
+                Dialog::new(
+                    "Write outside scope",
+                    Body::None,
+                    vec![
+                        DialogOption::new("apply", "Apply").key('a').guarded(),
+                        DialogOption::new("reject", "Reject with a reason").key('r'),
+                        DialogOption::new("grant", "Grant scope").key('g').guarded(),
+                    ],
+                )
+                .with_text("reason (reject) or directories (grant)")
+                .needs_text(&["reject"]),
+                open,
+            );
+            assert_eq!(d.options[d.selected].id, "reject");
+            d.key_at(code(KeyCode::Down), at(open, 1000));
+            d.key_at(code(KeyCode::Tab), at(open, 1000));
+            type_text(&mut d, open, 1100, 10, "src");
+            assert!(matches!(
+                d.key_at(KeyEvent::new(KeyCode::Enter, enter), at(open, 1300)),
+                Outcome::Chosen { id, text: Some(t) } if id == "grant" && t == "src"
+            ));
+        }
+    }
+
+    #[test]
     fn the_opening_grace_swallows_a_burst_and_a_click_ends_it() {
         let open = Instant::now();
         let mut d = opened(switch_model(), open);
@@ -1072,50 +1240,222 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Any dialog: random options, keys, guards, a text field and its
+    /// targets, a prefill, a selection.
+    fn random_dialog(rng: &mut Rng) -> Dialog {
+        const KEYS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let n = 1 + rng.below(6);
+        let options: Vec<DialogOption> = (0..n)
+            .map(|i| {
+                let mut o = DialogOption::new(format!("o{i}"), format!("Option {i}"));
+                if rng.chance(70) {
+                    o = o.key(KEYS[rng.below(KEYS.len())] as char);
+                }
+                if rng.chance(50) {
+                    o = o.guarded();
+                }
+                o
+            })
+            .collect();
+        let mut d = Dialog::new("t", Body::None, options);
+        if rng.chance(60) {
+            d = d.with_text("field");
+            if rng.chance(70) {
+                let target = format!("o{}", rng.below(n));
+                d = d.text_option(target, rng.chance(50));
+            }
+            if rng.chance(40) {
+                let ids: Vec<String> = (0..n)
+                    .filter(|_| rng.chance(40))
+                    .map(|i| format!("o{i}"))
+                    .collect();
+                let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                d = d.needs_text(&ids);
+            }
+            if rng.chance(30) {
+                d = d.prefill("draft");
+            }
+        }
+        d = d.select(&format!("o{}", rng.below(n)));
+        if rng.chance(20) {
+            d = d.require_focus();
+        }
+        d
+    }
+
+    /// A freshly opened dialog's cursor is on its first safe option
+    /// (unless it chose a safe one, or none is safe), and a plain Enter
+    /// there never fires a guarded option.
+    pub(crate) fn assert_opens_safe(d: &mut Dialog) {
+        let first_safe = d.options.iter().position(|o| !o.guarded);
+        assert!(
+            !d.is_guarded(d.selected) || first_safe.is_none(),
+            "opened on guarded {:?}",
+            d.options[d.selected].id
+        );
+        // After the opening grace, so the Enter counts.
+        let open = Instant::now();
+        d.guard = TypeAhead::opened_at(open);
+        if let Outcome::Chosen { id, .. } = d.key_at(code(KeyCode::Enter), at(open, 1000)) {
+            let o = d.options.iter().find(|o| o.id == id).unwrap();
+            assert!(!o.guarded, "a fresh Enter chose guarded {id:?}");
+        }
+    }
+
+    /// The dialog's rows as text, rendered on a 120×60 screen.
+    fn rendered(d: &mut Dialog) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
+        let mut hits = crate::ui::Hits::default();
+        term.draw(|f| d.render(f, f.area(), &mut hits)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Every `alt+X` in `line` names the key that chooses, with alt, the
+    /// option whose label the line shows; alt+enter is never named.
+    fn assert_line_agrees(d: &Dialog, line: &str) {
+        let lower = line.to_lowercase();
+        for (at, _) in lower.match_indices("alt+") {
+            let name: String = lower[at + 4..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '<' || *c == '>')
+                .collect();
+            if name.is_empty() {
+                continue; // cut off by the width
+            }
+            assert_ne!(name, "enter", "alt+enter named in {line:?}");
+            let options: Vec<usize> = (0..d.options.len())
+                .filter(|&i| lower.contains(&d.options[i].label.to_lowercase()))
+                .collect();
+            assert!(!options.is_empty(), "alt+{name} names no option: {line:?}");
+            let key = name.chars().next().unwrap();
+            assert!(
+                name.chars().count() == 1
+                    && d.key_target(key).is_some_and(|i| options.contains(&i))
+                    && options.iter().any(|&i| d.alt_key(i) == name),
+                "alt+{name} is not the one key of what {line:?} names"
+            );
+        }
+    }
+
+    /// The options, the field's placeholder and Enter hint, and the
+    /// footer a refused key shows all name the same alt+key per guarded
+    /// option, the one that chooses it.
+    pub(crate) fn assert_keys_agree(d: &mut Dialog) {
+        let open = Instant::now();
+        d.guard = TypeAhead::opened_at(open);
+        let mut lines = rendered(d);
+        if let Some((placeholder, _)) = &d.text {
+            lines.push(placeholder.clone());
+            // The field's Enter hint shows only while it has focus.
+            if !d.text_focus && d.armed {
+                d.key_at(code(KeyCode::Tab), at(open, 1000));
+                lines.extend(rendered(d));
+            }
+        }
+        for line in &lines {
+            assert_line_agrees(d, line);
+        }
+        for i in 0..d.options.len() {
+            if !d.options[i].guarded {
+                continue;
+            }
+            let row = format!("{}  alt+{}", d.options[i].label, d.alt_key(i));
+            assert!(
+                lines.iter().any(|l| l.contains(&row)),
+                "no row {row:?} in {lines:#?}"
+            );
+            d.refuse(i);
+            let hint = d.hint.take().unwrap();
+            assert_line_agrees(d, &hint);
+            assert!(hint.contains(&format!("alt+{} ", d.alt_key(i))), "{hint}");
+        }
+        // The key the focused field names does what it says, with the field
+        // as it is (unless that option needs text and the field is empty).
+        let idx = d.field_target();
+        if d.text_focus && d.is_guarded(idx) {
+            let id = d.options[idx].id.clone();
+            let empty = d
+                .text
+                .as_ref()
+                .is_some_and(|(_, b)| b.text().trim().is_empty());
+            let key = d.alt_key(idx).chars().next().unwrap();
+            let out = d.key_at(alt(key), at(open, 1100));
+            if !(empty && d.needs_text.contains(&id)) {
+                assert!(
+                    matches!(&out, Outcome::Chosen { id: got, .. } if *got == id),
+                    "alt+{key} from the field did not choose {id:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn random_prose_never_chooses_a_guarded_option() {
-        // Any dialog: random options, keys, guards, a text field and its
-        // targets, a prefill, a selection; then random prose.
-        const KEYS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
         for seed in 0..3000 {
             let mut rng = Rng::new(seed);
-            let n = 1 + rng.below(6);
-            let options: Vec<DialogOption> = (0..n)
-                .map(|i| {
-                    let mut o = DialogOption::new(format!("o{i}"), format!("Option {i}"));
-                    if rng.chance(70) {
-                        o = o.key(KEYS[rng.below(KEYS.len())] as char);
-                    }
-                    if rng.chance(50) {
-                        o = o.guarded();
-                    }
-                    o
-                })
-                .collect();
-            let mut d = Dialog::new("t", Body::None, options);
-            if rng.chance(60) {
-                d = d.with_text("field");
-                if rng.chance(70) {
-                    let target = format!("o{}", rng.below(n));
-                    d = d.text_option(target, rng.chance(50));
-                }
-                if rng.chance(40) {
-                    let ids: Vec<String> = (0..n)
-                        .filter(|_| rng.chance(40))
-                        .map(|i| format!("o{i}"))
-                        .collect();
-                    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-                    d = d.needs_text(&ids);
-                }
-                if rng.chance(30) {
-                    d = d.prefill("draft");
-                }
-            }
-            d = d.select(&format!("o{}", rng.below(n)));
-            if rng.chance(20) {
-                d = d.require_focus();
-            }
+            let mut d = random_dialog(&mut rng);
             assert_prose_is_safe(&mut d, &mut rng, 60);
         }
+    }
+
+    #[test]
+    fn a_fresh_dialog_opens_on_a_safe_option_and_enter_does_it() {
+        for seed in 0..3000 {
+            let mut d = random_dialog(&mut Rng::new(seed));
+            assert_opens_safe(&mut d);
+        }
+        // The first safe option, also over a guarded explicit selection.
+        let quit = || {
+            Dialog::new(
+                "Quit?",
+                Body::None,
+                vec![
+                    DialogOption::new("quit", "Quit").key('q').guarded(),
+                    DialogOption::new("stay", "Stay").key('n'),
+                ],
+            )
+        };
+        let open = Instant::now();
+        for d in [quit(), quit().select("quit")] {
+            let mut d = opened(d, open);
+            assert_eq!(d.selected, 1);
+            assert_eq!(
+                chosen(d.key_at(code(KeyCode::Enter), at(open, 1000))).as_deref(),
+                Some("stay")
+            );
+        }
+        // Quitting still takes ↓ + Enter or alt+q.
+        let mut d = opened(quit(), open);
+        d.key_at(code(KeyCode::Down), at(open, 1000));
+        assert_eq!(
+            chosen(d.key_at(code(KeyCode::Enter), at(open, 1100))).as_deref(),
+            Some("quit")
+        );
+        let mut d = opened(quit(), open);
+        assert_eq!(
+            chosen(d.key_at(alt('q'), at(open, 1000))).as_deref(),
+            Some("quit")
+        );
+        // Every option guarded: the cursor stays, Enter only hints.
+        let mut d = opened(
+            Dialog::new(
+                "t",
+                Body::None,
+                vec![DialogOption::new("a", "A").key('a').guarded()],
+            ),
+            open,
+        );
+        assert!(matches!(
+            d.key_at(code(KeyCode::Enter), at(open, 1000)),
+            Outcome::Pending
+        ));
+        assert_eq!(d.hint.as_deref(), Some("a: alt+a or ↑↓ + Enter"));
     }
 }

@@ -299,7 +299,7 @@ impl App {
         }
     }
 
-    fn term_add(&mut self, mut info: TermInfo) -> usize {
+    pub(super) fn term_add(&mut self, mut info: TermInfo) -> usize {
         info.breadcrumb = self.tree.crumb(&info.breadcrumb);
         // Make room: the oldest finished job tab goes first.
         while self.terms.views.len() >= MAX_TABS {
@@ -857,7 +857,7 @@ impl App {
         }
     }
 
-    fn term_close_dialog(&mut self, i: usize) {
+    pub(super) fn term_close_dialog(&mut self, i: usize) {
         let info = &self.terms.views[i].info;
         let sharing = if info.staged > 0 {
             format!(
@@ -884,11 +884,13 @@ impl App {
                 info.breadcrumb
             )),
             vec![
-                DialogOption::new("close", "Close and send").guarded(),
+                DialogOption::new("close", "Close and send")
+                    .key('c')
+                    .guarded(),
                 DialogOption::new("stay", "Keep it open"),
             ],
         )
-        .with_text("optional note for the agent · alt+enter closes and sends · esc keeps it open")
+        .with_text("optional note for the agent · esc keeps it open")
         .text_option("close", true);
         self.overlay = Overlay::Dialog(
             Box::new(dialog),

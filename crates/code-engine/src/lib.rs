@@ -1042,9 +1042,11 @@ impl Session {
         exclusive::safety(&self.settings())
     }
     pub fn set_mode(&self, mode: PermissionMode) -> Result<(), EngineError> {
+        // The tool list is fixed at the first message; an interactive
+        // frontend's includes the user terminal, which unattended leaves out.
         if mode == PermissionMode::Unattended && self.control.has_frozen_terminal() {
             return Err(EngineError::bad(
-                "this session froze a user terminal tool; unattended mode requires a new session",
+                "unattended needs a new session: this one's tools were fixed at its first message and include the user terminal, which unattended leaves out; start a new session and choose unattended before sending anything",
             ));
         }
         exclusive::check_mode(&self.settings(), mode)?;
@@ -4137,6 +4139,89 @@ mod tests {
         }
         // The surfaced answer is closed too: a later reply cannot join it.
         assert!(seen.ends_with("deep|"), "{seen}");
+        session.shutdown().await.unwrap();
+    }
+
+    /// Unattended is refused only once the first message froze a tool list
+    /// with the user terminal in it: not before that, and not in a session
+    /// whose frontend never offered terminals.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unattended_is_refused_only_after_a_frozen_user_terminal_tool() {
+        async fn hi(session: &Session) {
+            let mut turn = session.send("hi");
+            while let Some(event) = turn.recv().await {
+                if let EngineEvent::TurnEnd { .. } = event {
+                    break;
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(config.join("providers")).unwrap();
+        std::fs::write(
+            config.join("config.json"),
+            serde_json::json!({"defaultModel":"p/m", "skillsDirs":[]}).to_string(),
+        )
+        .unwrap();
+        let script = r#"printf '%s\n' '{"type":"text","delta":"ok"}' '{"type":"done","stopReason":"end_turn"}'"#;
+        std::fs::write(
+            config.join("providers/p.json"),
+            serde_json::json!({"type":"command", "command":{"argv":["sh", "-c", format!("cat > /dev/null; {script}")], "output":"jsonl"},
+                "models":{"m":{"capabilities":{"output":["text"], "tools":true}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let store = || {
+            code_config::ConfigStore::load(code_config::Directories {
+                config: config.clone(),
+                data: temp.path().join("data"),
+                cache: temp.path().join("cache"),
+            })
+            .unwrap()
+        };
+        let new = |terminals: bool| {
+            let session =
+                Session::create(store(), temp.path().to_owned(), Default::default()).unwrap();
+            if terminals {
+                session.enable_user_terminals().unwrap();
+            }
+            session
+        };
+        // A frontend with terminals, before its first message: allowed.
+        let session = new(true);
+        session.set_mode(PermissionMode::Unattended).unwrap();
+        session.set_mode(PermissionMode::Manual).unwrap();
+        // After it (no terminal ever opened): the tool list offers one.
+        hi(&session).await;
+        assert!(session.control.has_frozen_terminal());
+        let refused = session.set_mode(PermissionMode::Unattended).unwrap_err();
+        assert!(
+            refused
+                .message
+                .starts_with("unattended needs a new session: ")
+                && refused.message.contains("include the user terminal")
+                && refused
+                    .message
+                    .ends_with("choose unattended before sending anything"),
+            "{}",
+            refused.message
+        );
+        session.shutdown().await.unwrap();
+        // Unattended chosen before the first message: the frozen list has no
+        // terminal, and the mode can be left and chosen again.
+        let session = new(true);
+        session.set_mode(PermissionMode::Unattended).unwrap();
+        hi(&session).await;
+        assert!(!session.control.has_frozen_terminal());
+        session.set_mode(PermissionMode::Manual).unwrap();
+        session.set_mode(PermissionMode::Unattended).unwrap();
+        session.shutdown().await.unwrap();
+        // A frontend without terminals (headless, ACP): never refused.
+        let session = new(false);
+        hi(&session).await;
+        assert!(!session.control.has_frozen_terminal());
+        session.set_mode(PermissionMode::Unattended).unwrap();
         session.shutdown().await.unwrap();
     }
 
