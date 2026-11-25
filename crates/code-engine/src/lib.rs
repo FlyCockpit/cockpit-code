@@ -739,7 +739,7 @@ impl Session {
         let exclusive_policy = Arc::new(Mutex::new(journal.settings.exclusive.clone()));
         exclusive::register_policy(journal.header.id.clone(), &exclusive_policy);
         let usage = usage::Cache::start(&store);
-        let control = Arc::new(Control {
+        let control = Arc::new_cyclic(|weak: &std::sync::Weak<Control>| Control {
             data_dir: store.directories().data,
             directories: store.directories(),
             guidance_turns: Mutex::default(),
@@ -767,7 +767,7 @@ impl Session {
             lsp: Arc::new(tools::lsp::Manager::new(config.clone(), lsp_servers)),
             last_root_request: Mutex::default(),
             title_work: Mutex::default(),
-            scheduler: Arc::default(),
+            scheduler: Arc::new(scheduler::Scheduler::reporting(agent_status(weak.clone()))),
             health_cancel: CancellationToken::new(),
             fork_busy: Mutex::default(),
             queue: Mutex::default(),
@@ -776,31 +776,13 @@ impl Session {
             goal_progress: AtomicU64::new(0),
             discovery_pending: Mutex::default(),
         });
-        let weak = Arc::downgrade(&control);
-        control.scheduler.set_status(Arc::new(move |id, status| {
-            if let Some(control) = weak.upgrade() {
-                if id.starts_with("goal-review-")
-                    || id.starts_with("guidance:")
-                    || id.starts_with("scope-aux:")
-                {
-                    return;
-                }
-                if id.starts_with("question-fork-") {
-                    control.fork_status(id, status);
-                } else {
-                    let _ = control.agent_status(id, status);
-                }
-            }
-        }));
         control.watch_reviewer_guidance(&cwd)?;
         control.restore_guidance_requests()?;
         control.restore_interrupted()?;
         control.restore_scopes()?;
         control.start_subscription_watch()?;
         let gate = permissions::session_gate(control.clone(), config.clone(), custom_gate);
-        let mut tools = ToolBox::new(cwd.clone(), gate.clone());
-        tools.lsp = control.lsp.clone();
-        tools.control = Arc::downgrade(&control);
+        let tools = ToolBox::for_session(cwd.clone(), gate.clone(), &control, control.lsp.clone());
         let anchor = {
             let j = control.journal.lock().unwrap();
             j.histories
@@ -1516,6 +1498,24 @@ enum Action {
     Prune,
     IdleCompact,
 }
+/// Scheduler waiting/running transitions shown as agent or question-fork status.
+fn agent_status(weak: std::sync::Weak<Control>) -> impl Fn(&str, &str) + Send + Sync + 'static {
+    move |id, status| {
+        if let Some(control) = weak.upgrade() {
+            if id.starts_with("goal-review-")
+                || id.starts_with("guidance:")
+                || id.starts_with("scope-aux:")
+            {
+                return;
+            }
+            if id.starts_with("question-fork-") {
+                control.fork_status(id, status);
+            } else {
+                let _ = control.agent_status(id, status);
+            }
+        }
+    }
+}
 fn canonical_cwd(cwd: PathBuf) -> Result<PathBuf, EngineError> {
     let resolver =
         paths::Resolver::new(std::env::current_dir().map_err(|e| EngineError::bad(e.to_string()))?);
@@ -1737,9 +1737,7 @@ impl State {
             )?
         };
         self.tools
-            .lsp
-            .set_model_override(&self.agent_id, model.config.lsp.clone());
-        *self.tools.names.lock().unwrap() = self.tool_names();
+            .configure_model(&self.agent_id, model.config.lsp.clone(), self.tool_names());
         request.tool_aliases = self.tool_names().names;
         request.assets_dir = Some(assets);
         request.agent_id = self.agent_id.clone();
@@ -1749,7 +1747,7 @@ impl State {
             self.context_state
                 .frozen
                 .as_ref()
-                .and_then(|c| c.model_catalogs.get(&model.id()).cloned())
+                .and_then(|c| c.catalog(&model.id()).cloned())
                 .unwrap_or_else(|| self.available_definitions()),
         );
         if model.wire() == code_config::ProviderType::Command {
@@ -1846,7 +1844,7 @@ impl State {
     fn available_definitions(&self) -> Vec<tools::ToolDefinition> {
         if let Some(context) = &self.context_state.frozen {
             let id = self.model().map(|m| m.id()).unwrap_or_default();
-            if let Some(catalog) = context.model_catalogs.get(&id) {
+            if let Some(catalog) = context.catalog(&id) {
                 return catalog.clone();
             }
         }
@@ -1857,30 +1855,22 @@ impl State {
     }
     fn native_definitions(&self, catalog: &[tools::ToolDefinition]) -> Vec<tools::ToolDefinition> {
         let id = self.model().map(|m| m.id()).unwrap_or_default();
-        let profiles = self
+        let profile = self
             .context_state
             .frozen
             .as_ref()
-            .map(|c| c.tool_profiles.clone())
-            .unwrap_or_else(|| self.store.tool_profiles());
-        tool_profiles::native(
-            catalog,
-            tool_profiles::selected(&profiles, &id),
-            &self.tool_names(),
-        )
+            .map(|c| c.tool_profile(&id))
+            .unwrap_or_else(|| tool_profiles::selected(&self.store.tool_profiles(), &id));
+        tool_profiles::native(catalog, profile, &self.tool_names())
     }
     fn definitions(&self) -> Vec<tools::ToolDefinition> {
-        if let Some(defs) = self.context_state.frozen.as_ref().and_then(|c| {
-            self.model()
-                .ok()
-                .and_then(|m| c.model_tools.get(&m.id()).cloned())
-        }) {
-            return defs;
-        }
         self.context_state
             .frozen
             .as_ref()
-            .and_then(|c| c.offered_tools.clone())
+            .and_then(|c| {
+                c.tools(self.model().ok().map(|m| m.id()).as_deref())
+                    .cloned()
+            })
             .or_else(|| {
                 self.child_profile
                     .as_ref()
@@ -1967,26 +1957,17 @@ impl State {
         let mut context = if let Some(existing) = existing {
             existing
         } else {
-            let mut context = if let Some(mut shared) = shared {
-                shared.role_prompt = role;
-                shared.offered_tools = None;
-                shared.model_tools.clear();
-                shared.offered_catalog = None;
-                shared.model_catalogs.clear();
-                shared
+            let mut context = if let Some(shared) = shared {
+                shared.for_role(role)
             } else {
                 context::FrozenContext::capture(&self.store, &self.cwd, role, global.as_ref())?
             };
-            context.tool_model = self.model().ok().map(|m| m.id());
-            let overrides = tool_names::frozen(
-                &context.tool_overrides,
-                context.tool_model.as_deref().unwrap_or(""),
-            );
-            tool_names::apply(tool_defaults::definitions(), &overrides)?;
-            self.context_state.frozen = Some(context.clone());
-            let catalog = self.live_definitions();
-            context.offered_tools = Some(self.native_definitions(&catalog));
-            context.offered_catalog = Some(catalog);
+            context.freeze_offered(self.model().ok().map(|m| m.id()), |context, overrides| {
+                tool_names::apply(tool_defaults::definitions(), overrides)?;
+                self.context_state.frozen = Some(context.clone());
+                let catalog = self.live_definitions();
+                Ok((self.native_definitions(&catalog), catalog))
+            })?;
             self.control.commit(
                 &self.agent_id,
                 HistoryEvent::PromptContext {
@@ -1995,39 +1976,16 @@ impl State {
             )?;
             context
         };
-        if context.model_tools.is_empty() {
+        if context.needs_model_surfaces() {
             let raw = self.raw_definitions();
             for (provider, _, model, config) in self.store.models() {
                 let mut raw = raw.clone();
                 tools::media::filter(&mut raw, &config.capabilities);
-                let id = format!("{provider}/{model}");
-                let overrides = tool_names::frozen(&context.tool_overrides, &id);
-                let mut definitions = tool_names::apply(raw.clone(), &overrides)?;
-                if self.control.flat_mode() {
-                    crate::flat::filter_tools(
-                        &mut definitions,
-                        self.agent_id != "root",
-                        &tool_names::names(&overrides),
-                    );
-                }
-                let native = tool_profiles::native(
-                    &definitions,
-                    tool_profiles::selected(&context.tool_profiles, &id),
-                    &tool_names::names(&overrides),
-                );
-                context.model_catalogs.insert(id.clone(), definitions);
-                context.model_tools.insert(id, native);
+                context.freeze_model(format!("{provider}/{model}"), |overrides, profile| {
+                    self.tool_surface(raw, overrides, profile)
+                })?;
             }
-            if let (Some(id), Some(defs)) = (&context.tool_model, &context.offered_tools) {
-                context.model_tools.insert(id.clone(), defs.clone());
-                context.model_catalogs.insert(
-                    id.clone(),
-                    context
-                        .offered_catalog
-                        .clone()
-                        .ok_or_else(|| EngineError::bad("frozen tool catalog missing"))?,
-                );
-            }
+            context.freeze_offered_model()?;
             self.control.commit(
                 &self.agent_id,
                 HistoryEvent::PromptContext {
@@ -2035,22 +1993,32 @@ impl State {
                 },
             )?;
         }
-        for path in context.source_hashes.keys().filter(|p| p.is_file()) {
-            if let Ok(bytes) = std::fs::read(path)
-                && context.source_hashes.get(path).and_then(|h| h.as_ref())
-                    == Some(&context::digest(&bytes))
-            {
-                self.context_state
-                    .source_contents
-                    .lock()
-                    .unwrap()
-                    .remember(path, &bytes);
-                self.tools.watch_source(path, &bytes);
-            }
-        }
-        self.context_state.observed_hashes = Some(context.source_hashes.clone());
+        let observed = context.observe_sources(|path, bytes| {
+            self.context_state
+                .source_contents
+                .lock()
+                .unwrap()
+                .remember(path, bytes);
+            self.tools.watch_source(path, bytes);
+        });
+        self.context_state.observed_hashes = Some(observed);
         self.context_state.frozen = Some(context);
         self.freeze_tool_model(&self.model()?)
+    }
+    /// Native tools and callable catalog from a model's capability-filtered raw tools.
+    fn tool_surface(
+        &self,
+        raw: Vec<tools::ToolDefinition>,
+        overrides: &tool_names::Overrides,
+        profile: code_config::tools::Profile,
+    ) -> Result<context::Surface, EngineError> {
+        let names = tool_names::names(overrides);
+        let mut catalog = tool_names::apply(raw, overrides)?;
+        if self.control.flat_mode() {
+            flat::filter_tools(&mut catalog, self.agent_id != "root", &names);
+        }
+        let native = tool_profiles::native(&catalog, profile, &names);
+        Ok((native, catalog))
     }
     /// A model discovered after session creation gets its role surface exactly
     /// once, before its first request. Existing model surfaces are never rebuilt.
@@ -2059,26 +2027,15 @@ impl State {
             return Ok(());
         };
         let id = model.id();
-        if context.model_tools.contains_key(&id) {
+        if context.has_model(&id) {
             return Ok(());
         }
         let mut context = context.clone();
-        let overrides = tool_names::frozen(&context.tool_overrides, &id);
-        let names = tool_names::names(&overrides);
         let mut raw = self.raw_definitions();
         tools::media::filter(&mut raw, model.capabilities());
-        let mut catalog = tool_names::apply(raw, &overrides)?;
-        if self.control.flat_mode() {
-            flat::filter_tools(&mut catalog, self.agent_id != "root", &names);
-        }
-        let native = tool_profiles::native(
-            &catalog,
-            tool_profiles::selected(&context.tool_profiles, &id),
-            &names,
-        );
-        context.model_catalogs.insert(id.clone(), catalog);
-        context.model_tools.insert(id.clone(), native);
-        context.tool_overrides.insert(id, overrides);
+        context.freeze_new_model(id, |overrides, profile| {
+            self.tool_surface(raw, overrides, profile)
+        })?;
         self.control.commit(
             &self.agent_id,
             HistoryEvent::PromptContext {
@@ -2134,8 +2091,7 @@ impl State {
             self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text: self.tool_names().rewrite(SCRIPT_STATE_NOTICE) })?;
         }
         const CRITERIA_GUIDANCE: &str = "Use criteria only for multi-step work or work needing proof; trivial tasks just do the work. A child may create criteria only when its parent passed criteria through task parameters, and may update and meet passed ones. Only long-running children should send partial reports. Review panels run only when acceptance or findings criteria exist.";
-        if !context.shared_prompt.contains("Use criteria only for multi-step work or work needing proof")
-            && !context.role_prompt.contains("Use criteria only for multi-step work or work needing proof")
+        if !context.prompt_contains("Use criteria only for multi-step work or work needing proof")
             && !self.history().iter().any(|event| matches!(event, HistoryEvent::SystemReminder { text } if injection::body(text).unwrap_or(text) == CRITERIA_GUIDANCE))
         {
             self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text: CRITERIA_GUIDANCE.into() })?;
@@ -2150,7 +2106,7 @@ impl State {
                     }.into(),
                 })?;
             }
-            if !context.shared_prompt.contains(context::HEADROOM_GUIDANCE)
+            if !context.sources_contain(context::HEADROOM_GUIDANCE)
                 && !self.history().iter().any(|e| matches!(e, HistoryEvent::SystemReminder { text } if text.contains(context::HEADROOM_GUIDANCE))) {
                 self.control.commit(&self.agent_id, HistoryEvent::SystemReminder { text: context::HEADROOM_GUIDANCE.into() })?;
             }
@@ -2305,13 +2261,13 @@ impl State {
         } else {
             "tree_child"
         };
-        let profiles = self
+        let profile = self
             .context_state
             .frozen
             .as_ref()
-            .map(|c| c.tool_profiles.clone())
-            .unwrap_or_else(|| self.store.tool_profiles());
-        let profile = match tool_profiles::selected(&profiles, &model.id()) {
+            .map(|c| c.tool_profile(&model.id()))
+            .unwrap_or_else(|| tool_profiles::selected(&self.store.tool_profiles(), &model.id()));
+        let profile = match profile {
             code_config::tools::Profile::Full => "full",
             code_config::tools::Profile::Core => "core",
         };
@@ -2513,7 +2469,7 @@ impl State {
             .context_state
             .frozen
             .as_ref()
-            .and_then(|c| c.model_steering.get(&model.id()))
+            .and_then(|c| c.steering(&model.id()))
         else {
             return Ok(());
         };
@@ -2817,7 +2773,7 @@ async fn run(
             .context_state
             .frozen
             .as_ref()
-            .and_then(|c| c.model_steering.get(&turn_model.id()));
+            .and_then(|c| c.steering(&turn_model.id()));
         config.model_prompt = steering.and_then(|s| s.prompt.clone());
         config.model_reminder = steering.and_then(|s| s.reminder.clone());
         config.model_reminder_turns = steering.map(|s| s.reminder_turns);
@@ -2982,7 +2938,7 @@ async fn run(
                         .context_state
                         .frozen
                         .as_ref()
-                        .and_then(|c| c.model_tools.get(id))
+                        .and_then(|c| c.native_tools(id))
                         .cloned()
                         .unwrap_or_else(|| state.definitions());
                     let Ok(preview) = state.prepare(&candidate, &defs, &history) else {
@@ -3730,10 +3686,7 @@ fn execute_inner<'a>(
                 paths::Resolver::new(state.cwd.clone()).validate(path).map_err(|e|EngineError::bad(e.to_string()))?;
             }
         }
-        if let Some(foreground) = &state.tools.foreground {
-            let mut canonical = foreground.canonical.lock().unwrap();
-            if canonical.as_ref().is_some_and(|current| current.id == call.id) { *canonical = Some(call.clone()); }
-        }
+        state.tools.revise_foreground(&call);
         match call.name.as_str(){
             "terminal" => user_terminal::execute(state, &call, &cancel).await,
             "skill" => skill_commands::read(state, &call.arguments, &cancel, barrier.clone(), tx).await,
@@ -4140,19 +4093,19 @@ mod tests {
         {
             let mut state = session.state.lock().await;
             // No configured model gives the empty model key; catalog contents are still frozen.
-            let mut context: context::FrozenContext = serde_json::from_value(serde_json::json!({
+            let context: context::FrozenContext = serde_json::from_value(serde_json::json!({
                 "cwd":temp.path(), "sharedPrompt":"", "rolePrompt":"", "skills":[], "sourceHashes":{},
                 "modelCatalogs":{"":crate::intel::definitions()}, "modelTools":{"":[]}
             })).unwrap();
-            state.context_state.frozen = Some(context.clone());
+            state.context_state.frozen = Some(context);
             assert_eq!(
                 state.available_definitions().len(),
                 crate::intel::NAMES.len()
             );
-            context.model_catalogs.insert(String::new(), vec![]);
-            context
-                .model_tools
-                .insert(String::new(), crate::intel::definitions());
+            let context: context::FrozenContext = serde_json::from_value(serde_json::json!({
+                "cwd":temp.path(), "sharedPrompt":"", "rolePrompt":"", "skills":[], "sourceHashes":{},
+                "modelCatalogs":{"":[]}, "modelTools":{"":crate::intel::definitions()}
+            })).unwrap();
             state.context_state.frozen = Some(context);
             assert!(state.available_definitions().is_empty());
         }

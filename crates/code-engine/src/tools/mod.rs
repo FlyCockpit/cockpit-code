@@ -215,24 +215,24 @@ fn path_barrier(path: &Path) -> Arc<Mutex<()>> {
 type RecentWrites = HashMap<PathBuf, (String, Vec<u8>)>;
 #[derive(Clone)]
 pub struct ToolBox {
-    pub(crate) control: Weak<crate::Control>,
+    control: Weak<crate::Control>,
     scope_permit: Option<Arc<crate::scopes::ScopePermit>>,
     pub(crate) cwd: PathBuf,
     pub(crate) resolver: crate::paths::Resolver,
     agent_id: String,
     breadcrumb: String,
     job_id: Option<String>,
-    pub(crate) parent_call_id: Option<String>,
+    parent_call_id: Option<String>,
     structured: bool,
     pub(crate) foreground: Option<Arc<crate::foreground::Output>>,
     gate: Arc<dyn PermissionGate>,
     reads: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
     read_contents: Arc<Mutex<crate::file_notices::ReadMemory>>,
     own_writes: Arc<Mutex<RecentWrites>>,
-    pub(crate) lsp: Arc<lsp::Manager>,
+    lsp: Arc<lsp::Manager>,
     pub(crate) intel: Arc<crate::intel::Manager>,
     bash_history: Arc<Mutex<HashMap<String, bash_hints::History>>>,
-    pub(crate) names: Arc<Mutex<crate::tool_names::Names>>,
+    names: Arc<Mutex<crate::tool_names::Names>>,
 }
 pub struct ToolOutput {
     pub details: ToolResultDetails,
@@ -263,6 +263,29 @@ impl ToolBox {
             names: Arc::default(),
         }
     }
+    /// A tool box whose session-dependent tools (jobs, scopes, terminals) reach `control`.
+    pub(crate) fn attached(
+        cwd: PathBuf,
+        gate: Arc<dyn PermissionGate>,
+        control: &Arc<crate::Control>,
+    ) -> Self {
+        Self {
+            control: Arc::downgrade(control),
+            ..Self::new(cwd, gate)
+        }
+    }
+    /// The session's root tool box, sharing the session's language servers.
+    pub(crate) fn for_session(
+        cwd: PathBuf,
+        gate: Arc<dyn PermissionGate>,
+        control: &Arc<crate::Control>,
+        lsp: Arc<lsp::Manager>,
+    ) -> Self {
+        Self {
+            lsp,
+            ..Self::attached(cwd, gate, control)
+        }
+    }
     /// Children inherit a snapshot of read revisions; later sibling reads cannot authorize stale writes.
     pub fn fork_for_agent(&self, agent_id: String, breadcrumb: String, cwd: PathBuf) -> Self {
         Self {
@@ -291,6 +314,51 @@ impl ToolBox {
         tools.job_id = job_id;
         tools.structured = true;
         tools
+    }
+    /// Tool calls a script makes are reported under the script's own call.
+    pub(crate) fn for_script_call(&self, job_id: Option<String>, call_id: String) -> Self {
+        let mut tools = self.for_job(job_id);
+        tools.parent_call_id = Some(call_id);
+        tools
+    }
+    /// The same tools, streaming output into a foreground run that may move to the background.
+    pub(crate) fn for_foreground(&self, output: Arc<crate::foreground::Output>) -> Self {
+        let mut tools = self.clone();
+        tools.foreground = Some(output);
+        tools
+    }
+    /// Keeps the foreground run's call in step with the dispatcher's resolved call.
+    pub(crate) fn revise_foreground(&self, call: &ToolCall) {
+        if let Some(foreground) = &self.foreground {
+            foreground.revise(call);
+        }
+    }
+    pub(crate) fn launched_child(&self, id: &str) {
+        if let Some(foreground) = &self.foreground {
+            foreground.launched_child(id);
+        }
+    }
+    /// The foreground run these tools stream into has moved to the background.
+    pub(crate) fn in_background(&self) -> bool {
+        self.foreground
+            .as_ref()
+            .is_some_and(|output| output.is_background())
+    }
+    /// Per-request model settings: language-server overrides and the tool names it sees.
+    pub(crate) fn configure_model(
+        &self,
+        agent_id: &str,
+        lsp: Option<code_config::lsp::LspOverrides>,
+        names: crate::tool_names::Names,
+    ) {
+        self.lsp.set_model_override(agent_id, lsp);
+        *self.names.lock().unwrap() = names;
+    }
+    pub(crate) fn resolve_path(&self, raw: &str) -> Result<PathBuf> {
+        self.resolver.resolve(raw)
+    }
+    pub(crate) fn validate_path(&self, path: &Path) -> Result<()> {
+        self.resolver.validate(path)
     }
     /// Observe revisions without authorizing a stale write or advancing read state.
     pub(crate) fn context_observations(&self) -> Vec<(PathBuf, String, String)> {
@@ -614,16 +682,7 @@ impl ToolBox {
             if let Some(path) = &prepared.target {
                 self.resolver.validate(path)?;
             }
-            if let Some(foreground) = &self.foreground
-                && foreground
-                    .canonical
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|call| call.id == prepared.call.id)
-            {
-                *foreground.canonical.lock().unwrap() = Some(prepared.call.clone());
-            }
+            self.revise_foreground(&prepared.call);
             let output = match prepared.call.name.as_str() {
                 "lsp" => self.lsp(&prepared.call.arguments, &cancel).await,
                 name if crate::intel::NAMES.contains(&name) => {

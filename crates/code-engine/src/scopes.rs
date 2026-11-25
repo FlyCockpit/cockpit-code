@@ -640,8 +640,7 @@ async fn resolve(
             } else {
                 request.status = "applying".into();
                 request = control.save_scope_request(request)?;
-                let mut tools = ToolBox::new(request.cwd.clone(), gate.clone());
-                tools.control = Arc::downgrade(&control);
+                let mut tools = ToolBox::attached(request.cwd.clone(), gate.clone(), &control);
                 tools
                     .prepare_scope_apply(&request)
                     .map_err(|e| EngineError::bad(e.to_string()))?;

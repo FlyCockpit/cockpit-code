@@ -19,12 +19,12 @@ struct Sink {
 pub(crate) struct Output {
     sink: Mutex<Sink>,
     changed: tokio::sync::Notify,
-    pub child: Mutex<Option<String>>,
-    pub canonical: Mutex<Option<ToolCall>>,
+    child: Mutex<Option<String>>,
+    canonical: Mutex<Option<ToolCall>>,
 }
 impl Output {
-    fn new() -> std::io::Result<Self> {
-        Ok(Self {
+    fn new(call: &ToolCall) -> std::io::Result<Self> {
+        let output = Self {
             sink: Mutex::new(Sink {
                 spool: tempfile::tempfile()?,
                 job: None,
@@ -32,7 +32,54 @@ impl Output {
             changed: tokio::sync::Notify::new(),
             child: Mutex::default(),
             canonical: Mutex::default(),
-        })
+        };
+        *output.canonical.lock().unwrap() = Some(call.clone());
+        Ok(output)
+    }
+    /// The dispatcher's resolved form of this run's call replaces the provisional one.
+    pub fn revise(&self, call: &ToolCall) {
+        let mut canonical = self.canonical.lock().unwrap();
+        if canonical
+            .as_ref()
+            .is_some_and(|current| current.id == call.id)
+        {
+            *canonical = Some(call.clone());
+        }
+    }
+    /// A foreground `task` run remembers the child agent it launched.
+    pub fn launched_child(&self, id: &str) {
+        if self
+            .canonical
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|call| call.name == "task")
+        {
+            *self.child.lock().unwrap() = Some(id.into());
+        }
+    }
+    /// Starts the job this run moves into with `start(call, command, child agent)`;
+    /// returns it with the call as it now stands.
+    fn start_job<J>(
+        &self,
+        call: &ToolCall,
+        start: impl FnOnce(&ToolCall, String, Option<String>) -> Result<J, EngineError>,
+    ) -> Result<(ToolCall, J), EngineError> {
+        let child = self.child.lock().unwrap().clone();
+        let canonical = self
+            .canonical
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| call.clone());
+        let command = canonical.arguments["command"]
+            .as_str()
+            .or(canonical.arguments["code"].as_str())
+            .or(canonical.arguments["prompt"].as_str())
+            .unwrap_or("")
+            .into();
+        let job = start(&canonical, command, child)?;
+        Ok((canonical, job))
     }
     pub fn append(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut sink = self.sink.lock().unwrap();
@@ -87,17 +134,15 @@ pub(crate) async fn execute(
     parent_barrier: Arc<CommitBarrier>,
 ) -> ToolOutput {
     let started = Instant::now();
-    let output = match Output::new() {
+    let output = match Output::new(&call) {
         Ok(output) => Arc::new(output),
         Err(error) => return failure(call, error),
     };
-    *output.canonical.lock().unwrap() = Some(call.clone());
     let token = CancellationToken::new();
     let barrier = Arc::new(CommitBarrier::linked(parent_barrier));
     let mut owned = state.for_script(state.job_id.clone());
     owned.script_depth = state.script_depth;
-    owned.tools = state.tools.clone();
-    owned.tools.foreground = Some(output.clone());
+    owned.tools = state.tools.for_foreground(output.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let control = state.control.clone();
     let owner = state.agent_id.clone();
@@ -140,10 +185,8 @@ pub(crate) async fn execute(
                 // Recheck after timer wake: edit, cancellation and reclassification can withdraw it.
                 let Some((at, reason)) = state.control.background_deadline(&state.agent_id, started, &config) else { continue; };
                 if at > Instant::now() { continue; }
-                let child = output.child.lock().unwrap().clone();
-                let mut canonical = output.canonical.lock().unwrap().clone().unwrap_or_else(|| call.clone());
-                let job = match state.control.start_job(&state.agent_id, &canonical.name, canonical.arguments["command"].as_str().or(canonical.arguments["code"].as_str()).or(canonical.arguments["prompt"].as_str()).unwrap_or("").into(), child.clone(), token.clone(), barrier.clone()) {
-                    Ok(job) => job,
+                let (mut canonical, job) = match output.start_job(&call, |canonical, command, child| state.control.start_job(&state.agent_id, &canonical.name, command, child, token.clone(), barrier.clone())) {
+                    Ok(started) => started,
                     Err(error) => { barrier.revoke(); token.cancel(); let _ = worker.await; let _ = relay.await; return failure(call, error); }
                 };
                 state.control.guidance_job(&call.id, &job.id);

@@ -56,17 +56,12 @@ struct Shared {
 }
 pub(crate) struct Scheduler {
     shared: Arc<Shared>,
-    status: Mutex<Option<Status>>,
+    status: Option<Status>,
     namespace: String,
 }
 impl Default for Scheduler {
     fn default() -> Self {
-        static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
-        Self {
-            shared: SHARED.get_or_init(Arc::default).clone(),
-            status: Mutex::default(),
-            namespace: uuid::Uuid::new_v4().to_string(),
-        }
+        Self::new(None)
     }
 }
 pub(crate) struct Reservation {
@@ -101,16 +96,25 @@ impl Drop for InFlight {
     }
 }
 impl Scheduler {
+    fn new(status: Option<Status>) -> Self {
+        static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+        Self {
+            shared: SHARED.get_or_init(Arc::default).clone(),
+            status,
+            namespace: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+    /// A scheduler that reports each entry's waiting/running transitions to `status`.
+    pub fn reporting(status: impl Fn(&str, &str) + Send + Sync + 'static) -> Self {
+        Self::new(Some(Arc::new(status)))
+    }
     fn notify_status(&self, id: &str, status: &str) {
-        if let Some(callback) = self.status.lock().unwrap().clone() {
+        if let Some(callback) = &self.status {
             callback(id, status);
         }
     }
     fn key(&self, id: &str) -> String {
         format!("{}:{id}", self.namespace)
-    }
-    pub fn set_status(&self, status: Status) {
-        *self.status.lock().unwrap() = Some(status);
     }
     pub fn register(
         self: &Arc<Self>,

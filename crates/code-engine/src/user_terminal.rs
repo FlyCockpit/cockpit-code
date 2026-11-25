@@ -103,14 +103,7 @@ impl Control {
                 let HistoryEvent::PromptContext { context } = event else {
                     return false;
                 };
-                context
-                    .model_catalogs
-                    .values()
-                    .chain(context.model_tools.values())
-                    .chain(context.offered_catalog.iter())
-                    .chain(context.offered_tools.iter())
-                    .flatten()
-                    .any(|d| d.schema["x-cockpit-user-terminal"] == true)
+                context.offers_user_terminal()
             })
     }
     fn terminal_changed(&self, id: &str, update: impl FnOnce(&mut TerminalInfo)) {

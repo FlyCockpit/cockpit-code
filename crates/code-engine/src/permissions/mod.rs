@@ -78,8 +78,8 @@ impl PermissionGate for CustomGate {
 }
 
 pub(crate) struct SessionGate {
-    pub control: Arc<Control>,
-    pub config: Arc<Mutex<ConfigStore>>,
+    control: Arc<Control>,
+    config: Arc<Mutex<ConfigStore>>,
     grants: Mutex<BTreeSet<String>>,
     approval_queue: tokio::sync::Mutex<()>,
     libraries: tokio::sync::Mutex<crate::reviewer::Libraries>,
@@ -672,9 +672,9 @@ impl SessionGate {
         Ok(())
     }
 }
-#[async_trait]
-impl PermissionGate for SessionGate {
-    async fn revise(
+impl SessionGate {
+    /// Self-evaluates writes, or (auto modes) asks the safety reviewer and may substitute an improved call.
+    async fn revise_operation(
         &self,
         op: &PreparedOperation,
         improve: bool,
@@ -765,10 +765,15 @@ impl PermissionGate for SessionGate {
         prechecks.insert(op.call.id.clone(), (operation_key(op), verdict));
         Ok(None)
     }
-    fn commit(&self, action: Box<dyn FnOnce() -> Result<()> + Send + '_>) -> Result<()> {
+    fn commit_owned(&self, action: Box<dyn FnOnce() -> Result<()> + Send + '_>) -> Result<()> {
         self.control.journal.lock().unwrap().with_owner(action)
     }
-    async fn authorize(&self, op: &PreparedOperation, cancel: &CancellationToken) -> Result<()> {
+    /// Decides by mode, session grants, static read-only proof and the safety verdict; asks when unsure.
+    async fn authorize_operation(
+        &self,
+        op: &PreparedOperation,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         self.control.check_owner()?;
         if self.output_policy(op)?.is_some() {
             return Ok(());
@@ -852,5 +857,22 @@ impl PermissionGate for SessionGate {
                     .await
             }
         }
+    }
+}
+#[async_trait]
+impl PermissionGate for SessionGate {
+    async fn revise(
+        &self,
+        op: &PreparedOperation,
+        improve: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(ToolCall, String)>> {
+        self.revise_operation(op, improve, cancel).await
+    }
+    fn commit(&self, action: Box<dyn FnOnce() -> Result<()> + Send + '_>) -> Result<()> {
+        self.commit_owned(action)
+    }
+    async fn authorize(&self, op: &PreparedOperation, cancel: &CancellationToken) -> Result<()> {
+        self.authorize_operation(op, cancel).await
     }
 }

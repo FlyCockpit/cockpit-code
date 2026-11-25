@@ -93,7 +93,7 @@ pub(crate) async fn read(
         .context_state
         .frozen
         .as_ref()
-        .and_then(|c| c.skills.iter().find(|s| s.name == name))
+        .and_then(|c| c.skill(name))
         .ok_or_else(|| EngineError::bad("skill not found"))?;
     model_allowed(skill)?;
     if skill.disable_model_invocation {
