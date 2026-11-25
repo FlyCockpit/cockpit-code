@@ -1418,8 +1418,8 @@ impl App {
         let agent = self.view.clone().unwrap_or_else(|| "root".into());
         let mut chat = ForkChat::side_chat(self.tree.label(&agent));
         let opened = self.engine.open_side_chat(&agent);
-        self.connect_chat(&mut chat, &opened);
-        chat.connect_with(opened, text, |fork| {
+        let earlier = self.earlier_snapshots(&opened);
+        chat.connect_with(opened, earlier, text, |fork| {
             self.engine.fork_chat_send(fork, text.to_string())
         });
         self.overlay = Overlay::ForkChat(Box::new(chat));
@@ -4243,8 +4243,8 @@ impl App {
                 let who = self.tree.label(&q.asker);
                 let mut chat = ForkChat::new(who, &q.questions);
                 let opened = self.engine.open_fork_chat(&id);
-                self.connect_chat(&mut chat, &opened);
-                chat.connect(opened);
+                let earlier = self.earlier_snapshots(&opened);
+                chat.connect(opened, earlier);
                 // Defer the question while chatting: the fork answers it.
                 for p in &mut self.prompts {
                     if let Prompt::Question(x, deferred) = p
@@ -4354,20 +4354,20 @@ impl App {
             )],
         );
         let opened = self.engine.open_fork_chat(question);
-        self.connect_chat(&mut chat, &opened);
-        chat.connect(opened);
+        let earlier = self.earlier_snapshots(&opened);
+        chat.connect(opened, earlier);
         self.overlay = Overlay::ForkChat(Box::new(chat));
     }
 
-    /// An open call for `chat` returned: when it opened the fork, the
-    /// engine queued one snapshot for it, behind those of earlier opens of
-    /// the same fork not received yet, which `chat` passes over.
-    pub(super) fn connect_chat(&mut self, chat: &mut ForkChat, opened: &Result<String, String>) {
-        if let Ok(fork) = opened {
-            let queued = self.queued_snapshots.entry(fork.clone()).or_default();
-            chat.skip_snapshots(*queued);
-            *queued += 1;
-        }
+    /// An open call returned: when it opened the fork, the engine queued
+    /// one snapshot for it, behind those of earlier opens of the same fork
+    /// not received yet. Returns how many of those are ahead of it (the
+    /// new chat passes them over).
+    pub(super) fn earlier_snapshots(&mut self, opened: &Result<String, String>) -> usize {
+        let Ok(fork) = opened else { return 0 };
+        let queued = self.queued_snapshots.entry(fork.clone()).or_default();
+        *queued += 1;
+        *queued - 1
     }
 
     /// Keys in the fork-chat view.
@@ -5394,11 +5394,11 @@ mod tests {
         };
         // /btw, esc, then /btw text before the first snapshot arrived; the
         // provider is gone, so the text bounces back with its error.
-        let mut first = ForkChat::side_chat("root".into());
-        app.connect_chat(&mut first, &fork());
+        assert_eq!(app.earlier_snapshots(&fork()), 0);
         let mut chat = ForkChat::side_chat("root".into());
-        app.connect_chat(&mut chat, &fork());
-        chat.connect_with(fork(), "still there?", |_| {
+        let earlier = app.earlier_snapshots(&fork());
+        assert_eq!(earlier, 1);
+        chat.connect_with(fork(), earlier, "still there?", |_| {
             Err("fork provider unavailable".into())
         });
         app.overlay = Overlay::ForkChat(Box::new(chat));

@@ -638,8 +638,8 @@ impl App {
                         let mut chat =
                             crate::forkchat::ForkChat::side_chat(self.tree.label(&agent));
                         let opened = Ok(fork);
-                        self.connect_chat(&mut chat, &opened);
-                        chat.connect(opened);
+                        let earlier = self.earlier_snapshots(&opened);
+                        chat.connect(opened, earlier);
                         self.overlay_back = None;
                         self.overlay = Overlay::ForkChat(Box::new(chat));
                         return;

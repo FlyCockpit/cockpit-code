@@ -94,9 +94,14 @@ impl ForkChat {
     }
 
     /// The engine opened the chat's fork, or failed to (the error shows).
-    pub fn connect(&mut self, opened: Result<String, String>) {
+    /// `earlier` snapshots of earlier opens of the fork are queued ahead
+    /// of this chat's own: they are passed over.
+    pub fn connect(&mut self, opened: Result<String, String>, earlier: usize) {
         match opened {
-            Ok(fork) => self.fork = Some(fork),
+            Ok(fork) => {
+                self.fork = Some(fork);
+                self.stale = earlier;
+            }
             Err(e) => self.notice(Level::Error, e),
         }
     }
@@ -107,6 +112,7 @@ impl ForkChat {
     pub fn connect_with(
         &mut self,
         opened: Result<String, String>,
+        earlier: usize,
         text: &str,
         send: impl FnOnce(&str) -> Result<(), String>,
     ) {
@@ -115,17 +121,12 @@ impl ForkChat {
             _ => Ok(()),
         };
         let failed = opened.is_err();
-        self.connect(opened);
+        self.connect(opened, earlier);
         match sent {
             Err(e) => self.send_failed(text, e),
             Ok(()) if failed => self.input.insert(text),
             Ok(()) => {}
         }
-    }
-
-    /// `n` snapshots of earlier opens are queued ahead of this chat's own.
-    pub fn skip_snapshots(&mut self, n: usize) {
-        self.stale = n;
     }
 
     /// Whether this chat shows the engine's fork `fork`.
@@ -507,7 +508,7 @@ mod tests {
     #[test]
     fn reopening_keeps_a_first_message_the_fork_refused_and_its_error() {
         let mut chat = ForkChat::side_chat("root".into());
-        chat.connect_with(Ok("side".into()), "still there?", |fork| {
+        chat.connect_with(Ok("side".into()), 0, "still there?", |fork| {
             assert_eq!(fork, "side");
             Err("fork provider unavailable".into())
         });
@@ -536,20 +537,20 @@ mod tests {
     #[test]
     fn a_chat_that_failed_to_open_keeps_the_first_message() {
         let mut chat = ForkChat::side_chat("root".into());
-        chat.connect_with(Err("no checkpoint".into()), "hello", |_| {
+        chat.connect_with(Err("no checkpoint".into()), 0, "hello", |_| {
             panic!("nothing to send to")
         });
         assert_eq!(rows(&chat), ["error no checkpoint"]);
         assert_eq!(chat.input.text(), "hello");
         let mut chat = ForkChat::side_chat("root".into());
-        chat.connect_with(Ok("side".into()), "hello", |_| Ok(()));
+        chat.connect_with(Ok("side".into()), 0, "hello", |_| Ok(()));
         assert_eq!(chat.input.text(), "");
         assert!(chat.shows("side"));
     }
     #[test]
     fn a_queued_engine_error_shows_once_after_the_snapshot() {
         let mut chat = ForkChat::side_chat("root".into());
-        chat.connect(Ok("side".into()));
+        chat.connect(Ok("side".into()), 0);
         // The fork failed while the chat was closed; its event is still
         // queued when /btw reopens the chat, ahead of the snapshot.
         chat.event("error", "boom".into(), vec![], None, None);
@@ -565,7 +566,7 @@ mod tests {
     #[test]
     fn an_engine_error_after_the_snapshot_shows_once() {
         let mut chat = ForkChat::side_chat("root".into());
-        chat.connect(Ok("side".into()));
+        chat.connect(Ok("side".into()), 0);
         // The snapshot was sent before the fork saved its error; the live
         // event follows it.
         chat.event("opened", String::new(), vec![said("user", "q")], None, None);
@@ -575,7 +576,7 @@ mod tests {
     #[test]
     fn a_saved_error_shows_when_the_chat_reopens() {
         let mut chat = ForkChat::side_chat("root".into());
-        chat.connect(Ok("side".into()));
+        chat.connect(Ok("side".into()), 0);
         chat.event(
             "opened",
             String::new(),
