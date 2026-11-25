@@ -1460,12 +1460,47 @@ mod tests {
     }
 
     /// Open descriptors (spill files included: they have no name) under `dir`.
+    /// Linux and macOS only, like the tests that use it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn open_files_under(dir: &Path) -> usize {
+        // Both platforms report descriptor paths with symlinks resolved. `dir` may
+        // not exist yet (it is created on first spill), but its parent does.
+        let dir = std::fs::canonicalize(dir.parent().unwrap())
+            .unwrap()
+            .join(dir.file_name().unwrap());
+        open_file_paths()
+            .iter()
+            .filter(|target| target.starts_with(&dir))
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_file_paths() -> Vec<PathBuf> {
         std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
-            .filter(|target| target.starts_with(dir))
-            .count()
+            .collect()
+    }
+
+    /// macOS has no /proc; `F_GETPATH` still reports an unlinked file's last path.
+    #[cfg(target_os = "macos")]
+    fn open_file_paths() -> Vec<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let fds: Vec<libc::c_int> = std::fs::read_dir("/dev/fd")
+            .unwrap()
+            .filter_map(|fd| fd.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        fds.into_iter()
+            .filter_map(|fd| {
+                let mut buf = [0u8; libc::MAXPATHLEN as usize];
+                // SAFETY: F_GETPATH writes a NUL-terminated path of at most MAXPATHLEN bytes.
+                if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                let len = buf.iter().position(|&b| b == 0)?;
+                Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+            })
+            .collect()
     }
 
     fn limits(text_cap: u64, media_cap: u64, ceiling: u64) -> Limits {
@@ -1504,6 +1539,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn http_media_just_over_the_caps_spills_and_streams_base64() {
         let image = noise(30_000);
@@ -1560,6 +1596,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn http_response_over_the_ceiling_fails_clearly() {
         let image = noise(30_000);
@@ -1594,6 +1631,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn cancelled_generation_releases_its_spill_file() {
         let image = noise(30_000);

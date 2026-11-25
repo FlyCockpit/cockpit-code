@@ -824,8 +824,8 @@ mod tests {
             "input_estimate":0, "retry_limit":0,
             "tool_aliases":{"read":"view_file", "grep":"find_text", "glob":"find_files", "script":"run_code", "history":"past_events", "web_search":"search_online", "web_fetch":"fetch_online"}
         })).unwrap();
-        let reader =
-            ReadOnly::new(temp.path().to_owned()).with_aliases(request.tool_aliases.clone());
+        // Production readers get the session's canonical cwd, as here.
+        let reader = ReadOnly::new(session.cwd()).with_aliases(request.tool_aliases.clone());
         for (name, arguments) in [
             ("view_file", json!({"path":"example.txt"})),
             (
