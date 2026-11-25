@@ -38,7 +38,7 @@ When you need model metadata (context window, max output, pricing, capabilities 
 2. Read the existing file before editing it. Keep valid JSON (no comments, no trailing commas).
 3. Make the smallest edit. New provider = new file `providers/<id>.json`.
 4. If you don't know the API dialect, set your best guess for `type`, then run `cockpit-code doctor --probe <id>`. It makes one tiny request per dialect and prints `probe <Dialect>: accepted; suggested type="..."` for those that work. It never writes files: copy the suggestion into `type` yourself, and only after the user agrees if more than one dialect is accepted.
-5. Run `cockpit-code doctor` again and confirm the provider/model appears and nothing is `skipped`.
+5. Run `cockpit-code doctor` again and confirm the provider/model appears and nothing is `skipped`. It prints `error: ...` and exits non-zero while no session could start (no enabled provider with a model, or a `defaultModel` that does not resolve); it still prints `CONFIG` first.
 6. Config reloads at the next turn boundary when a file changes; no restart is needed. A running agent keeps the tools and model it started with.
 
 ## Adding an HTTP provider (the common case)
