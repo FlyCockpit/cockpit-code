@@ -167,7 +167,7 @@ impl App {
             if p == cwd {
                 "the whole project".to_string()
             } else {
-                crate::transcript::rel_path(p)
+                crate::wrap::rel_path(p)
             }
         };
         let paths = match &v["scope"] {
@@ -524,14 +524,8 @@ impl App {
         } else {
             ("flat subagents", "tree subagents")
         };
-        for e in &mut self.transcript.entries {
-            if let crate::transcript::Kind::Notice(_, text) = &mut e.kind
-                && text.contains(" subagents · /help for keys")
-            {
-                *text = text.replace(from, to);
-                e.touch();
-            }
-        }
+        self.transcript
+            .retext_notices(" subagents · /help for keys", from, to);
         self.transcript.notice(
             Level::Info,
             format!(

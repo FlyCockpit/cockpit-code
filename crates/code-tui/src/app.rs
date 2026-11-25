@@ -29,7 +29,7 @@ use crate::pager::{self, Pager};
 use crate::picker::{self, Picker, fmt_tokens};
 use crate::questions::{self, QDialog};
 use crate::theme::theme;
-use crate::transcript::{Entry, Kind, Level, Transcript};
+use crate::transcript::{Level, Transcript, entry::Kind};
 use crate::ui::{self, Hits, ScrollId, StatusSeg, Target};
 use crate::wrap::{truncate, wrap_lines};
 use goal::{EditPurpose, GoalAction, GoalPrompt};
@@ -483,7 +483,7 @@ fn short(id: &str) -> &str {
 impl App {
     pub fn new(engine: Engine, events: EventRx, issue: Option<OpenError>) -> Self {
         let catalog = engine.catalog();
-        crate::transcript::set_cwd(engine.cwd());
+        crate::wrap::set_cwd(engine.cwd());
         let mut app = Self {
             async_errors: std::sync::mpsc::channel(),
             backup_model: None,
@@ -749,9 +749,9 @@ impl App {
             let Some(tr) = self.transcript_of(&agent) else {
                 return true;
             };
-            let before = tr.entries.len();
-            tr.insert_earlier(n, sub.entries);
-            let delta = tr.entries.len() as isize - before as isize;
+            let before = tr.len();
+            tr.insert_earlier(n, sub);
+            let delta = tr.len() as isize - before as isize;
             if viewing
                 && self.scroll.is_some()
                 && let Some((e, row)) = on_screen
@@ -1081,14 +1081,7 @@ impl App {
     /// The session to name on exit, when it has any messages.
     pub fn resume_hint(&self) -> Option<String> {
         self.transcript
-            .entries
-            .iter()
-            .any(|e| {
-                matches!(
-                    e.kind,
-                    Kind::User(_) | Kind::Assistant(_) | Kind::Earlier(_) | Kind::Older { .. }
-                )
-            })
+            .has_conversation()
             .then(|| self.engine.session_id())
             .filter(|id| !id.is_empty())
     }
@@ -1153,21 +1146,12 @@ impl App {
         }
         let earlier = replay.earlier.len() + replay.older.len();
         if !replay.older.is_empty() {
-            self.transcript.entries.push(Entry::new(
-                Kind::Older {
-                    agent: "root".into(),
-                    contexts: replay.older,
-                    loading: false,
-                },
-                false,
-            ));
+            self.transcript.push_older("root", replay.older);
         }
         for items in replay.earlier {
             let mut sub = Transcript::default();
             fill(&mut sub, items, &self.tree, "root");
-            self.transcript
-                .entries
-                .push(Entry::new(Kind::Earlier(sub.entries), false));
+            self.transcript.push_earlier(sub);
         }
         let resumed = !replay.current.is_empty() || earlier > 0;
         fill(&mut self.transcript, replay.current, &self.tree, "root");
@@ -1446,20 +1430,7 @@ impl App {
             1 => crate::diffview::staged(&cwd),
             _ => {
                 // The viewed agent's edits since its last user message.
-                let tr = self.view_transcript();
-                let start = tr
-                    .entries
-                    .iter()
-                    .rposition(|e| matches!(e.kind, Kind::User(_)))
-                    .unwrap_or(0);
-                let edits: Vec<crate::engine::FileEdit> = tr.entries[start..]
-                    .iter()
-                    .filter_map(|e| match &e.kind {
-                        Kind::Tool(t) if !t.is_error => Some(t.edits.clone()),
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect();
+                let edits = self.view_transcript().turn_edits();
                 Ok(crate::diffview::turn(&edits, &cwd))
             }
         };
@@ -1861,14 +1832,12 @@ impl App {
                 reason,
             } => {
                 busy(self, Phase::Retrying);
-                self.transcript.abandon_pending();
                 self.transcript
                     .retry_notice(&retry_text(attempt, delay_ms, reason.as_deref()));
             }
             UiEvent::StreamReset => self.transcript.stream_reset(),
             UiEvent::Reconnecting { attempt, delay_ms } => {
                 busy(self, Phase::Reconnecting);
-                self.transcript.abandon_pending();
                 self.transcript
                     .retry_notice(&reconnect_text(attempt, delay_ms));
             }
@@ -2076,15 +2045,7 @@ impl App {
             UiEvent::Compacted(summary) => {
                 // The summary is committed to the old context, then repeated as
                 // the head of the new one; show it once.
-                if self.compacting
-                    && !self
-                        .transcript
-                        .entries
-                        .last()
-                        .is_some_and(|e| matches!(&e.kind, Kind::Compacted(s) if *s == summary))
-                {
-                    self.transcript.fold_earlier();
-                    self.transcript.push(Kind::Compacted(summary));
+                if self.compacting && self.transcript.compacted(summary) {
                     self.warned = false;
                     self.scroll = None;
                 }
@@ -2121,33 +2082,26 @@ impl App {
                 let (id, parent, task) = (v.id.clone(), v.parent.clone(), v.task.clone());
                 let known = self.tree.index(&id).is_some();
                 let i = self.tree.add(v, true);
-                let show = self.transcript.show_reasoning;
                 let a = &mut self.tree.agents[i];
-                if a.transcript.entries.is_empty() {
-                    a.transcript.show_reasoning = show;
-                }
+                a.transcript.adopt_reasoning(&self.transcript);
                 // A follow-up appends its new task to the existing transcript.
                 if a.loaded || !known {
                     a.transcript.push(Kind::User(task));
                 }
                 let call = self.tree.get(&id).and_then(|a| a.view.call_id.clone());
                 if let Some(tr) = self.transcript_of(&parent)
-                    && let Some(row) = tr.task_row_for(&id, call.as_deref())
+                    && let Some((row, follow_up)) = tr.task_row_for(&id, call.as_deref())
+                    && let Some(link) = self.tree.link(&id, follow_up)
+                    && let Some(tr) = self.transcript_of(&parent)
                 {
-                    let follow_up = matches!(&tr.entries[row].kind, Kind::Tool(x) if x.args["continue"].is_string());
-                    if let Some(link) = self.tree.link(&id, follow_up)
-                        && let Some(tr) = self.transcript_of(&parent)
-                    {
-                        tr.link_task(row, link);
-                    }
+                    tr.link_task(row, link);
                 }
             }
             UiEvent::AgentStatus { id, status } => self.agent_status(&id, &status),
             UiEvent::AgentFinished { id, status } => {
                 self.agent_status(&id, &status);
                 if let Some(a) = self.tree.get_mut(&id) {
-                    a.transcript.abandon_running();
-                    a.transcript.seal();
+                    a.transcript.end_turn();
                     a.transcript.notice(
                         if status == "done" {
                             Level::Info
@@ -2338,13 +2292,9 @@ impl App {
                 attempt,
                 delay_ms,
                 reason,
-            } => {
-                tr.abandon_pending();
-                tr.retry_notice(&retry_text(attempt, delay_ms, reason.as_deref()))
-            }
+            } => tr.retry_notice(&retry_text(attempt, delay_ms, reason.as_deref())),
             UiEvent::StreamReset => tr.stream_reset(),
             UiEvent::Reconnecting { attempt, delay_ms } => {
-                tr.abandon_pending();
                 tr.retry_notice(&reconnect_text(attempt, delay_ms))
             }
             UiEvent::ModelSwitched { from, to, reason } => {
@@ -2375,16 +2325,8 @@ impl App {
             UiEvent::TurnEnd { .. } => tr.seal(),
             UiEvent::Partial { status, text } => tr.partial(partial_text(&status, &text)),
             // The summary closes the old context and heads the new one; show it once.
-            UiEvent::Compacted(summary)
-                if !tr
-                    .entries
-                    .last()
-                    .is_some_and(|e| matches!(&e.kind, Kind::Compacted(s) if *s == summary)) =>
-            {
-                tr.end_compacting();
-                tr.fold_earlier();
-                tr.push(Kind::Compacted(summary));
-                if a.compacting {
+            UiEvent::Compacted(summary) => {
+                if tr.compacted(summary) && a.compacting {
                     tr.compacting();
                 }
             }
@@ -2443,8 +2385,7 @@ impl App {
         self.git.poke();
         self.running = false;
         self.phase = Phase::Idle;
-        self.transcript.abandon_running();
-        self.transcript.seal();
+        self.transcript.end_turn();
         if let Some(id) = self.pending_switch.take() {
             if stop_reason == "compacted" && !self.user_cancelled {
                 self.apply_model(id);
@@ -2824,22 +2765,14 @@ impl App {
             // Opened after a resume: replay its context files.
             let replay = self.engine.replay_agent(id, false);
             let mut tr = Transcript::default();
-            tr.show_reasoning = self.transcript.show_reasoning;
+            tr.adopt_reasoning(&self.transcript);
             if !replay.older.is_empty() {
-                tr.entries.push(Entry::new(
-                    Kind::Older {
-                        agent: id.to_string(),
-                        contexts: replay.older,
-                        loading: false,
-                    },
-                    false,
-                ));
+                tr.push_older(id, replay.older);
             }
             for items in replay.earlier {
                 let mut sub = Transcript::default();
                 fill(&mut sub, items, &self.tree, "root");
-                tr.entries
-                    .push(Entry::new(Kind::Earlier(sub.entries), false));
+                tr.push_earlier(sub);
             }
             fill(&mut tr, replay.current, &self.tree, id);
             let a = &mut self.tree.agents[i];
@@ -3365,8 +3298,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('r') if ctrl => {
-                let show = !self.transcript.show_reasoning;
-                self.transcript.set_show_reasoning(show);
+                let show = self.transcript.toggle_reasoning();
                 self.hint(if show {
                     "reasoning shown"
                 } else {
@@ -4865,10 +4797,8 @@ fn system_message(text: &str) -> Option<String> {
 
 /// Link `task` rows to their child once the child is known.
 fn link_tasks(t: &mut Transcript, tree: &Tree) {
-    for (i, hint) in t.unlinked_tasks() {
+    for (i, hint, follow_up) in t.unlinked_tasks() {
         let Some(id) = hint else { continue };
-        let follow_up =
-            matches!(&t.entries[i].kind, Kind::Tool(x) if x.args["continue"].is_string());
         if let Some(link) = tree.link(&id, follow_up) {
             t.link_task(i, link);
         }
@@ -4971,9 +4901,7 @@ fn fill(t: &mut Transcript, items: Vec<ReplayItem>, tree: &Tree, agent: &str) {
             }
         }
     }
-    t.abandon_running();
-    t.seal();
-    t.restamp();
+    t.end_replay();
     link_tasks(t, tree);
 }
 
@@ -5189,14 +5117,12 @@ mod tests {
                     &app.transcript
                 };
                 assert!(
-                    tr.entries
-                        .iter()
-                        .any(|e| matches!(&e.kind, Kind::Assistant(t) if t == "committed"))
+                    tr.kinds()
+                        .any(|k| matches!(k, Kind::Assistant(t) if t == "committed"))
                 );
                 assert!(
-                    !tr.entries
-                        .iter()
-                        .any(|e| matches!(&e.kind, Kind::Assistant(t) if t == "retry"))
+                    !tr.kinds()
+                        .any(|k| matches!(k, Kind::Assistant(t) if t == "retry"))
                 );
             }
         }

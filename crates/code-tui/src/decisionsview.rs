@@ -263,7 +263,7 @@ impl DecisionsView {
                 "files",
                 d.files
                     .iter()
-                    .map(|p| crate::transcript::rel_path(p))
+                    .map(|p| crate::wrap::rel_path(p))
                     .collect::<Vec<_>>()
                     .join(", "),
                 Style::default().fg(t.link),

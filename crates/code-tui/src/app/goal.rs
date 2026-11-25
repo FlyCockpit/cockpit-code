@@ -5,7 +5,7 @@ use super::{App, DialogPurpose, EditTarget, EditorReq, Overlay, Prompt};
 use crate::criteria::{ContractEditor, CriteriaAction, CriteriaView, EditorAction};
 use crate::dialog::{Body, Dialog, DialogOption};
 use crate::engine::{ContractDraft, ContractView, GoalView, ProposalView, RoadblockView, Section};
-use crate::transcript::{Kind, Level};
+use crate::transcript::{Level, entry::Kind};
 use crate::wrap::truncate;
 use ratatui::style::{Modifier, Style};
 

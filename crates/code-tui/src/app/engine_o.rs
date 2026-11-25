@@ -11,7 +11,7 @@ use crate::wrap::truncate;
 use std::path::Path;
 
 fn rel(p: &Path) -> String {
-    crate::transcript::rel_path(p)
+    crate::wrap::rel_path(p)
 }
 
 /// `who → owner`, with display labels.
@@ -267,7 +267,7 @@ fn prune_counts(r: &PruneView) -> String {
     }
 }
 
-use crate::transcript::fmt_bytes;
+use crate::wrap::fmt_bytes;
 
 /// A `!cmd` run as the agent was told about it (replay: the output was
 /// never kept).
@@ -496,7 +496,7 @@ impl App {
                 ));
                 for s in mine {
                     let when = chrono::DateTime::parse_from_rfc3339(&s.created)
-                        .map(|t| crate::transcript::fmt_stamp(&t.with_timezone(&chrono::Local)))
+                        .map(|t| crate::wrap::fmt_stamp(&t.with_timezone(&chrono::Local)))
                         .unwrap_or_default();
                     md.push_str(&format!(
                         "**{when}** · {} · context {} · {}\n\n",

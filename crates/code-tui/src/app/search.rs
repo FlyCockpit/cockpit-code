@@ -6,7 +6,6 @@
 //! earlier contexts are searched too (a match expands its section), and
 //! stepping past the oldest match loads the next context still on disk.
 use super::App;
-use crate::transcript::Kind;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Default)]
@@ -95,27 +94,11 @@ impl App {
             Some(i) => &mut self.tree.agents[i].transcript,
             None => &mut self.transcript,
         };
-        let mut matches = vec![];
-        if !q.is_empty() {
-            for (i, e) in tr.entries.iter_mut().enumerate() {
-                // A collapsed earlier context is searched as if open.
-                let fold = matches!(e.kind, Kind::Earlier(_)) && !e.expanded;
-                if fold {
-                    e.expanded = true;
-                }
-                let r = e.render(width, tick);
-                for (j, line) in r.lines.iter().enumerate() {
-                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                    if text.to_lowercase().contains(&q) {
-                        matches.push((i, j));
-                    }
-                }
-                if fold {
-                    e.expanded = false;
-                }
-            }
-        }
-        s.matches = matches;
+        s.matches = if q.is_empty() {
+            vec![]
+        } else {
+            tr.search(&q, width, tick)
+        };
         s.cur = if s.matches.is_empty() {
             None
         } else if jump {
@@ -135,14 +118,7 @@ impl App {
             return;
         };
         let tr = self.view_transcript();
-        let mut opened = None;
-        if let Some(entry) = tr.entries.get_mut(e)
-            && matches!(entry.kind, Kind::Earlier(_))
-            && !entry.expanded
-        {
-            entry.expanded = true;
-            opened = Some(e);
-        }
+        let opened = tr.open_earlier(e).then_some(e);
         let s = self.search.as_mut().unwrap();
         if let Some(e) = opened {
             s.opened.push(e);
@@ -232,9 +208,7 @@ impl App {
         if !keep {
             let tr = self.view_transcript();
             for e in s.opened {
-                if let Some(entry) = tr.entries.get_mut(e) {
-                    entry.expanded = false;
-                }
+                tr.collapse(e);
             }
             self.scroll = s.saved_scroll;
         }
