@@ -108,6 +108,7 @@ impl Engine {
         let options = SessionOptions {
             model: launch.model.clone(),
             effort: launch.effort.clone(),
+            system_prompt: None,
         };
         // An existing conversation switches models through the UI's
         // cache-aware confirmation.
@@ -121,6 +122,7 @@ impl Engine {
                 launch.model.clone()
             },
             effort: launch.effort.clone(),
+            system_prompt: None,
         };
         let mut issue = None;
         let target = if let Some(f) = &launch.fork {
@@ -225,6 +227,7 @@ impl Engine {
                 SessionOptions {
                     model: settings.model.clone(),
                     effort: settings.effort.clone(),
+                    system_prompt: None,
                 }
             } else {
                 SessionOptions::default()

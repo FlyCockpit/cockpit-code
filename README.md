@@ -169,6 +169,13 @@ Run `cockpit-code --help` for all flags, such as `--model`, `--effort`, `--mode`
 
 The exact settings format depends on your editor version, so check its ACP documentation.
 
+The server advertises these ACP session capabilities: `session/load` with history replay, `session/list`, `session/resume`, `session/close` and `systemPrompt` (`append` and `override`). The client can send a `systemPrompt` with `session/new`:
+
+- `append` adds the client's text after cockpit-code's own instructions, at the end of the system prompt.
+- `override` replaces the base instructions (the built-in text, or your `system.md`). Harness rules, the agent's role and tool guidance, AGENTS.md files and skills stay.
+
+The prompt reaches every agent's model requests in the session, subagents included. Internal utility calls (title generation, the permission safety check) keep their own fixed prompts. It is stored with the session and fixed for the session's life: `session/load`, `session/resume` and forks keep it. They may omit `systemPrompt` or repeat the same value. A different value is refused with `-32602`, and so are an unknown mode, non-text content, empty text and text over 128 KiB. The text is used literally, with no `${…}`, `{…}` or file expansion.
+
 ## Development
 
 ```sh
