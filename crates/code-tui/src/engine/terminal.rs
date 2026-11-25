@@ -1,6 +1,6 @@
 //! Terminal adapter. Metadata ([`TermInfo`]) is ordinary frontend
 //! data; terminal bytes travel only through [`TermMsg`] on their own channel,
-//! never as a [`super::UiEvent`], and nothing here formats, logs or stores
+//! never as a `UiEvent`, and nothing here formats, logs or stores
 //! them. User keystrokes go to the PTY through one ordered worker
 //! ([`TermCmd`]); they are never recorded.
 use super::Engine;
@@ -35,7 +35,7 @@ impl TermInfo {
     }
 }
 
-fn term_info(t: TerminalInfo) -> TermInfo {
+pub(super) fn term_info(t: TerminalInfo) -> TermInfo {
     TermInfo {
         user: t.kind == TerminalKind::User,
         id: t.id,
@@ -50,10 +50,6 @@ fn term_info(t: TerminalInfo) -> TermInfo {
         status: t.status,
         exit: t.exit_status,
     }
-}
-
-pub(super) fn translate(t: TerminalInfo) -> super::UiEvent {
-    super::UiEvent::Terminal(term_info(t))
 }
 
 /// Terminal bytes for the sidebar's own screen only. Deliberately no

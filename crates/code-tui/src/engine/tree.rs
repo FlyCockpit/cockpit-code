@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 
 /// A durable tree event rendered as a transcript row. The agent whose
-/// journal holds it travels beside it ([`super::UiEvent::Tree`]).
+/// journal holds it travels beside it (`UiEvent::Tree`).
 #[derive(Debug, Clone)]
 pub enum TreeRow {
     /// A child's mid-run report to its parent (replaces the previous
@@ -47,7 +47,7 @@ pub(super) fn tree_row(event: &HistoryEvent) -> Option<TreeRow> {
             text: text.clone(),
         },
         HistoryEvent::SystemReminder { text } => {
-            let text = super::summary_text(text);
+            let text = super::text::summary_text(text);
             let rows = text.strip_prefix("New descendants in your subtree:\n")?;
             TreeRow::Growth(
                 rows.lines()
@@ -91,7 +91,7 @@ pub(super) fn compact_suggestion(event: &HistoryEvent) -> Option<(u64, u64, u64)
     let HistoryEvent::SystemReminder { text } = event else {
         return None;
     };
-    let text = super::summary_text(text);
+    let text = super::text::summary_text(text);
     let rest = text.strip_prefix("Root context is at ")?;
     let (pct, rest) = rest.split_once("% (")?;
     let (used, rest) = rest.split_once('/')?;
