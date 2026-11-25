@@ -102,20 +102,33 @@ impl Control {
         }
     }
     fn chat_event(&self, record: &Record, kind: &str, text: String) {
-        self.emit(EngineEvent::ForkChat {
-            fork_id: record.chat.id.clone(),
-            question_id: record.chat.question_id.clone(),
-            asker: record.chat.asker.clone(),
-            kind: kind.into(),
-            text,
-            tool_call: None,
-            tool_result: None,
-            messages: if kind == "opened" {
-                record.chat.messages.clone()
-            } else {
-                vec![]
-            },
-        });
+        self.emit(fork_event(record, kind, text));
+    }
+    /// Save a chat's record, then send `event` about what changed in it. A
+    /// reopen reads the record and sends its snapshot under the same lock,
+    /// so the view gets each change either in the snapshot or after it,
+    /// never both and never neither.
+    fn saved_chat_event(&self, record: &Record, event: EngineEvent) -> Result<(), EngineError> {
+        let _io = self.chat_io.lock().unwrap();
+        self.save_chat(record)?;
+        self.emit(event);
+        Ok(())
+    }
+}
+fn fork_event(record: &Record, kind: &str, text: String) -> EngineEvent {
+    EngineEvent::ForkChat {
+        fork_id: record.chat.id.clone(),
+        question_id: record.chat.question_id.clone(),
+        asker: record.chat.asker.clone(),
+        kind: kind.into(),
+        text,
+        tool_call: None,
+        tool_result: None,
+        messages: if kind == "opened" {
+            record.chat.messages.clone()
+        } else {
+            vec![]
+        },
     }
 }
 impl Control {
@@ -261,6 +274,7 @@ impl Session {
         self.control.check_owner()?;
         let q = self.control.question_by_call(id)?;
         let dir = self.control.journal.lock().unwrap().dir.join("fork-chats");
+        let io = self.control.chat_io.lock().unwrap();
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if let Ok(mut record) = sessions::read_json::<Record>(&entry.path())
@@ -275,6 +289,7 @@ impl Session {
                 }
             }
         }
+        drop(io);
         if q.answer.is_some() {
             return Err(EngineError::bad(
                 "question already answered and has no fork record",
@@ -345,11 +360,14 @@ impl Session {
             .requests
             .get(agent)
             .map(|r| r.context);
-        if let Some(record) = self.control.side_chats(agent).pop()
-            && current.is_none_or(|c| c <= record.checkpoint.context)
         {
-            self.control.chat_event(&record, "opened", String::new());
-            return Ok(record.chat.id);
+            let _io = self.control.chat_io.lock().unwrap();
+            if let Some(record) = self.control.side_chats(agent).pop()
+                && current.is_none_or(|c| c <= record.checkpoint.context)
+            {
+                self.control.chat_event(&record, "opened", String::new());
+                return Ok(record.chat.id);
+            }
         }
         let (checkpoint, cwd) = {
             let j = self.control.journal.lock().unwrap();
@@ -437,7 +455,23 @@ impl Session {
                 "question fork is closed; its record can still be reopened",
             ));
         }
-        let model = chat_model(&self.config, || self.settings(), &record.checkpoint)?;
+        let model = match chat_model(&self.config, || self.settings(), &record.checkpoint) {
+            Ok(model) => model,
+            Err(error) => {
+                // The fork cannot answer now (its provider or model is
+                // gone): the reason stays in the record for a reopen. A
+                // reply still running owns the record and is left alone; one
+                // that finished since the load above saved it, so the record
+                // is read again.
+                let _io = self.control.chat_io.lock().unwrap();
+                if !self.control.fork_busy.lock().unwrap().contains(id) {
+                    let mut record = self.control.load_chat(id)?;
+                    record.chat.messages.push(error_message(&error));
+                    self.control.save_chat(&record)?;
+                }
+                return Err(error);
+            }
+        };
         record.request = record.request.with_user_tail(&text)?;
         if !self.control.fork_busy.lock().unwrap().insert(id.into()) {
             return Err(EngineError::bad("question fork is already responding"));
@@ -449,11 +483,11 @@ impl Session {
             text: text.clone(),
             ts: sessions::now(),
         });
-        if let Err(e) = self.control.save_chat(&record) {
+        let event = fork_event(&record, "user", text);
+        if let Err(e) = self.control.saved_chat_event(&record, event) {
             self.control.fork_busy.lock().unwrap().remove(id);
             return Err(e);
         }
-        self.control.chat_event(&record, "user", text);
         let control = self.control.clone();
         let cancel = work.cancel.child_token();
         let weak = Arc::downgrade(&self._lifetime);
@@ -464,11 +498,16 @@ impl Session {
         let directories = self.directories.clone();
         work.tasks.push(tokio::spawn(async move {
             let result = converse(&control, &config, &gate, &model, &mut record, &cancel).await;
-            if let Err(error) = result {
-                control.chat_event(&record, "error", error.message);
-            }
-            if let Err(error) = control.save_chat(&record) {
-                control.chat_event(&record, "error", error.message);
+            // The error is part of the record: a reopened chat shows it.
+            {
+                let _io = control.chat_io.lock().unwrap();
+                if let Err(error) = &result {
+                    record.chat.messages.push(error_message(error));
+                }
+                let saved = control.save_chat(&record);
+                for error in [result.err(), saved.err()].into_iter().flatten() {
+                    control.chat_event(&record, "error", error.message);
+                }
             }
             control.fork_busy.lock().unwrap().remove(&record.chat.id);
             control.chat_event(
@@ -490,6 +529,16 @@ impl Session {
             }
         }));
         Ok(())
+    }
+}
+/// A failure of the fork, as a row of its saved chat.
+fn error_message(error: &EngineError) -> ForkChatMessage {
+    ForkChatMessage {
+        role: "error".into(),
+        text: error.message.clone(),
+        ts: sessions::now(),
+        tool_call: None,
+        tool_result: None,
     }
 }
 /// Builds the fork's model from its checkpoint. The config lock is taken after the body parses and held
@@ -585,7 +634,8 @@ async fn converse(
                 text: completion.text.clone(),
                 ts: sessions::now(),
             });
-            control.chat_event(record, "assistant", completion.text.clone());
+            let event = fork_event(record, "assistant", completion.text.clone());
+            control.saved_chat_event(record, event)?;
         }
         let calls = completion.tool_calls.clone();
         let mut tail = vec![HistoryEvent::Assistant {
@@ -670,17 +720,19 @@ async fn converse(
                 tool_call: Some(call.clone()),
                 tool_result: None,
             });
-            control.save_chat(record)?;
-            control.emit(EngineEvent::ForkChat {
-                fork_id: record.chat.id.clone(),
-                question_id: record.chat.question_id.clone(),
-                asker: record.chat.asker.clone(),
-                kind: "tool_start".into(),
-                text: String::new(),
-                messages: vec![],
-                tool_call: Some(call.clone()),
-                tool_result: None,
-            });
+            control.saved_chat_event(
+                record,
+                EngineEvent::ForkChat {
+                    fork_id: record.chat.id.clone(),
+                    question_id: record.chat.question_id.clone(),
+                    asker: record.chat.asker.clone(),
+                    kind: "tool_start".into(),
+                    text: String::new(),
+                    messages: vec![],
+                    tool_call: Some(call.clone()),
+                    tool_result: None,
+                },
+            )?;
             let result = dispatch_call(
                 &record.request,
                 &reader,
@@ -705,17 +757,19 @@ async fn converse(
             message.text = format!("{}: {output}", call.name);
             message.tool_call = Some(call.clone());
             message.tool_result = Some(result.clone());
-            control.save_chat(record)?;
-            control.emit(EngineEvent::ForkChat {
-                fork_id: record.chat.id.clone(),
-                question_id: record.chat.question_id.clone(),
-                asker: record.chat.asker.clone(),
-                kind: "tool".into(),
-                text: format!("{}: {output}", call.name),
-                messages: vec![],
-                tool_call: Some(call.clone()),
-                tool_result: Some(result.clone()),
-            });
+            control.saved_chat_event(
+                record,
+                EngineEvent::ForkChat {
+                    fork_id: record.chat.id.clone(),
+                    question_id: record.chat.question_id.clone(),
+                    asker: record.chat.asker.clone(),
+                    kind: "tool".into(),
+                    text: format!("{}: {output}", call.name),
+                    messages: vec![],
+                    tool_call: Some(call.clone()),
+                    tool_result: Some(result.clone()),
+                },
+            )?;
             tail.push(HistoryEvent::ToolResult {
                 details: result.details,
                 id: call.id,
@@ -803,6 +857,178 @@ async fn dispatch_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session whose model is a command provider: it fails on "boom",
+    /// takes a second on "slow" and otherwise answers "ok". Root has made
+    /// one request, so it has a side chat.
+    #[cfg(unix)]
+    async fn side_chat_session() -> (tempfile::TempDir, Session) {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session::create(
+            provider_store(temp.path(), "p"),
+            temp.path().to_owned(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut turn = session.send("hi");
+        while let Some(event) = turn.recv().await {
+            if matches!(event, EngineEvent::TurnEnd { .. }) {
+                break;
+            }
+        }
+        (temp, session)
+    }
+
+    /// A config under `root` whose only provider is `name` (the script).
+    #[cfg(unix)]
+    fn provider_store(root: &std::path::Path, name: &str) -> code_config::ConfigStore {
+        let config = root.join(format!("config-{name}"));
+        std::fs::create_dir_all(config.join("providers")).unwrap();
+        std::fs::write(
+            config.join("config.json"),
+            json!({"defaultModel":format!("{name}/m"), "skillsDirs":[]}).to_string(),
+        )
+        .unwrap();
+        let script = r#"if grep -q boom "$1"; then printf '%s\n' '{"type":"error","message":"boom","retryable":false}'; exit 1; fi; if grep -q slow "$1"; then sleep 1; fi; printf '%s\n' '{"type":"text","delta":"ok"}' '{"type":"done","stopReason":"end_turn"}'"#;
+        std::fs::write(
+            config.join(format!("providers/{name}.json")),
+            json!({"type":"command", "command":{
+                "argv":["sh", "-c", format!("cat > /dev/null; {script}"), "adapter", "{messagesFile}"],
+                "output":"jsonl",
+            }, "models":{"m":{"capabilities":{"input":["text"], "output":["text"], "tools":true}}}})
+            .to_string(),
+        )
+        .unwrap();
+        code_config::ConfigStore::load(code_config::Directories {
+            config,
+            data: root.join("data"),
+            cache: root.join("cache"),
+        })
+        .unwrap()
+    }
+
+    /// The side chat's provider leaves the config (it stays valid: the
+    /// default model moves to another provider).
+    #[cfg(unix)]
+    fn drop_provider(session: &Session, root: &std::path::Path) {
+        *session.config.lock().unwrap() = provider_store(root, "q");
+    }
+
+    /// The fork chat's live events until it is idle; each one is checked
+    /// against the saved record as it arrives: what it reports is already
+    /// saved (a reopen's snapshot would have it).
+    async fn until_idle(
+        session: &Session,
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+        fork: &str,
+    ) -> Vec<(String, String)> {
+        let mut seen = vec![];
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(event) = events.recv().await {
+                let EngineEvent::ForkChat { kind, text, .. } = event else {
+                    continue;
+                };
+                if matches!(kind.as_str(), "idle" | "closed") {
+                    break;
+                }
+                if matches!(kind.as_str(), "user" | "assistant" | "error") {
+                    let saved = session.question_fork(fork).unwrap().messages;
+                    assert!(
+                        saved.iter().any(|m| m.role == kind && m.text == text),
+                        "{kind} {text} not saved before its event"
+                    );
+                }
+                seen.push((kind, text));
+            }
+        })
+        .await
+        .expect("the side chat turn did not end");
+        seen
+    }
+
+    fn roles(session: &Session, fork: &str) -> Vec<(String, String)> {
+        session
+            .question_fork(fork)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|m| (m.role, m.text))
+            .collect()
+    }
+
+    /// A side chat whose fork turn failed keeps the error in its record,
+    /// so reopening the chat shows it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_side_chat_turn_saves_its_error() {
+        let (temp, session) = side_chat_session().await;
+        let mut events = session.subscribe();
+        let fork = session.open_side_chat("root").unwrap();
+        session.fork_chat_send(&fork, "boom").unwrap();
+        let seen = until_idle(&session, &mut events, &fork).await;
+        let error = seen
+            .iter()
+            .find(|(kind, _)| kind == "error")
+            .map(|(_, text)| text.clone())
+            .expect("no live error event");
+        assert!(error.contains("boom"), "{error}");
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            roles(&session, &fork),
+            [pair("user", "boom"), pair("error", &error)]
+        );
+        // Reopening hands the error back with the record.
+        assert_eq!(session.open_side_chat("root").unwrap(), fork);
+        let reopened = loop {
+            match events.recv().await {
+                Some(EngineEvent::ForkChat { kind, messages, .. }) if kind == "opened" => {
+                    break messages;
+                }
+                Some(_) => {}
+                None => panic!("events ended"),
+            }
+        };
+        assert_eq!(reopened.last().map(|m| m.role.as_str()), Some("error"));
+        // A send the fork cannot take at all (its provider is gone) is
+        // saved as an error row too.
+        drop_provider(&session, temp.path());
+        let refused = session.fork_chat_send(&fork, "again").unwrap_err();
+        assert_eq!(refused.message, "fork provider unavailable");
+        let saved = roles(&session, &fork);
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[2], pair("error", &refused.message));
+        session.shutdown().await.unwrap();
+    }
+
+    /// A send refused while the fork is still answering leaves the record
+    /// to the running reply: its answer is kept, nothing is added.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_send_refused_during_a_reply_leaves_the_record_alone() {
+        let (temp, session) = side_chat_session().await;
+        let mut events = session.subscribe();
+        let fork = session.open_side_chat("root").unwrap();
+        session.fork_chat_send(&fork, "slow").unwrap();
+        drop_provider(&session, temp.path());
+        let refused = session.fork_chat_send(&fork, "meanwhile").unwrap_err();
+        assert_eq!(refused.message, "fork provider unavailable");
+        // The reply (a second) is still running: the record is its own.
+        assert_eq!(
+            roles(&session, &fork),
+            [("user".to_string(), "slow".to_string())]
+        );
+        let seen = until_idle(&session, &mut events, &fork).await;
+        assert!(
+            seen.iter()
+                .any(|(kind, text)| kind == "assistant" && text == "ok")
+        );
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            roles(&session, &fork),
+            [pair("user", "slow"), pair("assistant", "ok")]
+        );
+        session.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn renamed_fork_tools_dispatch_without_changing_the_wire_name() {

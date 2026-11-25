@@ -37,6 +37,13 @@ pub struct ForkChat {
     pub summary: Vec<String>,
     /// The engine's fork id once open.
     fork: Option<String>,
+    /// This view's own notices (open and send failures) raised before the
+    /// engine's saved record arrived (`opened` is delivered after the open
+    /// call returns): they stay under it.
+    early: Option<Vec<(Level, String)>>,
+    /// Snapshots (`opened`) of earlier opens of this fork still queued
+    /// ahead of this chat's own: they are passed over.
+    stale: usize,
     pub transcript: Transcript,
     pub input: TextBuf,
     /// Rows scrolled up from the bottom.
@@ -62,6 +69,8 @@ impl ForkChat {
             closed: false,
             summary,
             fork: None,
+            early: Some(vec![]),
+            stale: 0,
             transcript: Transcript::default(),
             input: TextBuf::default(),
             back: 0,
@@ -92,6 +101,33 @@ impl ForkChat {
         }
     }
 
+    /// Open the chat and send `text` as its first message (when nonempty).
+    /// A message the fork could not take stays in the input, with the
+    /// error, as when it fails from the input.
+    pub fn connect_with(
+        &mut self,
+        opened: Result<String, String>,
+        text: &str,
+        send: impl FnOnce(&str) -> Result<(), String>,
+    ) {
+        let sent = match &opened {
+            Ok(fork) if !text.trim().is_empty() => send(fork),
+            _ => Ok(()),
+        };
+        let failed = opened.is_err();
+        self.connect(opened);
+        match sent {
+            Err(e) => self.send_failed(text, e),
+            Ok(()) if failed => self.input.insert(text),
+            Ok(()) => {}
+        }
+    }
+
+    /// `n` snapshots of earlier opens are queued ahead of this chat's own.
+    pub fn skip_snapshots(&mut self, n: usize) {
+        self.stale = n;
+    }
+
     /// Whether this chat shows the engine's fork `fork`.
     pub fn shows(&self, fork: &str) -> bool {
         self.fork.as_deref() == Some(fork)
@@ -108,6 +144,7 @@ impl ForkChat {
         result: Option<ToolResultData>,
     ) -> bool {
         match kind {
+            "opened" if self.stale > 0 => self.stale -= 1,
             "opened" => self.load(messages),
             "tool_start" => self.tool_start(call),
             "tool" => {
@@ -119,8 +156,10 @@ impl ForkChat {
             "status" => self.status = text,
             "idle" => self.status.clear(),
             "error" => {
+                // The engine saved it before telling: a snapshot still on
+                // its way has it, so it is not kept across that reload.
                 self.status.clear();
-                self.notice(Level::Error, text);
+                self.transcript.notice(Level::Error, text);
             }
             "closed" => {
                 let reopened = self.closed;
@@ -155,6 +194,10 @@ impl ForkChat {
     }
 
     pub fn notice(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        if let Some(early) = &mut self.early {
+            early.push((level, text.clone()));
+        }
         self.transcript.notice(level, text);
     }
 
@@ -163,6 +206,7 @@ impl ForkChat {
         match role {
             "user" => self.transcript.push(Kind::User(text)),
             "assistant" => self.transcript.push(Kind::Assistant(text)),
+            "error" => self.transcript.notice(Level::Error, text),
             _ => self.transcript.notice(Level::Info, text),
         }
         self.back = 0;
@@ -182,7 +226,8 @@ impl ForkChat {
         self.back = 0;
     }
 
-    /// `opened`: the saved side record replaces whatever the view shows.
+    /// `opened`: the saved side record replaces whatever the view shows,
+    /// except notices raised while it was on its way (they follow it).
     /// Tool records come back as rows with arguments, result and run time;
     /// a call interrupted before its result shows as not recorded.
     pub fn load(&mut self, messages: Vec<ForkChatMessage>) {
@@ -198,6 +243,9 @@ impl ForkChat {
             }
         }
         self.transcript.end_replay();
+        for (level, text) in self.early.take().unwrap_or_default() {
+            self.transcript.notice(level, text);
+        }
         self.back = 0;
     }
 
@@ -434,6 +482,108 @@ mod tests {
             assert_eq!(tools[0].args["path"], "a.rs");
             assert_eq!(tools[0].output.as_deref(), Some("contents: with colon"));
         }
+    }
+    fn said(role: &str, text: &str) -> ForkChatMessage {
+        ForkChatMessage {
+            role: role.into(),
+            text: text.into(),
+            ts: String::new(),
+            tool_call: None,
+            tool_result: None,
+        }
+    }
+    fn rows(chat: &ForkChat) -> Vec<String> {
+        chat.transcript
+            .kinds()
+            .map(|k| match k {
+                Kind::User(t) => format!("user {t}"),
+                Kind::Assistant(t) => format!("assistant {t}"),
+                Kind::Notice(Level::Error, t) => format!("error {t}"),
+                Kind::Notice(_, t) => format!("notice {t}"),
+                _ => "other".into(),
+            })
+            .collect()
+    }
+    #[test]
+    fn reopening_keeps_a_first_message_the_fork_refused_and_its_error() {
+        let mut chat = ForkChat::side_chat("root".into());
+        chat.connect_with(Ok("side".into()), "still there?", |fork| {
+            assert_eq!(fork, "side");
+            Err("fork provider unavailable".into())
+        });
+        // The saved record arrives after the open call returned.
+        chat.event(
+            "opened",
+            String::new(),
+            vec![said("user", "what was said?"), said("assistant", "hi")],
+            None,
+            None,
+        );
+        assert_eq!(
+            rows(&chat),
+            [
+                "user what was said?",
+                "assistant hi",
+                "error fork provider unavailable"
+            ]
+        );
+        assert_eq!(chat.input.text(), "still there?");
+        // Later notices are live rows, not carried into another reload.
+        chat.event("error", "boom".into(), vec![], None, None);
+        chat.event("opened", String::new(), vec![], None, None);
+        assert!(rows(&chat).is_empty());
+    }
+    #[test]
+    fn a_chat_that_failed_to_open_keeps_the_first_message() {
+        let mut chat = ForkChat::side_chat("root".into());
+        chat.connect_with(Err("no checkpoint".into()), "hello", |_| {
+            panic!("nothing to send to")
+        });
+        assert_eq!(rows(&chat), ["error no checkpoint"]);
+        assert_eq!(chat.input.text(), "hello");
+        let mut chat = ForkChat::side_chat("root".into());
+        chat.connect_with(Ok("side".into()), "hello", |_| Ok(()));
+        assert_eq!(chat.input.text(), "");
+        assert!(chat.shows("side"));
+    }
+    #[test]
+    fn a_queued_engine_error_shows_once_after_the_snapshot() {
+        let mut chat = ForkChat::side_chat("root".into());
+        chat.connect(Ok("side".into()));
+        // The fork failed while the chat was closed; its event is still
+        // queued when /btw reopens the chat, ahead of the snapshot.
+        chat.event("error", "boom".into(), vec![], None, None);
+        chat.event(
+            "opened",
+            String::new(),
+            vec![said("user", "q"), said("error", "boom")],
+            None,
+            None,
+        );
+        assert_eq!(rows(&chat), ["user q", "error boom"]);
+    }
+    #[test]
+    fn an_engine_error_after_the_snapshot_shows_once() {
+        let mut chat = ForkChat::side_chat("root".into());
+        chat.connect(Ok("side".into()));
+        // The snapshot was sent before the fork saved its error; the live
+        // event follows it.
+        chat.event("opened", String::new(), vec![said("user", "q")], None, None);
+        chat.event("error", "boom".into(), vec![], None, None);
+        assert_eq!(rows(&chat), ["user q", "error boom"]);
+    }
+    #[test]
+    fn a_saved_error_shows_when_the_chat_reopens() {
+        let mut chat = ForkChat::side_chat("root".into());
+        chat.connect(Ok("side".into()));
+        chat.event(
+            "opened",
+            String::new(),
+            vec![said("user", "::error boom"), said("error", "boom")],
+            None,
+            None,
+        );
+        assert_eq!(rows(&chat), ["user ::error boom", "error boom"]);
     }
     #[test]
     fn saved_tool_rows_require_structured_calls() {

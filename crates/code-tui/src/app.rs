@@ -352,6 +352,9 @@ pub struct App {
     /// A fork chat set aside while its own web-tool approval is shown;
     /// it comes back when no fork-chat approval is left.
     parked_fork: Option<Box<ForkChat>>,
+    /// Fork-chat snapshots (`opened`) the engine queued and the view has
+    /// not received yet, per fork: one per successful open call.
+    queued_snapshots: BTreeMap<String, usize>,
     slash_sel: usize,
     /// The wheel's top row of the slash / `@` popups; None follows
     /// the selection. Any key resets them.
@@ -529,6 +532,7 @@ impl App {
             overlay: Overlay::None,
             overlay_back: None,
             parked_fork: None,
+            queued_snapshots: BTreeMap::new(),
             slash_sel: 0,
             slash_top: None,
             mention_top: None,
@@ -1105,6 +1109,7 @@ impl App {
     /// Reset the UI for the engine's (new) session and replay its transcript.
     fn load_session(&mut self, events: EventRx, how: &str) {
         self.events = Some(events);
+        self.queued_snapshots.clear();
         self.shells.clear();
         self.terms_reset();
         self.running = false;
@@ -1406,13 +1411,10 @@ impl App {
         let agent = self.view.clone().unwrap_or_else(|| "root".into());
         let mut chat = ForkChat::side_chat(self.tree.label(&agent));
         let opened = self.engine.open_side_chat(&agent);
-        if let Ok(fork) = &opened
-            && !text.trim().is_empty()
-            && let Err(e) = self.engine.fork_chat_send(fork, text.to_string())
-        {
-            chat.notice(Level::Error, e);
-        }
-        chat.connect(opened);
+        self.connect_chat(&mut chat, &opened);
+        chat.connect_with(opened, text, |fork| {
+            self.engine.fork_chat_send(fork, text.to_string())
+        });
         self.overlay = Overlay::ForkChat(Box::new(chat));
     }
 
@@ -4223,7 +4225,9 @@ impl App {
                 let Some(q) = self.question(&id) else { return };
                 let who = self.tree.label(&q.asker);
                 let mut chat = ForkChat::new(who, &q.questions);
-                chat.connect(self.engine.open_fork_chat(&id));
+                let opened = self.engine.open_fork_chat(&id);
+                self.connect_chat(&mut chat, &opened);
+                chat.connect(opened);
                 // Defer the question while chatting: the fork answers it.
                 for p in &mut self.prompts {
                     if let Prompt::Question(x, deferred) = p
@@ -4296,6 +4300,14 @@ impl App {
         call: Option<crate::engine::ToolCall>,
         result: Option<crate::engine::ToolResultData>,
     ) {
+        if kind == "opened"
+            && let Some(queued) = self.queued_snapshots.get_mut(&fork)
+        {
+            *queued -= 1;
+            if *queued == 0 {
+                self.queued_snapshots.remove(&fork);
+            }
+        }
         let parked = !matches!(self.overlay, Overlay::ForkChat(_));
         let c = match (&mut self.overlay, &mut self.parked_fork) {
             (Overlay::ForkChat(c), _) | (_, Some(c)) => c,
@@ -4324,8 +4336,21 @@ impl App {
                 summary.lines().next().unwrap_or_default()
             )],
         );
-        chat.connect(self.engine.open_fork_chat(question));
+        let opened = self.engine.open_fork_chat(question);
+        self.connect_chat(&mut chat, &opened);
+        chat.connect(opened);
         self.overlay = Overlay::ForkChat(Box::new(chat));
+    }
+
+    /// An open call for `chat` returned: when it opened the fork, the
+    /// engine queued one snapshot for it, behind those of earlier opens of
+    /// the same fork not received yet, which `chat` passes over.
+    pub(super) fn connect_chat(&mut self, chat: &mut ForkChat, opened: &Result<String, String>) {
+        if let Ok(fork) = opened {
+            let queued = self.queued_snapshots.entry(fork.clone()).or_default();
+            chat.skip_snapshots(*queued);
+            *queued += 1;
+        }
     }
 
     /// Keys in the fork-chat view.
@@ -5114,6 +5139,54 @@ mod tests {
             panic!("fork changed")
         };
         assert_eq!(chat.input.text(), "keep draft");
+    }
+
+    #[tokio::test]
+    async fn a_reopened_chat_passes_over_snapshots_of_earlier_opens() {
+        let (_dir, mut app) = app();
+        let fork = || Ok::<String, String>("side".into());
+        let said = |role: &str, text: &str| crate::engine::ForkChatMessage {
+            role: role.into(),
+            text: text.into(),
+            ts: String::new(),
+            tool_call: None,
+            tool_result: None,
+        };
+        // /btw, esc, then /btw text before the first snapshot arrived; the
+        // provider is gone, so the text bounces back with its error.
+        let mut first = ForkChat::side_chat("root".into());
+        app.connect_chat(&mut first, &fork());
+        let mut chat = ForkChat::side_chat("root".into());
+        app.connect_chat(&mut chat, &fork());
+        chat.connect_with(fork(), "still there?", |_| {
+            Err("fork provider unavailable".into())
+        });
+        app.overlay = Overlay::ForkChat(Box::new(chat));
+        for _ in 0..2 {
+            app.fork_chat_event(
+                "side".into(),
+                "opened".into(),
+                String::new(),
+                vec![said("user", "q")],
+                None,
+                None,
+            );
+        }
+        let Overlay::ForkChat(chat) = &app.overlay else {
+            panic!("the chat closed");
+        };
+        let rows: Vec<String> = chat
+            .transcript
+            .kinds()
+            .map(|k| match k {
+                Kind::User(t) => format!("user {t}"),
+                Kind::Notice(Level::Error, t) => format!("error {t}"),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(rows, ["user q", "error fork provider unavailable"]);
+        assert_eq!(chat.input.text(), "still there?");
+        assert!(app.queued_snapshots.is_empty());
     }
 
     #[tokio::test]

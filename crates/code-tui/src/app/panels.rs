@@ -633,7 +633,9 @@ impl App {
                             .unwrap_or_else(|| "root".into());
                         let mut chat =
                             crate::forkchat::ForkChat::side_chat(self.tree.label(&agent));
-                        chat.connect(Ok(fork));
+                        let opened = Ok(fork);
+                        self.connect_chat(&mut chat, &opened);
+                        chat.connect(opened);
                         self.overlay_back = None;
                         self.overlay = Overlay::ForkChat(Box::new(chat));
                         return;

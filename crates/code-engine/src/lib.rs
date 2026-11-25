@@ -143,6 +143,9 @@ pub(crate) struct Control {
     scheduler: Arc<scheduler::Scheduler>,
     health_cancel: CancellationToken,
     fork_busy: Mutex<std::collections::BTreeSet<String>>,
+    /// Orders fork-chat record writes and their live events against a
+    /// reopen's read and snapshot (see `question_chat`).
+    chat_io: Mutex<()>,
     exclusive_policy: Arc<Mutex<Option<Exclusive>>>,
     queue: Mutex<queue::Queue>,
     mail_since: Mutex<HashMap<String, tokio::time::Instant>>,
@@ -776,6 +779,7 @@ impl Session {
             scheduler: Arc::new(scheduler::Scheduler::reporting(agent_status(weak.clone()))),
             health_cancel: CancellationToken::new(),
             fork_busy: Mutex::default(),
+            chat_io: Mutex::default(),
             queue: Mutex::default(),
             mail_since: Mutex::default(),
             goal_clock: Mutex::default(),
