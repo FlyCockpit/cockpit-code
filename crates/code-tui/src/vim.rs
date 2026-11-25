@@ -3,7 +3,7 @@
 //! operator-pending and visual (charwise and linewise) modes with the
 //! common motions, operators, text objects and one unnamed register.
 //!
-//! Every edit goes through [`TextBuf::splice`], so paste chips stay atomic:
+//! Every edit goes through [`TextBuf`]'s chip-aware edits, so paste chips stay atomic:
 //! an operator range touching a chip widens over the whole chip, and the
 //! register keeps wire text so a yanked chip is put back as a chip.
 //!
@@ -11,7 +11,7 @@
 //! mode; in normal mode Esc clears a pending `g`/`f`/operator/text object
 //! and is otherwise passed on, keeping its app meaning (clear the
 //! selection, clear and save input, then cancel a turn on an empty box).
-use crate::composer::TextBuf;
+use crate::textbuf::TextBuf;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,10 +139,10 @@ impl Vim {
     /// The highlighted range in visual modes.
     pub fn visual_range(&self, buf: &TextBuf) -> Option<(usize, usize)> {
         let (lo, hi) = (
-            buf.text
-                .floor_char_boundary(self.anchor.min(buf.cursor).min(buf.text.len())),
-            buf.text
-                .floor_char_boundary(self.anchor.max(buf.cursor).min(buf.text.len())),
+            buf.text()
+                .floor_char_boundary(self.anchor.min(buf.cursor()).min(buf.text().len())),
+            buf.text()
+                .floor_char_boundary(self.anchor.max(buf.cursor()).min(buf.text().len())),
         );
         match self.mode {
             Mode::Visual => Some(buf.widen(lo, buf.next(hi).max(lo))),
@@ -150,7 +150,7 @@ impl Vim {
                 let end = buf.line_end_of(hi);
                 Some((
                     buf.line_start_of(lo),
-                    (end + 1).min(buf.text.len()).max(end),
+                    (end + 1).min(buf.text().len()).max(end),
                 ))
             }
             _ => None,
@@ -165,8 +165,8 @@ impl Vim {
             Mode::Insert => {
                 if key.code == KeyCode::Esc {
                     self.mode = Mode::Normal;
-                    if buf.cursor > buf.line_start_of(buf.cursor) {
-                        buf.cursor = buf.snap(buf.prev(buf.cursor), false);
+                    if buf.cursor() > buf.line_start_of(buf.cursor()) {
+                        buf.move_snapped(buf.prev(buf.cursor()), false);
                     }
                     return Outcome::Handled;
                 }
@@ -191,7 +191,7 @@ impl Vim {
     /// Resolve a motion key from `pos`: (target, inclusive, linewise).
     /// None when `c` is not a motion (or a prefix was stored).
     fn motion(&mut self, buf: &TextBuf, c: char) -> Option<(usize, bool, bool)> {
-        let pos = buf.cursor;
+        let pos = buf.cursor();
         let was_g = std::mem::take(&mut self.pending_g);
         if let Some(mut f) = self.pending_find.take() {
             f.target = c;
@@ -232,7 +232,7 @@ impl Vim {
             '0' => (buf.line_start_of(pos), false, false),
             '^' => (first_non_blank(buf, pos), false, false),
             '$' => (buf.line_end_of(pos), false, false),
-            'G' => (buf.line_start_of(buf.text.len()), false, true),
+            'G' => (buf.line_start_of(buf.text().len()), false, true),
             '%' => (match_bracket(buf, pos)?, true, false),
             ';' | ',' => {
                 let mut f = self.last_find?;
@@ -294,17 +294,16 @@ impl Vim {
         };
         if self.pending_r {
             self.pending_r = false;
-            if buf.cursor < buf.line_end_of(buf.cursor) {
-                let n = buf.next(buf.cursor);
-                let (a, _) = buf.splice(buf.cursor, n, c.encode_utf8(&mut [0; 4]));
-                buf.cursor = a;
+            if buf.cursor() < buf.line_end_of(buf.cursor()) {
+                let n = buf.next(buf.cursor());
+                buf.overwrite(buf.cursor(), n, c.encode_utf8(&mut [0; 4]));
                 return Outcome::Edited;
             }
             return Outcome::Handled;
         }
         let prefixed = self.is_prefix();
         if let Some((target, _, _)) = self.motion(buf, c) {
-            buf.cursor = buf.snap(target, target > buf.cursor);
+            buf.move_snapped(target, target > buf.cursor());
             self.clamp(buf);
             return Outcome::Handled;
         }
@@ -317,47 +316,47 @@ impl Vim {
                 false
             }
             'I' => {
-                buf.cursor = first_non_blank(buf, buf.cursor);
+                buf.move_to(first_non_blank(buf, buf.cursor()));
                 self.mode = Mode::Insert;
                 false
             }
             'a' => {
-                if buf.cursor < buf.line_end_of(buf.cursor) {
-                    buf.cursor = buf.snap(buf.next(buf.cursor), true);
+                if buf.cursor() < buf.line_end_of(buf.cursor()) {
+                    buf.move_snapped(buf.next(buf.cursor()), true);
                 }
                 self.mode = Mode::Insert;
                 false
             }
             'A' => {
-                buf.cursor = buf.line_end_of(buf.cursor);
+                buf.end();
                 self.mode = Mode::Insert;
                 false
             }
             'o' => {
-                buf.cursor = buf.line_end_of(buf.cursor);
+                buf.end();
                 buf.insert("\n");
                 self.mode = Mode::Insert;
                 true
             }
             'O' => {
-                buf.cursor = buf.line_start_of(buf.cursor);
+                buf.home();
                 buf.insert("\n");
-                buf.cursor -= 1;
+                buf.left();
                 self.mode = Mode::Insert;
                 true
             }
             'v' => {
-                self.anchor = buf.cursor;
+                self.anchor = buf.cursor();
                 self.mode = Mode::Visual;
                 false
             }
             'V' => {
-                self.anchor = buf.cursor;
+                self.anchor = buf.cursor();
                 self.mode = Mode::VisualLine;
                 false
             }
             'x' | 's' => {
-                let at = buf.cursor;
+                let at = buf.cursor();
                 if at < buf.line_end_of(at) {
                     self.apply(buf, Op::Delete, at, buf.next(at), false);
                 }
@@ -367,14 +366,14 @@ impl Vim {
                 true
             }
             'X' => {
-                let at = buf.cursor;
+                let at = buf.cursor();
                 if at > buf.line_start_of(at) {
                     self.apply(buf, Op::Delete, buf.prev(at), at, false);
                 }
                 true
             }
             'D' | 'C' => {
-                let (a, b) = (buf.cursor, buf.line_end_of(buf.cursor));
+                let (a, b) = (buf.cursor(), buf.line_end_of(buf.cursor()));
                 self.apply(
                     buf,
                     if c == 'C' { Op::Change } else { Op::Delete },
@@ -385,17 +384,16 @@ impl Vim {
                 true
             }
             'S' => {
-                let p = buf.cursor;
+                let p = buf.cursor();
                 self.apply(buf, Op::Change, p, p, true);
                 true
             }
             'J' => {
-                let end = buf.line_end_of(buf.cursor);
-                if end < buf.text.len() {
-                    let rest = &buf.text[end + 1..];
+                let end = buf.line_end_of(buf.cursor());
+                if end < buf.text().len() {
+                    let rest = &buf.text()[end + 1..];
                     let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
-                    let (a, _) = buf.splice(end, end + 1 + ws, " ");
-                    buf.cursor = a;
+                    buf.overwrite(end, end + 1 + ws, " ");
                 }
                 true
             }
@@ -440,12 +438,12 @@ impl Vim {
         if self.mode == Mode::Insert {
             return;
         }
-        let p = buf.cursor.min(buf.text.len());
+        let p = buf.cursor().min(buf.text().len());
         let start = buf.line_start_of(p);
-        if p > start && (p == buf.text.len() || buf.text[p..].starts_with('\n')) {
-            buf.cursor = buf.snap(buf.prev(p), false);
+        if p > start && (p == buf.text().len() || buf.text()[p..].starts_with('\n')) {
+            buf.move_snapped(buf.prev(p), false);
         } else {
-            buf.cursor = buf.snap(p, false);
+            buf.move_snapped(p, false);
         }
     }
 
@@ -478,7 +476,7 @@ impl Vim {
         );
         if doubled && !self.is_prefix() {
             self.mode = Mode::Normal;
-            let p = buf.cursor;
+            let p = buf.cursor();
             self.apply(buf, op, p, p, true);
             return Outcome::Edited;
         }
@@ -489,7 +487,7 @@ impl Vim {
         let prefixed = self.is_prefix();
         // `cw` changes to the end of the word, as in vim.
         let c = if op == Op::Change && !prefixed && matches!(c, 'w' | 'W') {
-            let on_word = buf.text[buf.cursor..]
+            let on_word = buf.text()[buf.cursor()..]
                 .chars()
                 .next()
                 .is_some_and(|ch| !ch.is_whitespace());
@@ -504,9 +502,9 @@ impl Vim {
         match self.motion(buf, c) {
             Some((target, inclusive, linewise)) => {
                 self.mode = Mode::Normal;
-                let pos = buf.cursor;
+                let pos = buf.cursor();
                 let (mut a, mut b) = (pos.min(target), pos.max(target));
-                if inclusive && b < buf.text.len() {
+                if inclusive && b < buf.text().len() {
                     b = buf.next(b);
                 }
                 if linewise {
@@ -534,32 +532,32 @@ impl Vim {
             self.register = (text, true);
             match op {
                 Op::Yank => {
-                    buf.cursor = a;
+                    buf.move_to(a);
                 }
                 _ if keep_line => {
-                    let (s, _) = buf.splice(a, b, "");
-                    buf.cursor = s;
+                    buf.delete_range(a, b);
                     self.mode = Mode::Insert;
                 }
                 _ => {
                     // Take the line break too: the next one, else the previous.
-                    if b < buf.text.len() {
+                    if b < buf.text().len() {
                         b += 1;
                     } else {
                         a = a.saturating_sub(1);
                     }
-                    let (s, _) = buf.splice(a, b, "");
-                    let s = s.min(buf.text.len());
-                    buf.cursor = first_non_blank(buf, s);
+                    let s = buf.delete_range(a, b).min(buf.text().len());
+                    buf.move_to(first_non_blank(buf, s));
                 }
             }
         } else {
             self.register = (buf.wire_range(a, b), false);
             match op {
-                Op::Yank => buf.cursor = a,
-                Op::Delete => buf.cursor = buf.splice(a, b, "").0,
+                Op::Yank => buf.move_to(a),
+                Op::Delete => {
+                    buf.delete_range(a, b);
+                }
                 Op::Change => {
-                    buf.cursor = buf.splice(a, b, "").0;
+                    buf.delete_range(a, b);
                     self.mode = Mode::Insert;
                 }
             }
@@ -578,26 +576,25 @@ impl Vim {
         if linewise {
             let body = text.strip_suffix('\n').unwrap_or(&text);
             if after {
-                let end = buf.line_end_of(buf.cursor);
-                buf.cursor = end;
+                buf.end();
                 buf.insert("\n");
-                let start = buf.cursor;
+                let start = buf.cursor();
                 buf.insert_wire(body);
-                buf.cursor = start;
+                buf.move_to(start);
             } else {
-                let start = buf.line_start_of(buf.cursor);
-                buf.cursor = start;
+                buf.home();
+                let start = buf.cursor();
                 buf.insert_wire(body);
                 buf.insert("\n");
-                buf.cursor = start;
+                buf.move_to(start);
             }
         } else {
-            if after && buf.cursor < buf.line_end_of(buf.cursor) {
-                buf.cursor = buf.snap(buf.next(buf.cursor), true);
+            if after && buf.cursor() < buf.line_end_of(buf.cursor()) {
+                buf.move_snapped(buf.next(buf.cursor()), true);
             }
             buf.insert_wire(&text);
-            if buf.cursor > 0 {
-                buf.cursor = buf.snap(buf.prev(buf.cursor), false);
+            if buf.cursor() > 0 {
+                buf.move_snapped(buf.prev(buf.cursor()), false);
             }
         }
     }
@@ -624,14 +621,14 @@ impl Vim {
         if let Some(around) = self.pending_obj.take() {
             if let Some((a, b)) = text_object(buf, c, around) {
                 self.anchor = a;
-                buf.cursor = buf.prev(b).max(a);
+                buf.move_to(buf.prev(b).max(a));
                 self.mode = Mode::Visual;
             }
             return Outcome::Handled;
         }
         let prefixed = self.is_prefix();
         if let Some((target, _, _)) = self.motion(buf, c) {
-            buf.cursor = buf.snap(target, target > buf.cursor);
+            buf.move_snapped(target, target > buf.cursor());
             return Outcome::Handled;
         }
         if prefixed || self.is_prefix() {
@@ -644,7 +641,9 @@ impl Vim {
             'c' | 's' | 'C' | 'S' => Some(Op::Change),
             'y' | 'Y' => Some(Op::Yank),
             'o' => {
-                std::mem::swap(&mut self.anchor, &mut buf.cursor);
+                let cursor = buf.cursor();
+                buf.move_to(self.anchor);
+                self.anchor = cursor;
                 return Outcome::Handled;
             }
             'v' => {
@@ -668,8 +667,7 @@ impl Vim {
                 let saved = self.register.clone();
                 if let Some((a, b)) = range {
                     self.mode = Mode::Normal;
-                    let (s, _) = buf.splice(a, b, "");
-                    buf.cursor = s;
+                    buf.delete_range(a, b);
                     self.register = saved;
                     let lw = self.register.1;
                     self.register.1 = false;
@@ -709,7 +707,7 @@ impl Vim {
 // ---- motion helpers ------------------------------------------------------
 
 fn chars(buf: &TextBuf) -> Vec<(usize, char)> {
-    buf.text.char_indices().collect()
+    buf.text().char_indices().collect()
 }
 
 fn index_of(cs: &[(usize, char)], pos: usize) -> usize {
@@ -717,14 +715,14 @@ fn index_of(cs: &[(usize, char)], pos: usize) -> usize {
 }
 
 fn byte_at(buf: &TextBuf, cs: &[(usize, char)], i: usize) -> usize {
-    cs.get(i).map_or(buf.text.len(), |&(b, _)| b)
+    cs.get(i).map_or(buf.text().len(), |&(b, _)| b)
 }
 
 fn word_forward(buf: &TextBuf, pos: usize, big: bool) -> usize {
     let cs = chars(buf);
     let mut i = index_of(&cs, pos);
     if i >= cs.len() {
-        return buf.text.len();
+        return buf.text().len();
     }
     let k = class(cs[i].1, big);
     while i < cs.len() && k != 0 && class(cs[i].1, big) == k {
@@ -788,7 +786,7 @@ fn word_end_back(buf: &TextBuf, pos: usize, big: bool) -> usize {
 
 fn first_non_blank(buf: &TextBuf, pos: usize) -> usize {
     let start = buf.line_start_of(pos);
-    let line = &buf.text[start..buf.line_end_of(pos)];
+    let line = &buf.text()[start..buf.line_end_of(pos)];
     start + (line.len() - line.trim_start_matches([' ', '\t']).len())
 }
 
@@ -796,11 +794,11 @@ fn find(buf: &TextBuf, pos: usize, f: Find) -> Option<usize> {
     let (start, end) = (buf.line_start_of(pos), buf.line_end_of(pos));
     if f.forward {
         let from = buf.next(pos).min(end);
-        let rel = buf.text[from..end].find(f.target)?;
+        let rel = buf.text()[from..end].find(f.target)?;
         let hit = from + rel;
         Some(if f.till { buf.prev(hit).max(pos) } else { hit })
     } else {
-        let hit = buf.text[start..pos].rfind(f.target)? + start;
+        let hit = buf.text()[start..pos].rfind(f.target)? + start;
         Some(if f.till { buf.next(hit).min(pos) } else { hit })
     }
 }
@@ -843,7 +841,7 @@ fn match_bracket(buf: &TextBuf, pos: usize) -> Option<usize> {
 
 /// `iw` `aw` `iW` `aW` `i"` `a"` `i'` `a'` `` i` `` `i(` `a(` `ib` `i[` `i{` `iB` `i<`.
 fn text_object(buf: &TextBuf, obj: char, around: bool) -> Option<(usize, usize)> {
-    let pos = buf.cursor;
+    let pos = buf.cursor();
     match obj {
         'w' | 'W' => {
             let cs = chars(buf);
@@ -876,7 +874,7 @@ fn text_object(buf: &TextBuf, obj: char, around: bool) -> Option<(usize, usize)>
         }
         '"' | '\'' | '`' => {
             let (start, end) = (buf.line_start_of(pos), buf.line_end_of(pos));
-            let line = &buf.text[start..end];
+            let line = &buf.text()[start..end];
             let quotes: Vec<usize> = line
                 .char_indices()
                 .filter(|&(_, c)| c == obj)
@@ -952,7 +950,7 @@ mod tests {
     fn visual_ranges_clamp_stale_multibyte_anchors() {
         let mut buf = TextBuf::default();
         buf.set("éab");
-        buf.cursor = 0;
+        buf.move_to(0);
         let mut vim = Vim {
             mode: Mode::Visual,
             anchor: 1,

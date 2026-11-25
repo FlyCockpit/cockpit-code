@@ -6,8 +6,8 @@
 //! discovery. Toggles are session-only and live in the engine adapter.
 //! Rows, headers and the toggle/badge columns are clickable. A provider
 //! whose discovery failed carries a warning badge on its header.
-use crate::composer::TextBuf;
 use crate::engine::{Catalog, ModelInfo};
+use crate::textbuf::TextBuf;
 use crate::theme::theme;
 use crate::ui::{self, Hits, ScrollId, Target};
 use crate::wrap::{truncate, wrap_lines};
@@ -149,7 +149,7 @@ impl Picker {
 
     fn rebuild(&mut self) {
         let keep = self.current().map(|m| m.id.clone());
-        let needle = self.filter.text.to_lowercase();
+        let needle = self.filter.text().to_lowercase();
         let mut idx: Vec<usize> = (0..self.catalog.models.len())
             .filter(|&i| {
                 needle.is_empty() || {
@@ -261,7 +261,7 @@ impl Picker {
         self.pinned = false;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc if !self.filter.text.is_empty() => {
+            KeyCode::Esc if !self.filter.text().is_empty() => {
                 self.filter.clear();
                 self.rebuild();
             }
@@ -288,9 +288,9 @@ impl Picker {
             KeyCode::Char('o') if ctrl => return self.toggle_model(),
             KeyCode::Char('s') if ctrl => return self.mark_safety(),
             KeyCode::Char('r') if ctrl => return Action::Refresh,
-            KeyCode::Char(' ') if self.filter.text.is_empty() => return self.toggle_model(),
+            KeyCode::Char(' ') if self.filter.text().is_empty() => return self.toggle_model(),
             // `/` was the old filter key; it is a no-op on an empty query.
-            KeyCode::Char('/') if self.filter.text.is_empty() => {}
+            KeyCode::Char('/') if self.filter.text().is_empty() => {}
             KeyCode::Char(c) if !ctrl => {
                 self.filter.insert(c.encode_utf8(&mut [0; 4]));
                 self.rebuild();
@@ -435,12 +435,12 @@ impl Picker {
         } else {
             "Models"
         };
-        let title = if self.filter.text.is_empty() {
+        let title = if self.filter.text().is_empty() {
             format!(" {what} · sort: {sort_label} · type to search ")
         } else {
             format!(
                 " {what} · search: {}▏ · {count} of {} · sort: {sort_label} ",
-                self.filter.text,
+                self.filter.text(),
                 self.catalog.models.len()
             )
         };
@@ -574,12 +574,12 @@ impl Picker {
         } else {
             "enter use"
         };
-        let space = if self.filter.text.is_empty() {
+        let space = if self.filter.text().is_empty() {
             "space/^O"
         } else {
             "^O"
         };
-        let esc = if self.filter.text.is_empty() {
+        let esc = if self.filter.text().is_empty() {
             "esc close"
         } else {
             "esc clear"

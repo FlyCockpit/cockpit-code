@@ -2,8 +2,8 @@
 //! question's asker. The view shows the questions, the fork's chat and an
 //! input; the fork answers with its `answer_question` script function,
 //! which closes it. The asker keeps running or waiting meanwhile.
-use crate::composer::TextBuf;
 use crate::engine::{ForkChatMessage, QItem, ToolCall, ToolResultData};
+use crate::textbuf::TextBuf;
 use crate::theme::theme;
 use crate::transcript::{Kind, Level, SPINNER, Transcript};
 use crate::ui::{self, Hits, ScrollId};
@@ -137,8 +137,7 @@ impl ForkChat {
             }
             KeyCode::Enter if self.closed => {}
             KeyCode::Enter => {
-                let text = std::mem::take(&mut self.input.text);
-                self.input.clear();
+                let text = self.input.take_text();
                 if !text.trim().is_empty() {
                     self.back = 0;
                     return Action::Send(text);
@@ -232,7 +231,7 @@ impl ForkChat {
             Span::raw("  "),
             t.text(),
         );
-        let input_rows: Vec<Line<'static>> = if self.input.text.is_empty() || self.closed {
+        let input_rows: Vec<Line<'static>> = if self.input.text().is_empty() || self.closed {
             let hint = if self.closed {
                 "this fork answered the question · a read-only record · esc close"
             } else if self.side {
@@ -310,7 +309,7 @@ impl ForkChat {
             body_h,
             top,
         );
-        let cursor = if self.input.text.is_empty() || self.closed {
+        let cursor = if self.input.text().is_empty() || self.closed {
             (2, 0)
         } else {
             (cx, cy)

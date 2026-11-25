@@ -214,19 +214,12 @@ fn search(cwd: PathBuf, q: String) -> Vec<Item> {
 impl App {
     /// The composer changed or the cursor moved: track the `@` token.
     pub(super) fn mention_update(&mut self) {
-        let text = self.composer.buf.text.clone();
-        let cursor = self.composer.buf.cursor;
-        let in_chip = self
+        let tok = self
             .composer
-            .buf
-            .blocks
-            .iter()
-            .any(|b| b.start < cursor && cursor <= b.end);
-        let tok = (!text.trim_start().starts_with('/') && !in_chip)
-            .then(|| token(&text, cursor))
-            .flatten();
+            .mention_context()
+            .and_then(|(text, cursor)| Some((token(text, cursor)?, cursor)));
         let m = &mut self.mentions;
-        let Some((start, q)) = tok else {
+        let Some(((start, q), cursor)) = tok else {
             // Closed: drop everything, the listing included.
             *m = Default::default();
             return;
@@ -345,8 +338,7 @@ impl App {
         } else {
             format!("@{} ", item.insert)
         };
-        let (_, e) = self.composer.buf.splice(start, end, &ins);
-        self.composer.buf.cursor = e;
+        self.composer.replace(start, end, &ins);
         self.composer.edited();
         if !item.dir {
             self.convert_mentions(true);

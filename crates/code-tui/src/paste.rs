@@ -1,6 +1,6 @@
 //! Paste blocks, adapted from FlyCockpit's Cockpit: a large paste becomes
 //! one atomic chip in the composer. The chip's label lives in the buffer
-//! text and its byte range is tracked beside it (see `composer::TextBuf`);
+//! text and its byte range is tracked beside it (see `textbuf::TextBuf`);
 //! the full text is sent as `<paste id="R">…</paste id="R">` with a fresh
 //! random id per paste, so pasted text can't forge the closing tag. User
 //! messages show the chip instead of the text, and replay re-collapses

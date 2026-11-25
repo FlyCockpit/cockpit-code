@@ -1457,18 +1457,18 @@ mod tests {
         let queued = queued_view(item.clone(), assets);
         let mut composer = crate::composer::Composer::default();
         composer.set_wire(&queued.text);
-        assert_eq!(composer.buf.blocks.len(), 1);
-        assert_eq!(composer.buf.blocks[0].full, "/session/assets/image.png");
-        assert_eq!(composer.buf.blocks[0].attach.as_deref(), Some("image"));
+        assert!(composer.chip(1).is_none());
+        assert_eq!(composer.chip(0).unwrap().full, "/session/assets/image.png");
+        assert_eq!(composer.chip(0).unwrap().attach.as_deref(), Some("image"));
         assert_eq!(
             crate::paste::attachments(&composer.wire()),
             crate::paste::attachments(&user_wire(&item.text, &item.attachments, assets))
         );
-        composer.buf.insert(" edited");
+        composer.insert(" edited");
         let wire = composer.wire();
         composer.set_wire(&wire);
-        assert_eq!(composer.buf.blocks.len(), 1);
-        assert_eq!(composer.buf.blocks[0].full, "/session/assets/image.png");
+        assert!(composer.chip(1).is_none());
+        assert_eq!(composer.chip(0).unwrap().full, "/session/assets/image.png");
         assert!(composer.text().ends_with(" edited"));
     }
 }

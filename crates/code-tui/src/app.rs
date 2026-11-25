@@ -584,7 +584,7 @@ impl App {
             terms: Terms::default(),
         };
         if app.catalog.vim {
-            app.composer.vim = Some(crate::vim::Vim::default());
+            app.composer.enable_vim();
         }
         let deferred = app.engine.deferred_model.take();
         app.load_session(events, "session");
@@ -846,7 +846,7 @@ impl App {
             }
         }
         if !out.is_empty() {
-            self.composer.buf.insert(&out);
+            self.composer.insert(&out);
             self.composer.edited();
             self.hint("typed while starting: kept in the composer");
         }
@@ -854,7 +854,7 @@ impl App {
 
     fn early_enter(&mut self, text: &mut String) {
         if !text.is_empty() {
-            self.composer.buf.insert(text);
+            self.composer.insert(text);
             text.clear();
             self.composer.edited();
         }
@@ -2766,9 +2766,7 @@ impl App {
                     | Overlay::Decisions(_)
                     | Overlay::Menu(_) => {}
                     Overlay::None => {
-                        if let Some(vim) = &mut self.composer.vim {
-                            vim.before_paste();
-                        }
+                        self.composer.before_paste();
                         // Pasted image paths (a drag-and-drop) and an empty
                         // paste with an image on the clipboard become
                         // attachment chips.
@@ -2785,9 +2783,9 @@ impl App {
                             &text,
                             self.catalog.paste_collapse_lines,
                         ) {
-                            self.composer.buf.insert_block(&text);
+                            self.composer.insert_paste(&text);
                         } else {
-                            self.composer.buf.insert(&text);
+                            self.composer.insert(&text);
                         }
                         self.composer.edited();
                     }
@@ -3361,9 +3359,7 @@ impl App {
                 return;
             }
             // Insert → normal; visual/operator/pending commands dismiss first.
-            if let Some(v) = &mut self.composer.vim
-                && v.key(&mut self.composer.buf, key) != crate::vim::Outcome::Pass
-            {
+            if self.composer.vim_key(key) != crate::vim::Outcome::Pass {
                 return;
             }
         }
@@ -3603,11 +3599,7 @@ impl App {
             return self.restore_queue_edit(false);
         }
         if !self.composer.is_empty() {
-            self.composer.buf.clear();
-            self.composer.edited();
-            if let Some(v) = &mut self.composer.vim {
-                v.reset_insert();
-            }
+            self.composer.discard();
             return;
         }
         if self
@@ -3648,8 +3640,8 @@ impl App {
         let matches = self.slash_matches();
         let slash_nav =
             !matches.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab);
-        if !slash_nav && let Some(v) = &mut self.composer.vim {
-            match v.key(&mut self.composer.buf, key) {
+        if !slash_nav {
+            match self.composer.vim_key(key) {
                 crate::vim::Outcome::Pass => {}
                 crate::vim::Outcome::Handled => return,
                 crate::vim::Outcome::Edited => {
@@ -3659,22 +3651,19 @@ impl App {
                 }
             }
         }
-        let buf = &mut self.composer.buf;
         let mut edited = true;
         match key.code {
-            KeyCode::Enter if shift || alt => buf.insert("\n"),
-            KeyCode::Char('j') if ctrl => buf.insert("\n"),
-            KeyCode::Enter => {
+            KeyCode::Enter if !(shift || alt) => {
                 if !matches.is_empty() {
                     let cmd = matches[self.slash_sel.min(matches.len() - 1)].0.clone();
-                    self.composer.buf.set(format!("/{cmd}"));
+                    self.composer.set_text(format!("/{cmd}"));
                 }
                 return self.submit();
             }
             KeyCode::Tab => {
                 if !matches.is_empty() {
                     let cmd = matches[self.slash_sel.min(matches.len() - 1)].0.clone();
-                    buf.set(format!("/{cmd} "));
+                    self.composer.set_text(format!("/{cmd} "));
                 } else {
                     edited = false;
                 }
@@ -3695,26 +3684,17 @@ impl App {
                 self.composer.history_next();
                 return;
             }
-            KeyCode::Left if alt || ctrl => buf.word_left(),
-            KeyCode::Right if alt || ctrl => buf.word_right(),
-            KeyCode::Left => buf.left(),
-            KeyCode::Right => buf.right(),
-            KeyCode::Home => buf.home(),
-            KeyCode::End => buf.end(),
-            KeyCode::Char('a') if ctrl => buf.home(),
-            KeyCode::Char('u') if ctrl => buf.kill_line(),
-            KeyCode::Char('w') if ctrl => buf.delete_word(),
-            KeyCode::Backspace if alt || ctrl => buf.delete_word(),
-            KeyCode::Backspace => buf.backspace(),
-            KeyCode::Delete => buf.delete(),
-            KeyCode::Char(c) if !ctrl => {
-                buf.insert(c.encode_utf8(&mut [0; 4]));
+            _ => {
+                edited = self.composer.edit_key(key);
                 // A finished `@path` becomes an attachment chip.
-                if c.is_whitespace() {
+                if edited
+                    && !ctrl
+                    && let KeyCode::Char(c) = key.code
+                    && c.is_whitespace()
+                {
                     self.convert_mentions(true);
                 }
             }
-            _ => edited = false,
         }
         if edited {
             self.composer.edited();
@@ -3728,26 +3708,14 @@ impl App {
 
     /// Turn `@path` mentions of existing files into attachment chips.
     fn convert_mentions(&mut self, complete_only: bool) {
-        let buf = &self.composer.buf;
-        if buf.text.trim_start().starts_with('/') {
-            return;
-        }
-        let skip: Vec<(usize, usize)> = buf.blocks.iter().map(|b| (b.start, b.end)).collect();
-        let found = crate::attach::mentions(&buf.text, self.engine.cwd(), &skip, complete_only);
-        // From the end, so earlier ranges stay valid.
-        for (a, b, path) in found.into_iter().rev() {
-            self.composer
-                .buf
-                .attach_range(a, b, &path.to_string_lossy());
-        }
+        self.composer
+            .attach_mentions(self.engine.cwd(), complete_only);
     }
 
     /// Insert an attachment chip for an existing file.
     fn attach_path(&mut self, path: &std::path::Path) {
         let kind = crate::attach::kind_of(path);
-        self.composer
-            .buf
-            .insert_attachment(kind, &path.to_string_lossy());
+        self.composer.attach(kind, &path.to_string_lossy());
         self.composer.edited();
         if let Some(m) = self.active_info()
             && !crate::attach::supported(kind, &m.input)
@@ -3774,10 +3742,8 @@ impl App {
     fn unsupported_attachments(&self) -> Option<String> {
         let blocks: Vec<_> = self
             .composer
-            .buf
-            .blocks
-            .iter()
-            .filter_map(|b| b.attach.as_ref().map(|k| (k.clone(), b.full.clone())))
+            .attachments()
+            .map(|(k, p)| (k.to_string(), p.to_string()))
             .collect();
         if blocks.is_empty() {
             return None;
@@ -3813,7 +3779,7 @@ impl App {
     }
 
     fn submit(&mut self) {
-        if !self.composer.buf.text.trim_start().starts_with('/') {
+        if !self.composer.is_command() {
             self.convert_mentions(false);
             if let Some(e) = self.unsupported_attachments() {
                 self.transcript.notice(Level::Error, e);
@@ -4055,17 +4021,16 @@ impl App {
             "copy" => self.copy_selection(),
             "mouse" => self.toggle_mouse(),
             "vim" => {
-                if self.composer.vim.take().is_some() {
+                if !self.composer.toggle_vim() {
                     self.hint("vim keys off for this session");
                 } else {
-                    self.composer.vim = Some(crate::vim::Vim::default());
                     self.hint("vim keys on for this session · esc: normal mode · config.json \"vim\": true makes it the default");
                 }
             }
             "rename" => {
                 let title = arg.trim();
                 if title.is_empty() {
-                    self.composer.buf.set("/rename ");
+                    self.composer.set_text("/rename ");
                     return self
                         .hint("/rename <title> sets the session title (stops automatic titles)");
                 }
@@ -4180,8 +4145,7 @@ impl App {
 
     /// A block cursor while vim is in a non-insert mode.
     pub fn block_cursor(&self) -> bool {
-        matches!(self.overlay, Overlay::None)
-            && self.composer.vim.as_ref().is_some_and(|v| v.block_cursor())
+        matches!(self.overlay, Overlay::None) && self.composer.block_cursor()
     }
 
     // ---- $EDITOR -----------------------------------------------------------
@@ -4189,14 +4153,14 @@ impl App {
     /// Ctrl+G: edit the whole composer (paste chips expanded) in `$EDITOR`.
     fn edit_composer(&mut self) {
         self.editor = Some(EditorReq {
-            text: self.composer.buf.editor_text(),
+            text: self.composer.editor_text(),
             target: EditTarget::Composer,
         });
     }
 
     /// Edit one composer paste chip in `$EDITOR`.
     pub(super) fn edit_chip(&mut self, i: usize) {
-        if let Some(b) = self.composer.buf.blocks.get(i) {
+        if let Some(b) = self.composer.chip(i) {
             self.editor = Some(EditorReq {
                 text: b.full.clone(),
                 target: EditTarget::Chip(i, b.id.clone()),
@@ -4225,12 +4189,12 @@ impl App {
         };
         match req.target {
             EditTarget::Composer => {
-                self.composer.buf.rebuild_from_editor(&text);
+                self.composer.rebuild_from_editor(&text);
                 self.composer.edited();
                 self.hint("composer updated from the editor");
             }
             EditTarget::Chip(i, id) => {
-                let Some(b) = self.composer.buf.blocks.get(i).filter(|b| b.id == id) else {
+                let Some(b) = self.composer.chip(i).filter(|b| b.id == id) else {
                     return self.hint("that paste is gone; nothing changed");
                 };
                 let mut text = text;
@@ -4238,10 +4202,10 @@ impl App {
                     text.push('\n');
                 }
                 if text.trim().is_empty() {
-                    self.composer.buf.remove_block(i);
+                    self.composer.remove_chip(i);
                     self.hint("paste removed");
                 } else {
-                    self.composer.buf.set_block_text(i, text);
+                    self.composer.set_chip_text(i, text);
                     self.hint("paste updated");
                 }
                 self.composer.edited();
@@ -5143,31 +5107,18 @@ mod tests {
     #[tokio::test]
     async fn paste_leaves_visual_mode_before_multibyte_insert_and_yank() {
         let (_dir, mut app) = app();
-        app.composer.vim = Some(crate::vim::Vim::default());
-        app.composer.buf.set("ab");
+        app.composer.enable_vim();
+        app.composer.set_text("ab");
         for code in [KeyCode::Esc, KeyCode::Char('v'), KeyCode::Char('h')] {
             app.on_key(key(code));
         }
-        assert_eq!(
-            app.composer.vim.as_ref().unwrap().mode,
-            crate::vim::Mode::Visual
-        );
+        assert_eq!(app.composer.vim_label().as_deref(), Some("-- VISUAL --"));
         app.on_term_event(Event::Paste("é".into()));
         assert_eq!(app.composer.text(), "éab");
-        assert_eq!(
-            app.composer.vim.as_ref().unwrap().mode,
-            crate::vim::Mode::Normal
-        );
+        assert_eq!(app.composer.vim_label().as_deref(), Some("NORMAL"));
         app.on_key(key(KeyCode::Char('y')));
         assert_eq!(app.composer.wire(), "éab");
-        assert_eq!(
-            app.composer
-                .vim
-                .as_ref()
-                .unwrap()
-                .visual_range(&app.composer.buf),
-            None
-        );
+        assert_eq!(app.composer.selection(), None);
     }
 
     #[tokio::test]
@@ -5269,7 +5220,7 @@ mod tests {
             let Overlay::ForkChat(chat) = &app.overlay else {
                 panic!("fork not restored")
             };
-            assert_eq!(chat.input.text, "unsent 界");
+            assert_eq!(chat.input.text(), "unsent 界");
             assert!(app.parked_fork.is_none());
         }
     }
@@ -5291,7 +5242,7 @@ mod tests {
         let Overlay::ForkChat(chat) = &app.overlay else {
             panic!("fork changed")
         };
-        assert_eq!(chat.input.text, "keep draft");
+        assert_eq!(chat.input.text(), "keep draft");
     }
 
     #[tokio::test]
@@ -5341,14 +5292,15 @@ mod tests {
             .queue_message("root", wire, QueueClass::NextTurn)
             .unwrap();
         app.queue_act(id, crate::ui::QAct::Edit);
-        assert_eq!(app.composer.buf.blocks.len(), 1);
-        let imported = app.composer.buf.blocks[0].full.clone();
+        assert_eq!(app.composer.attachments().count(), 1);
+        assert!(app.composer.chip(1).is_none());
+        let imported = app.composer.chip(0).unwrap().full.clone();
         assert_ne!(imported, source.to_string_lossy());
         assert_eq!(
             std::fs::read_to_string(&imported).unwrap(),
             "attachment contents"
         );
-        app.composer.buf.insert(" edited");
+        app.composer.insert(" edited");
         app.restore_queue_edit(true);
         assert!(app.composer.is_empty());
         let queued = app.engine.queued("root");
@@ -5356,9 +5308,10 @@ mod tests {
         assert_eq!(crate::paste::attachments(&queued[0].text).len(), 1);
         app.user_cancelled = true;
         app.finish_turn("cancelled".into());
-        assert_eq!(app.composer.buf.blocks.len(), 1);
+        assert_eq!(app.composer.attachments().count(), 1);
+        assert!(app.composer.chip(1).is_none());
         assert_eq!(
-            std::fs::read_to_string(&app.composer.buf.blocks[0].full).unwrap(),
+            std::fs::read_to_string(&app.composer.chip(0).unwrap().full).unwrap(),
             "attachment contents"
         );
         assert!(app.composer.text().contains("edited"));

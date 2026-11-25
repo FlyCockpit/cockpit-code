@@ -182,7 +182,7 @@ impl App {
             if edited && !self.composer.is_empty() {
                 item.text = self.composer.wire();
             }
-            self.composer.buf.clear();
+            self.composer.set_text("");
             self.composer.edited();
             let text = item.text.clone();
             match self.engine.requeue(item, at) {
